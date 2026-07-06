@@ -21,10 +21,12 @@ export interface Settings {
   fileClickMode: FileClickMode;
   /** 全局搜索单击文件后：true=在编辑器打开 / false=仅在 File 页签定位选中、不打开(不切走终端，便于找文件喂给 AI)。默认 false */
   openFileFromSearch: boolean;
+  /** 编辑器可打开的文件大小上限（MB）；过大文件编辑可能卡顿。默认 10 */
+  maxEditMB: number;
 }
 
 const KEY = "htybox.settings.v1";
-const DEFAULTS: Settings = { hoverPreview: true, autoRelay: false, fontFamily: "harmony", maxFiles: 100000, theme: "light", fileClickMode: "open", openFileFromSearch: false };
+const DEFAULTS: Settings = { hoverPreview: true, autoRelay: false, fontFamily: "harmony", maxFiles: 100000, theme: "light", fileClickMode: "open", openFileFromSearch: false, maxEditMB: 10 };
 
 function load(): Settings {
   try {

@@ -291,10 +291,15 @@ fn list_dir(path: String) -> Result<Vec<fs_tree::DirEntry>, String> {
     fs_tree::list_dir(&path)
 }
 
-/// M9：读文本文件（目录/二进制/超大 → editable=false）。
+/// M9：读文本文件（目录 → Err；超上限/二进制 → editable=false；文本白名单/强制 → 有损打开）。
+/// force_lossy / max_bytes 可选（invoke 侧 forceLossy / maxBytes），缺省 = 不强制 / 默认 10MB。
 #[tauri::command]
-fn read_text_file(path: String) -> Result<fs_tree::ReadTextResult, String> {
-    fs_tree::read_text_file(&path)
+fn read_text_file(
+    path: String,
+    force_lossy: Option<bool>,
+    max_bytes: Option<u64>,
+) -> Result<fs_tree::ReadTextResult, String> {
+    fs_tree::read_text_file(&path, force_lossy.unwrap_or(false), max_bytes)
 }
 
 /// M9：保存文本文件。

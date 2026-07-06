@@ -132,9 +132,20 @@ export interface ReadTextResult {
   content: string;
   editable: boolean;
   reason?: string;
+  /** editable=false 时是否可「仍以文本方式打开」（疑似二进制=可；过大=不可，正道是调设置上限） */
+  canForce: boolean;
+  /** 内容经有损转换（坏字节以 � 替换 / UTF-16 转码），保存会以转换后内容覆盖原字节 */
+  lossy: boolean;
+  /** lossy 时供编辑器警告条显示的文案 */
+  warning?: string;
 }
-export const readTextFile = (path: string) =>
-  invoke<ReadTextResult>("read_text_file", { path });
+/** 读文本文件；forceLossy=疑似二进制时仍有损打开，maxBytes=编辑大小上限（缺省走后端默认 10MB）。 */
+export const readTextFile = (path: string, opts?: { forceLossy?: boolean; maxBytes?: number }) =>
+  invoke<ReadTextResult>("read_text_file", {
+    path,
+    forceLossy: opts?.forceLossy,
+    maxBytes: opts?.maxBytes,
+  });
 export const writeTextFile = (path: string, content: string) =>
   invoke<void>("write_text_file", { path, content });
 /** M9：读图片为 base64 data URL（图片预览；非图片/超大 → ok=false + reason）。 */

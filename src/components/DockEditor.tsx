@@ -4,6 +4,7 @@ import { marked } from "marked";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { readTextFile, writeTextFile, readImageDataUrl, watchFile, unwatchFile } from "../catalog";
 import { emitActiveFile } from "../dockBus";
+import { getSettings } from "../settings";
 
 // 透明图棋盘格背景（SVG / 图片预览共用）。
 const CHECKER_BG: React.CSSProperties = {
@@ -22,6 +23,14 @@ interface Buf {
   loaded: boolean;
   editable: boolean;
   reason?: string;
+  /** editable=false 时是否可「仍以文本方式打开」（疑似二进制=可；过大=不可） */
+  canForce?: boolean;
+  /** 内容经有损转换（� 替换 / UTF-16 转码），保存会覆盖原字节 */
+  lossy?: boolean;
+  /** lossy 警告条文案 */
+  warning?: string;
+  /** 用户点过「仍以文本方式打开」——外部变化重载时沿用，避免弹回占位 */
+  forcedLossy?: boolean;
 }
 const editorStore = new Map<string, Buf>();
 // 图片预览缓存（与 editorStore 同样为跨重挂保活；data URL 较大，避免重复读盘）。
@@ -62,24 +71,31 @@ export default function DockEditor(
   const previewable = isMd || isSvg;
   const [view, setView] = useState<"edit" | "preview">(isSvg ? "preview" : "edit");
   const [imgFailed, setImgFailed] = useState(false); // SVG <img> 渲染失败(onError)安全网标志
+  // 预览产物仅在预览视图计算：上限放宽后大文件在编辑视图打字，避免每键全量 parse/encode。
   const html = useMemo(
-    () => (isMd ? (marked.parse(buf.content, { async: false }) as string) : ""),
-    [isMd, buf.content],
+    () => (isMd && view === "preview" ? (marked.parse(buf.content, { async: false }) as string) : ""),
+    [isMd, view, buf.content],
   );
-  const svgUrl = useMemo(
-    () => (isSvg ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(buf.content)}` : ""),
-    [isSvg, buf.content],
-  );
-  // SVG 良构性校验:DOMParser 解析失败时 Chromium 会插入 <parsererror>,取其错误明细作诊断(无错为 null)。
-  // 与位图分支的 {ok, reason} 失败 UI 对齐:把真实 XML 错误如实暴露,而非静默退化成碎图图标。
-  const svgError = useMemo<string | null>(() => {
-    if (!isSvg || !buf.loaded || !buf.content.trim()) return null;
-    const doc = new DOMParser().parseFromString(buf.content, "image/svg+xml");
-    const errNode = doc.querySelector("parsererror");
-    if (!errNode) return null;
-    const detail = errNode.querySelector("div")?.textContent; // Chromium 把"error on line…"明细放在内层 div
-    return (detail || errNode.textContent || "SVG 解析失败").replace(/\s+/g, " ").trim();
-  }, [isSvg, buf.loaded, buf.content]);
+  // SVG 预览：良构性校验（DOMParser 失败时 Chromium 插入 <parsererror>，取明细作诊断）+ 容错重试。
+  // 解析失败时把「孤立 &」（后面不是合法实体）转义为 &amp; 再试一次——损坏/AI 生成的 mockup 常见
+  // 此类语法伤；容错只影响预览渲染，不改编辑缓冲与保存内容，重试仍失败才如实报原始错误。
+  const svgView = useMemo<{ url: string; error: string | null }>(() => {
+    if (!isSvg || view !== "preview" || !buf.loaded || !buf.content.trim())
+      return { url: "", error: null };
+    const parseErr = (txt: string): string | null => {
+      const doc = new DOMParser().parseFromString(txt, "image/svg+xml");
+      const errNode = doc.querySelector("parsererror");
+      if (!errNode) return null;
+      const detail = errNode.querySelector("div")?.textContent; // Chromium 把"error on line…"明细放在内层 div
+      return (detail || errNode.textContent || "SVG 解析失败").replace(/\s+/g, " ").trim();
+    };
+    const toUrl = (txt: string) => `data:image/svg+xml;charset=utf-8,${encodeURIComponent(txt)}`;
+    const err = parseErr(buf.content);
+    if (!err) return { url: toUrl(buf.content), error: null };
+    const relaxed = buf.content.replace(/&(?![a-zA-Z][a-zA-Z0-9]*;|#[0-9]+;|#x[0-9a-fA-F]+;)/g, "&amp;");
+    if (relaxed !== buf.content && !parseErr(relaxed)) return { url: toUrl(relaxed), error: null };
+    return { url: "", error: err };
+  }, [isSvg, view, buf.loaded, buf.content]);
   // 内容变化时复位 <img> 渲染失败标志,让修正后的 SVG 重新尝试渲染。
   useEffect(() => {
     setImgFailed(false);
@@ -118,9 +134,9 @@ export default function DockEditor(
       return;
     }
     let alive = true;
-    readTextFile(path)
+    readTextFile(path, { maxBytes: getSettings().maxEditMB * 1024 * 1024 })
       .then((r) => {
-        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason };
+        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning };
         editorStore.set(panelId, b);
         if (alive) setBuf(b);
       })
@@ -147,13 +163,25 @@ export default function DockEditor(
 
   // 从磁盘重新载入（放弃本地未保存内容）。供外部变化同步 / 冲突时手动重载。
   const reloadFromDisk = () => {
-    readTextFile(path)
+    const forced = editorStore.get(panelId)?.forcedLossy ?? false;
+    readTextFile(path, { forceLossy: forced, maxBytes: getSettings().maxEditMB * 1024 * 1024 })
       .then((r) => {
-        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason };
+        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, forcedLossy: forced };
         editorStore.set(panelId, b);
         setBuf(b);
         setExternalChanged(false);
         setErr(null);
+      })
+      .catch((e) => setErr(String(e)));
+  };
+
+  // 疑似二进制的逃生门：用户在占位 UI 显式确认后，以 U+FFFD 有损替换打开。
+  const forceOpen = () => {
+    readTextFile(path, { forceLossy: true, maxBytes: getSettings().maxEditMB * 1024 * 1024 })
+      .then((r) => {
+        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, forcedLossy: true };
+        editorStore.set(panelId, b);
+        setBuf(b);
       })
       .catch((e) => setErr(String(e)));
   };
@@ -276,6 +304,15 @@ export default function DockEditor(
       <div className="flex h-full flex-col items-center justify-center gap-2 bg-[var(--bg)] p-6 text-center">
         <div className="text-[13px] font-semibold text-[var(--text-2)]">{basename(path)}</div>
         <div className="text-[12px] text-[var(--text-3)]">{buf.reason ?? "不支持编辑此文件"}</div>
+        {buf.canForce && (
+          <button
+            onClick={forceOpen}
+            className="mt-2 rounded-md border border-[var(--border)] px-3 py-1.5 text-[12px] text-[var(--text-2)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+          >
+            仍以文本方式打开
+          </button>
+        )}
+        {err && <div className="text-[10.5px] text-[var(--danger)]">{err}</div>}
       </div>
     );
   }
@@ -318,6 +355,13 @@ export default function DockEditor(
           保存
         </button>
       </div>
+      {buf.lossy && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-3 py-1.5">
+          <span className="min-w-0 flex-1 text-[10.5px] text-[var(--accent-text)]">
+            {buf.warning ?? "内容经有损转换，保存将写回转换后的内容"}
+          </span>
+        </div>
+      )}
       {externalChanged && (
         <div className="flex shrink-0 items-center gap-2 border-b border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-3 py-1.5">
           <span className="min-w-0 flex-1 text-[10.5px] text-[var(--accent-text)]">文件已被外部修改，本地有未保存的改动。</span>
@@ -337,11 +381,11 @@ export default function DockEditor(
       )}
       {previewable && view === "preview" ? (
         isSvg ? (
-          svgError || imgFailed ? (
+          svgView.error || imgFailed ? (
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 overflow-auto p-6 text-center">
               <div className="text-[12px] font-semibold text-[var(--text-2)]">SVG 无法预览(XML 解析错误)</div>
               <div className="max-w-full whitespace-pre-wrap break-words text-[11px] leading-relaxed text-[var(--text-3)]">
-                {svgError ?? "SVG 渲染失败"}
+                {svgView.error ?? "SVG 渲染失败"}
               </div>
               <div className="text-[10.5px] text-[var(--text-3)]">切到「编辑」查看并修复后,回到「预览」即自动重试。</div>
             </div>
@@ -351,7 +395,7 @@ export default function DockEditor(
               style={CHECKER_BG}
             >
               <img
-                src={svgUrl}
+                src={svgView.url}
                 alt={basename(path)}
                 onError={() => setImgFailed(true)}
                 className="max-h-full max-w-full object-contain"

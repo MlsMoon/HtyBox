@@ -67,6 +67,17 @@ export default function SettingsModal({
     }
   };
 
+  const [editMbDraft, setEditMbDraft] = useState(String(s.maxEditMB));
+  const commitEditMb = () => {
+    const n = Math.round(Number(editMbDraft));
+    if (Number.isFinite(n) && n >= 1) {
+      setSetting("maxEditMB", n);
+      setEditMbDraft(String(n));
+    } else {
+      setEditMbDraft(String(s.maxEditMB)); // 非法输入回退到当前值
+    }
+  };
+
   const over = count !== null && count > s.maxFiles;
   const countLabel = !root
     ? "未打开工作区"
@@ -256,6 +267,30 @@ export default function SettingsModal({
                 }
               >
                 {countLabel}
+              </span>
+            </div>
+          </div>
+
+          <div className="rounded-lg px-3 py-2.5">
+            <div className="text-sm font-medium text-[var(--text)]">文件编辑大小上限</div>
+            <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">
+              编辑器可打开的最大文件体积（MB）；过大文件编辑可能卡顿，建议 ≤ 20。默认 10
+            </div>
+            <div className="flex items-center gap-2.5">
+              <input
+                type="number"
+                min={1}
+                step={1}
+                value={editMbDraft}
+                onChange={(e) => setEditMbDraft(e.target.value)}
+                onBlur={commitEditMb}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                }}
+                className="w-32 rounded-lg border border-[var(--border)] bg-[var(--elevated)] px-2.5 py-1.5 text-sm text-[var(--text)] outline-none focus:border-[var(--accent)]"
+              />
+              <span className="min-w-0 flex-1 text-[11px] text-[var(--text-faint)]">
+                MB · 对新打开的文件生效
               </span>
             </div>
           </div>

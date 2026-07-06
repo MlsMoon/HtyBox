@@ -44,7 +44,17 @@ pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, String> {
 
 // ---------------- M9：文件读写 / 增删改 ----------------
 
-const MAX_EDIT_BYTES: u64 = 1024 * 1024; // 1MB，超过不进编辑器
+const DEFAULT_MAX_EDIT_BYTES: u64 = 10 * 1024 * 1024; // 默认编辑上限 10MB（前端经全局设置传入覆盖）
+
+/// 内容判定失败（含 NUL / 非法 UTF-8）时仍直接以文本有损打开的扩展名——
+/// 用户直观认为是文本的格式，不再挡"二进制"占位；白名单外靠 force_lossy 逃生门。
+const TEXT_EXTS: &[&str] = &[
+    "svg", "xml", "html", "htm", "txt", "log", "md", "markdown", "json", "jsonl",
+    "yaml", "yml", "toml", "csv", "tsv", "ini", "conf", "cfg", "gitignore",
+    "gitattributes", "editorconfig", "env", "bat", "cmd", "ps1", "sh", "py",
+    "js", "ts", "tsx", "jsx", "rs", "cs", "c", "h", "cpp", "hpp", "java", "kt",
+    "go", "lua", "sql",
+];
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,37 +62,113 @@ pub struct ReadTextResult {
     pub content: String,
     pub editable: bool,
     pub reason: Option<String>,
+    /// editable=false 时前端是否可给「仍以文本方式打开」按钮（疑似二进制=可；过大=不可，正道是调设置上限）。
+    pub can_force: bool,
+    /// 内容经有损转换（坏字节以 U+FFFD 替换 / UTF-16 转码），保存会以转换后内容覆盖原字节。
+    pub lossy: bool,
+    /// lossy 时供编辑器警告条显示的文案。
+    pub warning: Option<String>,
 }
 
-/// 读文本文件；目录/超大/二进制/非 UTF-8 → editable=false + reason（不回内容）。
-pub fn read_text_file(path: &str) -> Result<ReadTextResult, String> {
+/// 有损打开时的坏字符清洗：除 \t\n\r 外的 C0 控制字符、DEL、U+FFFE/FFFF 一并替换为 U+FFFD。
+/// 这些字符是合法 UTF-8（from_utf8_lossy 不会动它们），但既是 XML 1.0 非法字符——
+/// 残留一个就让整个 SVG/XML 预览报 parsererror——在文本文件里也只会是损坏产物；
+/// 统一替换后坏 SVG 无需手修即可直接预览，编辑视图中坏字节可见、可删。
+fn replace_invalid_text_chars(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\t' | '\n' | '\r' => c,
+            '\0'..='\u{1F}' | '\u{7F}' | '\u{FFFE}' | '\u{FFFF}' => '\u{FFFD}',
+            _ => c,
+        })
+        .collect()
+}
+
+/// 读文本文件。目录 → Err；超上限 → 不可编辑（引导调设置）；UTF-16 BOM → 转码打开；
+/// 疑似二进制（含 NUL / 非法 UTF-8）→ 文本扩展名白名单或 force_lossy 时有损打开，否则占位但可强制。
+pub fn read_text_file(
+    path: &str,
+    force_lossy: bool,
+    max_bytes: Option<u64>,
+) -> Result<ReadTextResult, String> {
     let p = Path::new(path);
     let meta = std::fs::metadata(p).map_err(|e| e.to_string())?;
     if meta.is_dir() {
         return Err("是目录，无法作为文本打开".into());
     }
-    let not_editable = |reason: String| ReadTextResult {
+    let ok_text = |content: String, lossy: bool, warning: Option<String>| ReadTextResult {
+        content,
+        editable: true,
+        reason: None,
+        can_force: false,
+        lossy,
+        warning,
+    };
+    let blocked = |reason: String, can_force: bool| ReadTextResult {
         content: String::new(),
         editable: false,
         reason: Some(reason),
+        can_force,
+        lossy: false,
+        warning: None,
     };
-    if meta.len() > MAX_EDIT_BYTES {
-        return Ok(not_editable(format!(
-            "文件过大（{} KB），不支持编辑",
-            meta.len() / 1024
-        )));
+    let limit = max_bytes.unwrap_or(DEFAULT_MAX_EDIT_BYTES);
+    if meta.len() > limit {
+        return Ok(blocked(
+            format!(
+                "文件过大（{} KB），超出编辑上限（{} MB），可在设置中调整",
+                meta.len() / 1024,
+                limit / 1024 / 1024
+            ),
+            false,
+        ));
     }
     let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
-    if bytes.contains(&0) {
-        return Ok(not_editable("二进制文件，不支持编辑".to_string()));
+    // UTF-16 BOM（Windows 日志常见，如 PowerShell 5 重定向输出）：转码显示，保存写回 UTF-8。
+    if bytes.len() >= 2 && (bytes[..2] == [0xFF, 0xFE] || bytes[..2] == [0xFE, 0xFF]) {
+        let le = bytes[0] == 0xFF;
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| {
+                if le {
+                    u16::from_le_bytes([c[0], c[1]])
+                } else {
+                    u16::from_be_bytes([c[0], c[1]])
+                }
+            })
+            .collect();
+        let label = if le { "UTF-16 LE" } else { "UTF-16 BE" };
+        return Ok(ok_text(
+            String::from_utf16_lossy(&units),
+            true,
+            Some(format!("{label} 编码：已转码显示，保存将以 UTF-8 写回")),
+        ));
     }
+    // 严格路径：不含 NUL 且合法 UTF-8 —— 绝大多数文件，无损打开。
+    let has_nul = bytes.contains(&0);
     match String::from_utf8(bytes) {
-        Ok(content) => Ok(ReadTextResult {
-            content,
-            editable: true,
-            reason: None,
-        }),
-        Err(_) => Ok(not_editable("非 UTF-8 文本，不支持编辑".to_string())),
+        Ok(content) if !has_nul => Ok(ok_text(content, false, None)),
+        // 疑似二进制（含 NUL 或非法 UTF-8）：白名单扩展名 / 强制 → 有损打开，否则占位 + 可强制。
+        other => {
+            let bytes = match other {
+                Ok(s) => s.into_bytes(),
+                Err(e) => e.into_bytes(),
+            };
+            let is_text_ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| TEXT_EXTS.contains(&e.to_ascii_lowercase().as_str()));
+            if force_lossy || is_text_ext {
+                let content = replace_invalid_text_chars(&String::from_utf8_lossy(&bytes));
+                Ok(ok_text(
+                    content,
+                    true,
+                    Some("包含无效编码字节，已以 � 替换显示；保存将写回替换后的内容".into()),
+                ))
+            } else {
+                Ok(blocked("检测到二进制内容".into(), true))
+            }
+        }
     }
 }
 
