@@ -3,6 +3,7 @@ import type { IDockviewPanelProps } from "dockview-react";
 import { marked } from "marked";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { readTextFile, writeTextFile, readImageDataUrl, watchFile, unwatchFile } from "../catalog";
+import { sanitizeForRender } from "../svgSanitize";
 import { emitActiveFile } from "../dockBus";
 import { getSettings } from "../settings";
 
@@ -79,9 +80,9 @@ export default function DockEditor(
   // SVG 预览：良构性校验（DOMParser 失败时 Chromium 插入 <parsererror>，取明细作诊断）+ 容错重试。
   // 解析失败时把「孤立 &」（后面不是合法实体）转义为 &amp; 再试一次——损坏/AI 生成的 mockup 常见
   // 此类语法伤；容错只影响预览渲染，不改编辑缓冲与保存内容，重试仍失败才如实报原始错误。
-  const svgView = useMemo<{ url: string; error: string | null }>(() => {
+  const svgView = useMemo<{ url: string; error: string | null; cleaned: boolean; degraded: boolean }>(() => {
     if (!isSvg || view !== "preview" || !buf.loaded || !buf.content.trim())
-      return { url: "", error: null };
+      return { url: "", error: null, cleaned: false, degraded: false };
     const parseErr = (txt: string): string | null => {
       const doc = new DOMParser().parseFromString(txt, "image/svg+xml");
       const errNode = doc.querySelector("parsererror");
@@ -90,11 +91,13 @@ export default function DockEditor(
       return (detail || errNode.textContent || "SVG 解析失败").replace(/\s+/g, " ").trim();
     };
     const toUrl = (txt: string) => `data:image/svg+xml;charset=utf-8,${encodeURIComponent(txt)}`;
-    const err = parseErr(buf.content);
-    if (!err) return { url: toUrl(buf.content), error: null };
-    const relaxed = buf.content.replace(/&(?![a-zA-Z][a-zA-Z0-9]*;|#[0-9]+;|#x[0-9a-fA-F]+;)/g, "&amp;");
-    if (relaxed !== buf.content && !parseErr(relaxed)) return { url: toUrl(relaxed), error: null };
-    return { url: "", error: err };
+    const err0 = parseErr(buf.content);
+    if (!err0) return { url: toUrl(buf.content), error: null, cleaned: false, degraded: false };
+    // 非良构：清洗管线累加修正（仅作用于渲染副本、不改编辑缓冲与保存），让严格 DOMParser 通过。
+    const { text, cleaned, wellFormed } = sanitizeForRender(buf.content, (s) => !parseErr(s));
+    if (wellFormed) return { url: toUrl(text), error: null, cleaned, degraded: false };
+    // 决策 1-A：清洗仍非良构 → 乐观兜底，仍交 <img> 试渲染（onError=imgFailed 才判失败）；err0 留作诊断。
+    return { url: toUrl(text), error: err0, cleaned, degraded: true };
   }, [isSvg, view, buf.loaded, buf.content]);
   // 内容变化时复位 <img> 渲染失败标志,让修正后的 SVG 重新尝试渲染。
   useEffect(() => {
@@ -381,17 +384,24 @@ export default function DockEditor(
       )}
       {previewable && view === "preview" ? (
         isSvg ? (
-          svgView.error || imgFailed ? (
+          !svgView.url ? (
+            <div
+              className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4 text-[12px] text-[var(--text-3)]"
+              style={CHECKER_BG}
+            >
+              （无预览内容）
+            </div>
+          ) : imgFailed ? (
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 overflow-auto p-6 text-center">
-              <div className="text-[12px] font-semibold text-[var(--text-2)]">SVG 无法预览(XML 解析错误)</div>
+              <div className="text-[12px] font-semibold text-[var(--text-2)]">SVG 无法预览</div>
               <div className="max-w-full whitespace-pre-wrap break-words text-[11px] leading-relaxed text-[var(--text-3)]">
                 {svgView.error ?? "SVG 渲染失败"}
               </div>
-              <div className="text-[10.5px] text-[var(--text-3)]">切到「编辑」查看并修复后,回到「预览」即自动重试。</div>
+              <div className="text-[10.5px] text-[var(--text-3)]">已尽力容错渲染仍无法显示，可切到「编辑」查看并修正原始内容。</div>
             </div>
           ) : (
             <div
-              className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4"
+              className="relative flex min-h-0 flex-1 items-center justify-center overflow-auto p-4"
               style={CHECKER_BG}
             >
               <img
@@ -400,6 +410,11 @@ export default function DockEditor(
                 onError={() => setImgFailed(true)}
                 className="max-h-full max-w-full object-contain"
               />
+              {svgView.cleaned ? (
+                <div className="absolute bottom-1.5 right-2 rounded bg-[var(--bg)]/80 px-1.5 py-0.5 text-[10px] text-[var(--text-3)]">
+                  已容错渲染
+                </div>
+              ) : null}
             </div>
           )
         ) : (

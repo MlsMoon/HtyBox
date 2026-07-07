@@ -64,6 +64,9 @@ export default function QuickOpen({
       emitActiveFolder(workspaceId, f.path, true); // 挂载后补发 → revealFolder 定位选中
     } else if (s.openFileFromSearch) {
       openEditor(workspaceId, f.path); // 直接在编辑器打开
+      // 同时显式揭示：不能只靠 DockEditor 的"激活即揭示"——重复搜同一个已打开且已激活的
+      // 文件时，编辑器 Tab 不会重新激活、onDidActiveChange 不触发，树的揭示/滚动就不会发生
+      emitActiveFile(workspaceId, f.path, true);
     } else {
       // 仅选中：切到 File 页签并定位选中，不打开、不切走终端（找文件喂 AI 用）
       onEnsureSidebar(); // 侧边栏若折叠则展开

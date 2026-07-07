@@ -106,8 +106,6 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
   const s = useSettings();
   const [showIgnore, setShowIgnore] = useState(false);
   const [showTop, setShowTop] = useState(false); // 滚动超过阈值 → 浮现「回到顶部」按钮（瞬时态，不持久化）
-  const childrenRef = useRef(children);
-  childrenRef.current = children;
   const scrollDoneFor = useRef<string | null>(null);
   // 拖拽时的自动滚动（悬停上/下条带即滚动列表）
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -205,7 +203,10 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
       d = up;
     }
     setExpanded((s) => { const n = new Set(s); dirs.forEach((x) => n.add(x)); setWsState(EXP_KEY, root, [...n]); return n; });
-    dirs.forEach((x) => { if (!childrenRef.current[x]) load(x); });
+    // 刷新目标路径各级目录（含 root）：树缓存可能陈旧（终端/Agent 刚新建的文件），
+    // 只加载"未缓存"的会漏掉"父目录已缓存但内容陈旧"→ 搜到的文件在树里无行可选中；故沿路径无条件重载
+    [root, ...dirs].forEach((x) => load(x));
+    scrollDoneFor.current = null; // 每次显式揭示都重置守卫：允许对"同一活动文件"再次滚动定位（与 revealFolder 对称，修复重复搜索不重新聚焦）
     setActiveFile(filePath); setSelected(new Set([filePath])); setAnchor(filePath);
   }, [root, load]);
   useEffect(() => registerActiveFileReveal(workspaceId, reveal), [workspaceId, reveal]);
@@ -236,9 +237,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
       setWsState(EXP_KEY, root, [...n]);
       return n;
     });
-    dirs.forEach((x) => {
-      if (!childrenRef.current[x]) load(x);
-    });
+    dirs.forEach((x) => load(x)); // 刷新路径各级目录（dirs 已含 root），避免树缓存陈旧导致目标文件夹无法定位
     scrollDoneFor.current = null;
     setActiveFile(p); setSelected(new Set([p])); setAnchor(p);
   }, [root, load]);
