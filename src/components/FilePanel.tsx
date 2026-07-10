@@ -193,7 +193,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
   }, [root, load]);
   useEffect(() => registerActiveFileReveal(workspaceId, reveal), [workspaceId, reveal]);
 
-  // 收藏文件夹：原树照常显示，顶部独立区提供快速跳转 + 就地展开子树（迷你树）。
+  // 收藏文件夹：原树照常显示，顶部独立区提供快速跳转（点击 = 主树定位；非根直接子级附带父路径）。
   // 读写走 favFolders.ts 公共模块（QuickOpen 共用），本地 state 靠事件订阅同步。
   const isFavFolder = (p: string) => favFolders.includes(p);
   const toggleFavFolder = (p: string) => toggleFavStored(root, p);
@@ -404,11 +404,10 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
     }
   };
 
-  // 行点击：Ctrl 离散切换 / Shift 区间 / 无修饰键按 fileClickMode 决定「选中并打开/展开」或「仅选中」。
-  // ctx="fav"（收藏区子树）时 Ctrl/Shift 退化为单选：visibleOrder 只含主树可见序，区间语义在收藏区不成立。
-  const clickRow = (entry: DirEntry, e: React.MouseEvent, ctx: "main" | "fav" = "main") => {
+  // 行点击：Ctrl 离散切换 / Shift 区间 / 无修饰键按 fileClickMode 决定「选中并打开/展开」或「仅选中」
+  const clickRow = (entry: DirEntry, e: React.MouseEvent) => {
     const path = entry.path;
-    if (ctx === "main" && (e.ctrlKey || e.metaKey)) {
+    if (e.ctrlKey || e.metaKey) {
       setSelected((prev) => {
         const next = new Set(prev);
         if (next.has(path)) next.delete(path);
@@ -418,7 +417,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
       setAnchor(path);
       return;
     }
-    if (ctx === "main" && e.shiftKey) {
+    if (e.shiftKey) {
       const i = anchor ? visibleOrder.indexOf(anchor) : -1;
       const j = visibleOrder.indexOf(path);
       if (i >= 0 && j >= 0) {
@@ -444,8 +443,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
     else openEditor(workspaceId, entry.path);
   };
 
-  // ctx="fav"：收藏区子树复用本渲染，行为白名单——不绑定位滚动 ref（reveal 只滚主树）、点击单选（见 clickRow）
-  const renderNode = (entry: DirEntry, depth: number, ctx: "main" | "fav" = "main") => {
+  const renderNode = (entry: DirEntry, depth: number) => {
     const isOpen = expanded.has(entry.path);
     const pad = 8 + depth * 12;
     const isDrop = dropDir === entry.path;
@@ -455,7 +453,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
       <div key={entry.path}>
         <div
           ref={
-            isActive && ctx === "main"
+            isActive
               ? (el) => {
                   if (el && scrollDoneFor.current !== entry.path) {
                     scrollDoneFor.current = entry.path;
@@ -493,20 +491,19 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
           }
           onDragLeave={entry.isDir ? () => setDropDir((d) => (d === entry.path ? null : d)) : undefined}
           onDrop={entry.isDir ? (e) => onFolderDrop(entry.path, e) : undefined}
-          onClick={(e) => clickRow(entry, e, ctx)}
+          onClick={(e) => clickRow(entry, e)}
           onDoubleClick={() => dblRow(entry)}
           onContextMenu={(e) => {
             e.preventDefault();
             e.stopPropagation();
-            // 决策 5：命中未选中项→选区重置为该项；命中已选中项→保持选区、对整组生效。
-            // fav 区一律单选语义（多选/批量仅主树），避免主树多选残留串扰出 multi 菜单。
+            // 决策 5：命中未选中项→选区重置为该项；命中已选中项→保持选区、对整组生效
             let count = selected.size;
-            if (ctx === "fav" || !selected.has(entry.path)) {
+            if (!selected.has(entry.path)) {
               setSelected(new Set([entry.path]));
               setAnchor(entry.path);
               count = 1;
             }
-            setMenu({ x: e.clientX, y: e.clientY, node: entry, isTopLevel: ctx === "main" && depth === 0, count });
+            setMenu({ x: e.clientX, y: e.clientY, node: entry, isTopLevel: depth === 0, count });
           }}
           title={entry.path}
           style={{ paddingLeft: pad }}
@@ -533,7 +530,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
           <>
             {errors[entry.path] && <div style={{ paddingLeft: pad + 20 }} className="py-0.5 text-[10.5px] text-[var(--danger)]">读取失败</div>}
             {loading.has(entry.path) && !children[entry.path] && <div style={{ paddingLeft: pad + 20 }} className="py-0.5 text-[10.5px] text-[var(--text-3)]">加载中…</div>}
-            {filterEntries(children[entry.path] ?? [], depth + 1).map((c) => renderNode(c, depth + 1, ctx))}
+            {filterEntries(children[entry.path] ?? [], depth + 1).map((c) => renderNode(c, depth + 1))}
           </>
         )}
       </div>
@@ -663,66 +660,53 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
                 收藏文件夹
               </div>
               {favFolders.map((p) => {
-                const isOpen = expanded.has(p);
                 const isDrop = dropDir === p;
+                const rel = relOf(dirOf(p)); // 非根直接子级才显示父相对路径
                 return (
-                  <div key={p}>
-                    {/* 收藏根行：chevron 就地展开子树；名称单击仍 = 跳主树定位（旧语义保留） */}
-                    <div
-                      draggable
-                      onDragStart={(e) => {
-                        e.dataTransfer.setData(DRAG_MIME, JSON.stringify({ kind: "file", path: p, paths: [p] }));
-                        e.dataTransfer.effectAllowed = "copyMove";
-                        requestAnimationFrame(() => setDragActive(true));
-                      }}
-                      onDragEnd={() => {
-                        setDragActive(false);
-                        setDropDir(null);
-                      }}
-                      onDragOver={(e) => {
-                        e.preventDefault();
-                        e.dataTransfer.dropEffect = "copy";
-                        if (dropDir !== p) setDropDir(p);
-                      }}
-                      onDragLeave={() => setDropDir((d) => (d === p ? null : d))}
-                      onDrop={(e) => onFolderDrop(p, e)}
-                      onClick={() => revealFolder(p)}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setSelected(new Set([p]));
-                        setAnchor(p);
-                        setMenu({
-                          x: e.clientX,
-                          y: e.clientY,
-                          node: { name: baseName(p), path: p, isDir: true },
-                          isTopLevel: false,
-                          count: 1,
-                        });
-                      }}
-                      title={p}
-                      className={
-                        "flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-1 text-[12px] text-[var(--text-deep)] " +
-                        (isDrop
-                          ? "bg-[var(--accent)]/15 ring-1 ring-inset ring-[var(--accent-border)]"
-                          : "hover:bg-[var(--surface-hover)]")
-                      }
-                    >
-                      <span onClick={(e) => { e.stopPropagation(); toggle(p); }} className="-m-1 shrink-0 p-1" title="展开/折叠">
-                        <Chevron open={isOpen} />
-                      </span>
-                      <FolderGlyph />
-                      <span className="shrink-0 truncate font-medium">{baseName(p)}</span>
-                      <span className="min-w-0 flex-1 truncate text-[10px] text-[var(--text-3)]">{relOf(dirOf(p))}</span>
-                    </div>
-                    {/* 就地子树：与主树共享 children 缓存 + expanded 展开态，行为走 renderNode ctx="fav" */}
-                    {isOpen && (
-                      <>
-                        {errors[p] && <div style={{ paddingLeft: 28 }} className="py-0.5 text-[10.5px] text-[var(--danger)]">读取失败</div>}
-                        {loading.has(p) && !children[p] && <div style={{ paddingLeft: 28 }} className="py-0.5 text-[10.5px] text-[var(--text-3)]">加载中…</div>}
-                        {filterEntries(children[p] ?? [], 1).map((c) => renderNode(c, 1, "fav"))}
-                      </>
-                    )}
+                  <div
+                    key={p}
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData(DRAG_MIME, JSON.stringify({ kind: "file", path: p, paths: [p] }));
+                      e.dataTransfer.effectAllowed = "copyMove";
+                      requestAnimationFrame(() => setDragActive(true));
+                    }}
+                    onDragEnd={() => {
+                      setDragActive(false);
+                      setDropDir(null);
+                    }}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = "copy";
+                      if (dropDir !== p) setDropDir(p);
+                    }}
+                    onDragLeave={() => setDropDir((d) => (d === p ? null : d))}
+                    onDrop={(e) => onFolderDrop(p, e)}
+                    onClick={() => revealFolder(p)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setSelected(new Set([p]));
+                      setAnchor(p);
+                      setMenu({
+                        x: e.clientX,
+                        y: e.clientY,
+                        node: { name: baseName(p), path: p, isDir: true },
+                        isTopLevel: false,
+                        count: 1,
+                      });
+                    }}
+                    title={p}
+                    className={
+                      "flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-1 text-[12px] text-[var(--text-deep)] " +
+                      (isDrop
+                        ? "bg-[var(--accent)]/15 ring-1 ring-inset ring-[var(--accent-border)]"
+                        : "hover:bg-[var(--surface-hover)]")
+                    }
+                  >
+                    <FolderGlyph />
+                    <span className="shrink-0 truncate font-medium">{baseName(p)}</span>
+                    {rel && <span className="min-w-0 flex-1 truncate text-[10px] text-[var(--text-3)]">{rel}</span>}
                   </div>
                 );
               })}
