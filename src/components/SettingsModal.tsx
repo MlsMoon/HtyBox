@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { useSettings, setSetting, type FileClickMode } from "../settings";
 import { FONTS, applyFont } from "../fonts";
 import { THEMES, applyTheme, watchSystemTheme } from "../theme";
@@ -25,12 +25,146 @@ function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void 
   );
 }
 
+/* ===== 公共控件：现有三种设置项形态的收敛（视觉语言不变），各分类声明式复用 ===== */
+
+/** 开关行：标题 + 描述 + 右侧 Toggle */
+function ToggleRow({
+  title,
+  desc,
+  on,
+  onChange,
+}: {
+  title: string;
+  desc: string;
+  on: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-4 rounded-lg px-3 py-2.5 transition-colors hover:bg-[var(--surface-soft)]">
+      <div className="min-w-0">
+        <div className="text-sm font-medium text-[var(--text)]">{title}</div>
+        <div className="text-[11px] text-[var(--text-faint)]">{desc}</div>
+      </div>
+      <Toggle on={on} onChange={onChange} />
+    </div>
+  );
+}
+
+/** 卡片单选组：`large` = 大字号卡（字体选择预览用），`style` 作用于整卡（字体栈预览） */
+function ChoiceGrid<K extends string>({
+  title,
+  desc,
+  cols,
+  large,
+  options,
+  value,
+  onChange,
+}: {
+  title: string;
+  desc: string;
+  cols: 2 | 3;
+  large?: boolean;
+  options: { key: K; label: string; desc: string; style?: CSSProperties }[];
+  value: K;
+  onChange: (k: K) => void;
+}) {
+  return (
+    <div className="rounded-lg px-3 py-2.5">
+      <div className="text-sm font-medium text-[var(--text)]">{title}</div>
+      <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">{desc}</div>
+      <div className={"grid gap-2 " + (cols === 3 ? "grid-cols-3" : "grid-cols-2")}>
+        {options.map((m) => {
+          const on = value === m.key;
+          return (
+            <button
+              key={m.key}
+              onClick={() => onChange(m.key)}
+              style={m.style}
+              className={
+                "rounded-lg border px-3 py-2 text-left transition-colors " +
+                (on
+                  ? "border-[var(--accent)] bg-[var(--accent-soft)]"
+                  : "border-[var(--border)] hover:bg-[var(--surface-soft)]")
+              }
+            >
+              <div className={"flex items-center gap-1.5 leading-tight text-[var(--text)] " + (large ? "text-[15px]" : "text-[13px]")}>
+                {m.label}
+                {on && <span className="text-[var(--accent)]">✓</span>}
+              </div>
+              <div className={"mt-0.5 text-[var(--text-faint)] " + (large ? "text-[11px]" : "text-[10px]")}>{m.desc}</div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** 数字输入行：失焦/回车 commit（非法值由调用方回退），hint 可切强调色（超限提示） */
+function NumberField({
+  title,
+  desc,
+  min,
+  step,
+  draft,
+  setDraft,
+  commit,
+  hint,
+  hintAccent,
+}: {
+  title: string;
+  desc: string;
+  min: number;
+  step: number;
+  draft: string;
+  setDraft: (v: string) => void;
+  commit: () => void;
+  hint: string;
+  hintAccent?: boolean;
+}) {
+  return (
+    <div className="rounded-lg px-3 py-2.5">
+      <div className="text-sm font-medium text-[var(--text)]">{title}</div>
+      <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">{desc}</div>
+      <div className="flex items-center gap-2.5">
+        <input
+          type="number"
+          min={min}
+          step={step}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          }}
+          className="w-32 rounded-lg border border-[var(--border)] bg-[var(--elevated)] px-2.5 py-1.5 text-sm text-[var(--text)] outline-none focus:border-[var(--accent)]"
+        />
+        <span className={"min-w-0 flex-1 text-[11px] " + (hintAccent ? "text-[var(--accent)]" : "text-[var(--text-faint)]")}>
+          {hint}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 const CLICK_MODES: { key: FileClickMode; label: string; desc: string }[] = [
   { key: "open", label: "单击打开（默认）", desc: "单击文件即在编辑器打开、文件夹即展开/折叠" },
   { key: "select", label: "单击选中 · 双击打开", desc: "单击仅选中(可 Ctrl/Shift 多选)，双击才打开/展开" },
 ];
 
-/** 全局设置弹窗（Cursor 式）。未来各类全局开关都加到这里。 */
+/* ===== 分类导航（Cursor 式左导航；上次停留分类全局记忆——设置是全局概念，不按工作区） ===== */
+
+type SectionKey = "general" | "appearance" | "terminal" | "files" | "connection";
+const SECTIONS: { key: SectionKey; label: string }[] = [
+  { key: "general", label: "通用" },
+  { key: "appearance", label: "外观" },
+  { key: "terminal", label: "终端" },
+  { key: "files", label: "文件与搜索" },
+  { key: "connection", label: "连接" },
+];
+const SECTION_KEY = "htybox.settingsSection.v1";
+
+/** 全局设置弹窗：宽体 + 左侧分类导航。未来新设置项加进对应分类（或新增 SECTIONS 项）。 */
 export default function SettingsModal({
   root,
   onClose,
@@ -39,6 +173,19 @@ export default function SettingsModal({
   onClose: () => void;
 }) {
   const s = useSettings();
+  const [section, setSection] = useState<SectionKey>(() => {
+    const v = localStorage.getItem(SECTION_KEY);
+    return SECTIONS.some((x) => x.key === v) ? (v as SectionKey) : "general";
+  });
+  const pick = (k: SectionKey) => {
+    setSection(k);
+    try {
+      localStorage.setItem(SECTION_KEY, k);
+    } catch {
+      /* localStorage 不可用 → 本次会话内仍生效 */
+    }
+  };
+
   const [draft, setDraft] = useState(String(s.maxFiles));
   const [count, setCount] = useState<number | null>(null);
   const [counting, setCounting] = useState(false);
@@ -96,212 +243,152 @@ export default function SettingsModal({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="max-h-[85vh] w-[460px] overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--bg)] p-5 shadow-2xl"
+        className="flex h-[min(78vh,640px)] w-[min(760px,92vw)] overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg)] shadow-2xl"
       >
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-base font-bold text-[var(--text)]">设置</h2>
-          <button
-            onClick={onClose}
-            className="rounded-md px-2 py-1 text-sm text-[var(--text-2)] transition-colors hover:bg-[var(--surface-hover)] hover:text-[var(--text)]"
-          >
-            ✕
-          </button>
-        </div>
-
-        <div className="space-y-1">
-          <div className="flex items-center justify-between gap-4 rounded-lg px-3 py-2.5 transition-colors hover:bg-[var(--surface-soft)]">
-            <div className="min-w-0">
-              <div className="text-sm font-medium text-[var(--text)]">悬浮提示</div>
-              <div className="text-[11px] text-[var(--text-faint)]">
-                鼠标停留时弹出 Skill / Memory 详情浮层
-              </div>
-            </div>
-            <Toggle
-              on={s.hoverPreview}
-              onChange={(v) => setSetting("hoverPreview", v)}
-            />
-          </div>
-
-          <div className="flex items-center justify-between gap-4 rounded-lg px-3 py-2.5 transition-colors hover:bg-[var(--surface-soft)]">
-            <div className="min-w-0">
-              <div className="text-sm font-medium text-[var(--text)]">多 Agent 全自动接力</div>
-              <div className="text-[11px] text-[var(--text-faint)]">
-                开：唤醒自动注入（终端静默后），团队无人工接力跑；关：半自动（弹提示，点击才唤醒）
-              </div>
-            </div>
-            <Toggle
-              on={s.autoRelay}
-              onChange={(v) => setSetting("autoRelay", v)}
-            />
-          </div>
-
-          <div className="rounded-lg px-3 py-2.5">
-            <div className="text-sm font-medium text-[var(--text)]">文件单击行为</div>
-            <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">
-              作用于文件树（全局搜索单独由下方开关控制）；选「单击选中」可像资源管理器那样 Ctrl/Shift 多选后批量操作
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              {CLICK_MODES.map((m) => {
-                const on = s.fileClickMode === m.key;
-                return (
-                  <button
-                    key={m.key}
-                    onClick={() => setSetting("fileClickMode", m.key)}
-                    className={
-                      "rounded-lg border px-3 py-2 text-left transition-colors " +
-                      (on
-                        ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                        : "border-[var(--border)] hover:bg-[var(--surface-soft)]")
-                    }
-                  >
-                    <div className="flex items-center gap-1.5 text-[13px] leading-tight text-[var(--text)]">
-                      {m.label}
-                      {on && <span className="text-[var(--accent)]">✓</span>}
-                    </div>
-                    <div className="mt-0.5 text-[10px] text-[var(--text-faint)]">{m.desc}</div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between gap-4 rounded-lg px-3 py-2.5 transition-colors hover:bg-[var(--surface-soft)]">
-            <div className="min-w-0">
-              <div className="text-sm font-medium text-[var(--text)]">全局搜索后打开文件</div>
-              <div className="text-[11px] text-[var(--text-faint)]">
-                开：单击搜索结果即在编辑器打开；关：仅在 File 页签定位选中、不打开（适合找文件喂给 AI，不切走终端）
-              </div>
-            </div>
-            <Toggle on={s.openFileFromSearch} onChange={(v) => setSetting("openFileFromSearch", v)} />
-          </div>
-
-          <div className="rounded-lg px-3 py-2.5">
-            <div className="text-sm font-medium text-[var(--text)]">外观主题</div>
-            <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">
-              浅色（奶油）/ 深色（暖棕黑）/ 跟随系统；终端配色保持暖深不变
-            </div>
-            <div className="grid grid-cols-3 gap-2">
-              {THEMES.map((t) => {
-                const on = s.theme === t.key;
-                return (
-                  <button
-                    key={t.key}
-                    onClick={() => {
-                      setSetting("theme", t.key);
-                      applyTheme(t.key);
-                      watchSystemTheme();
-                    }}
-                    className={
-                      "rounded-lg border px-3 py-2 text-left transition-colors " +
-                      (on
-                        ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                        : "border-[var(--border)] hover:bg-[var(--surface-soft)]")
-                    }
-                  >
-                    <div className="flex items-center gap-1.5 text-[13px] leading-tight text-[var(--text)]">
-                      {t.label}
-                      {on && <span className="text-[var(--accent)]">✓</span>}
-                    </div>
-                    <div className="mt-0.5 text-[10px] text-[var(--text-faint)]">{t.desc}</div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="rounded-lg px-3 py-2.5">
-            <div className="text-sm font-medium text-[var(--text)]">界面字体</div>
-            <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">
-              全局 UI、会话、编辑器、Markdown 预览跟随；终端与代码块保持等宽
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              {FONTS.map((f) => {
-                const on = s.fontFamily === f.key;
-                return (
-                  <button
-                    key={f.key}
-                    onClick={() => {
-                      setSetting("fontFamily", f.key);
-                      applyFont(f.key);
-                    }}
-                    style={{ fontFamily: f.stack }}
-                    className={
-                      "rounded-lg border px-3 py-2 text-left transition-colors " +
-                      (on
-                        ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                        : "border-[var(--border)] hover:bg-[var(--surface-soft)]")
-                    }
-                  >
-                    <div className="flex items-center gap-1.5 text-[15px] leading-tight text-[var(--text)]">
-                      {f.label}
-                      {on && <span className="text-[var(--accent)]">✓</span>}
-                    </div>
-                    <div className="mt-0.5 text-[11px] text-[var(--text-faint)]">{f.desc}</div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="rounded-lg px-3 py-2.5">
-            <div className="text-sm font-medium text-[var(--text)]">全局搜索索引上限</div>
-            <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">
-              双击 Shift 全局搜索一次最多索引的文件数；超出的不会被搜到。默认 10 万
-            </div>
-            <div className="flex items-center gap-2.5">
-              <input
-                type="number"
-                min={1000}
-                step={10000}
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                onBlur={commit}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                }}
-                className="w-32 rounded-lg border border-[var(--border)] bg-[var(--elevated)] px-2.5 py-1.5 text-sm text-[var(--text)] outline-none focus:border-[var(--accent)]"
-              />
-              <span
+        {/* 左：分类导航 */}
+        <div className="flex w-[168px] shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] px-3 py-4">
+          <h2 className="mb-3 px-2 text-base font-bold text-[var(--text)]">设置</h2>
+          {SECTIONS.map((x) => {
+            const on = section === x.key;
+            return (
+              <button
+                key={x.key}
+                onClick={() => pick(x.key)}
                 className={
-                  "min-w-0 flex-1 text-[11px] " + (over ? "text-[var(--accent)]" : "text-[var(--text-faint)]")
+                  "relative mb-0.5 rounded-lg px-3 py-2 text-left text-[12.5px] transition-colors " +
+                  (on
+                    ? "bg-[var(--accent-soft)] font-semibold text-[var(--text)]"
+                    : "text-[var(--text-2)] hover:bg-[var(--surface-hover)] hover:text-[var(--text)]")
                 }
               >
-                {countLabel}
-              </span>
-            </div>
-          </div>
-
-          <div className="rounded-lg px-3 py-2.5">
-            <div className="text-sm font-medium text-[var(--text)]">文件编辑大小上限</div>
-            <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">
-              编辑器可打开的最大文件体积（MB）；过大文件编辑可能卡顿，建议 ≤ 20。默认 10
-            </div>
-            <div className="flex items-center gap-2.5">
-              <input
-                type="number"
-                min={1}
-                step={1}
-                value={editMbDraft}
-                onChange={(e) => setEditMbDraft(e.target.value)}
-                onBlur={commitEditMb}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                }}
-                className="w-32 rounded-lg border border-[var(--border)] bg-[var(--elevated)] px-2.5 py-1.5 text-sm text-[var(--text)] outline-none focus:border-[var(--accent)]"
-              />
-              <span className="min-w-0 flex-1 text-[11px] text-[var(--text-faint)]">
-                MB · 对新打开的文件生效
-              </span>
-            </div>
-          </div>
-
-          <ConnectionSettings />
+                {on && <span className="absolute top-2 bottom-2 left-0 w-[3px] rounded-full bg-[var(--accent)]" />}
+                {x.label}
+              </button>
+            );
+          })}
         </div>
 
-        <div className="mt-4 border-t border-[var(--border)] pt-3 text-[10px] text-[var(--text-3)]">
-          更多全局设置将陆续加入此处。
+        {/* 右：当前分类内容（独立滚动） */}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex items-center justify-between border-b border-[var(--border-soft)] px-5 py-3.5">
+            <div className="text-[15px] font-bold text-[var(--text)]">
+              {SECTIONS.find((x) => x.key === section)?.label}
+            </div>
+            <button
+              onClick={onClose}
+              className="rounded-md px-2 py-1 text-sm text-[var(--text-2)] transition-colors hover:bg-[var(--surface-hover)] hover:text-[var(--text)]"
+            >
+              ✕
+            </button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+            {section === "general" && (
+              <div className="space-y-1">
+                <ToggleRow
+                  title="悬浮提示"
+                  desc="鼠标停留时弹出 Skill / Memory 详情浮层"
+                  on={s.hoverPreview}
+                  onChange={(v) => setSetting("hoverPreview", v)}
+                />
+                <ToggleRow
+                  title="多 Agent 全自动接力"
+                  desc="开：唤醒自动注入（终端静默后），团队无人工接力跑；关：半自动（弹提示，点击才唤醒）"
+                  on={s.autoRelay}
+                  onChange={(v) => setSetting("autoRelay", v)}
+                />
+              </div>
+            )}
+            {section === "appearance" && (
+              <div className="space-y-1">
+                <ChoiceGrid
+                  title="外观主题"
+                  desc="浅色（奶油）/ 深色（暖棕黑）/ 跟随系统；终端配色保持暖深不变"
+                  cols={3}
+                  options={THEMES.map((t) => ({ key: t.key, label: t.label, desc: t.desc }))}
+                  value={s.theme}
+                  onChange={(k) => {
+                    setSetting("theme", k);
+                    applyTheme(k);
+                    watchSystemTheme();
+                  }}
+                />
+                <ChoiceGrid
+                  title="界面字体"
+                  desc="全局 UI、会话、编辑器、Markdown 预览跟随；终端与代码块保持等宽"
+                  cols={2}
+                  large
+                  options={FONTS.map((f) => ({ key: f.key, label: f.label, desc: f.desc, style: { fontFamily: f.stack } }))}
+                  value={s.fontFamily}
+                  onChange={(k) => {
+                    setSetting("fontFamily", k);
+                    applyFont(k);
+                  }}
+                />
+              </div>
+            )}
+            {section === "terminal" && (
+              <div className="space-y-1">
+                <ToggleRow
+                  title="终端中键自动滚动"
+                  desc="按下鼠标中键出现滚轮锚点，移动即按距离自动滚动（仿浏览器）；vim 等接管鼠标的应用内自动让位"
+                  on={s.middleClickScroll}
+                  onChange={(v) => setSetting("middleClickScroll", v)}
+                />
+                <ToggleRow
+                  title="工作流面板"
+                  desc="终端底部的工作流进度面板；关闭后所有终端均不显示（绑定与进度保留）"
+                  on={s.showWorkflowPanel}
+                  onChange={(v) => setSetting("showWorkflowPanel", v)}
+                />
+              </div>
+            )}
+            {section === "files" && (
+              <div className="space-y-1">
+                <ChoiceGrid
+                  title="文件单击行为"
+                  desc="作用于文件树（全局搜索单独由下方开关控制）；选「单击选中」可像资源管理器那样 Ctrl/Shift 多选后批量操作"
+                  cols={2}
+                  options={CLICK_MODES.map((m) => ({ key: m.key, label: m.label, desc: m.desc }))}
+                  value={s.fileClickMode}
+                  onChange={(k) => setSetting("fileClickMode", k)}
+                />
+                <ToggleRow
+                  title="全局搜索后打开文件"
+                  desc="开：单击搜索结果即在编辑器打开；关：仅在 File 页签定位选中、不打开（适合找文件喂给 AI，不切走终端）"
+                  on={s.openFileFromSearch}
+                  onChange={(v) => setSetting("openFileFromSearch", v)}
+                />
+                <NumberField
+                  title="全局搜索索引上限"
+                  desc="双击 Shift 全局搜索一次最多索引的文件数；超出的不会被搜到。默认 10 万"
+                  min={1000}
+                  step={10000}
+                  draft={draft}
+                  setDraft={setDraft}
+                  commit={commit}
+                  hint={countLabel}
+                  hintAccent={over}
+                />
+                <NumberField
+                  title="文件编辑大小上限"
+                  desc="编辑器可打开的最大文件体积（MB）；过大文件编辑可能卡顿，建议 ≤ 20。默认 10"
+                  min={1}
+                  step={1}
+                  draft={editMbDraft}
+                  setDraft={setEditMbDraft}
+                  commit={commitEditMb}
+                  hint="MB · 对新打开的文件生效"
+                />
+              </div>
+            )}
+            {section === "connection" && <ConnectionSettings />}
+            <div className="mt-4 border-t border-[var(--border)] pt-3 text-[10px] text-[var(--text-3)]">
+              更多全局设置将陆续加入此处。
+            </div>
+          </div>
         </div>
       </div>
     </div>
   );
 }
+

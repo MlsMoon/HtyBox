@@ -106,8 +106,7 @@ export default function ConnectionSettings() {
   };
 
   return (
-    <div className="border-t border-[var(--border-soft)] pt-5">
-      <div className="mb-1 text-[13px] font-semibold text-[var(--text)]">连接（手机配对）</div>
+    <div className="px-3 py-2.5">
       <div className="mb-3 text-[11px] leading-relaxed text-[var(--text-3)]">
         在手机上用 HtyBox 扫码或粘贴链接，即可远程查看 / 操控本机终端。支持局域网直连，或经 relay 中继远程访问（异地 / 蜂窝）。
       </div>
