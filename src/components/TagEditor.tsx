@@ -66,6 +66,7 @@ export default function TagEditor({
   const [confirmDel, setConfirmDel] = useState<Tag | null>(null); // 删除词表 tag 的确认框
   // 原位编辑态（改名/改色）：clash = 提交被拒（空名/撞名）红边提示
   const [editing, setEditing] = useState<{ id: string; name: string; color: TagColorKey; clash: boolean } | null>(null);
+  const editRowRef = useRef<HTMLDivElement>(null); // 编辑行容器：popover 内点击行外 = 视同回车提交
   const commitEdit = () => {
     if (!editing) return;
     if (updateTag(editing.id, { name: editing.name })) setEditing(null);
@@ -121,6 +122,10 @@ export default function TagEditor({
       ref={ref}
       style={{ position: "fixed", left: pos.left, top: pos.top, zIndex: 120 }}
       className="w-[300px] overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--elevated)] shadow-xl"
+      onMouseDown={(e) => {
+        // 编辑态下点击编辑行以外的任意位置 = 提交（与回车一致，防"看似卡住"）；失败（撞名/空名）保持红边
+        if (editing && !editRowRef.current?.contains(e.target as Node)) commitEdit();
+      }}
     >
       {/* 头部：标题 + 会话名 + ✕ */}
       <div className="flex items-center gap-2 border-b border-[var(--border-soft)] px-3.5 py-2.5">
@@ -168,7 +173,7 @@ export default function TagEditor({
               // 原位编辑行：input（Enter 提交 / Esc 取消）+ 色点即时改色；撞名/空名红边不关闭
               if (editing?.id === t.id) {
                 return (
-                  <div key={t.id} className="flex w-full flex-wrap items-center gap-2 rounded-md border border-[var(--accent-border)] bg-[var(--surface)] px-2 py-1.5">
+                  <div key={t.id} ref={editRowRef} className="flex w-full flex-wrap items-center gap-2 rounded-md border border-[var(--accent-border)] bg-[var(--surface)] px-2 py-1.5">
                     <input
                       autoFocus
                       value={editing.name}
