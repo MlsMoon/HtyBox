@@ -144,6 +144,21 @@ html.dark {
   box-shadow: inset 0 0 0 9999px rgba(217, 119, 87, 0.08);
 }
 
+/* 终端中键自动滚动会话期间的全局光标（见 middleScroll.ts）：
+   死区内=全向，出死区按方向变上/下箭头；!important 压过 xterm 自带 cursor */
+body.htybox-mscroll-idle,
+body.htybox-mscroll-idle * {
+  cursor: all-scroll !important;
+}
+body.htybox-mscroll-up,
+body.htybox-mscroll-up * {
+  cursor: n-resize !important;
+}
+body.htybox-mscroll-down,
+body.htybox-mscroll-down * {
+  cursor: s-resize !important;
+}
+
 /* HtyBox 纸箱 logo：箱体描边随主题（浅=深墨线，暗=暖棕勾勒，避免暗底糊成一团）；
    仅覆盖 polygon/line 的 stroke，不动 fill（陶土色）与 hty 文字层（含阴影层）。 */
 .hty-logo polygon,

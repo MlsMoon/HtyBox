@@ -83,15 +83,18 @@ export function launchCmdFor(
 }
 
 export interface DragItem {
-  kind: "skill" | "memory" | "file" | "text";
+  kind: "skill" | "memory" | "file" | "text" | "workflow";
   invoke?: string; // skill 的 /调用串
   text?: string; // text(书签)：直接注入的文本内容
   path?: string; // 文件绝对路径（text 类型无 path）
   paths?: string[]; // file 多选拖拽：多个绝对路径（有则优先于 path）
+  workflowId?: string; // workflow：拖到终端=绑定该工作流（非文本注入，落点分支处理）
 }
 
 /** 按目标终端的 agent 类型决定注入文本（落点时计算，而非拖起时）。 */
 export function injectText(item: DragItem, agent: AgentKind): string {
+  // workflow：语义是"绑定"而非注入，落点（TerminalDock onDrop）分支拦截，不产生注入文本
+  if (item.kind === "workflow") return "";
   // text(书签)：直接注入文本内容，三种 agent 一致；多行压成单行防 agent 输入框逐行误提交。
   if (item.kind === "text") return (item.text ?? "").replace(/\r?\n/g, " ").trim();
   if (item.kind === "skill") {

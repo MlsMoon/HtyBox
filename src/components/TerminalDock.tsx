@@ -48,6 +48,19 @@ import { pingAgentActivity, clearTerm } from "../agentStatus";
 import ContextMenu from "./ui/ContextMenu";
 import TagEditor from "./TagEditor";
 import type { RunConfig } from "../runConfigs";
+import WorkflowBar from "./WorkflowBar";
+import WorkflowPicker from "./WorkflowPicker";
+import ConfirmModal from "./ui/ConfirmModal";
+import { MENU_SEP, type MenuItem } from "./ui/ContextMenu";
+import {
+  clearRun,
+  getRun,
+  applyWorkflow,
+  resetRun,
+  archiveRunToSession,
+  restoreRunFromSession,
+} from "../workflowRuns";
+import { getWorkflow, type Workflow } from "../workflows";
 
 type TermParams = {
   termId: string;
@@ -62,6 +75,12 @@ type TermParams = {
 };
 
 const DRAG_MIME = "application/x-htybox-item";
+
+// 终端 id 形如 "<wsId>::t-…"，反推工作区 id（工作流模板库按工作区独立，scope 用它）
+const wsOfTerm = (termId: string): string => {
+  const i = termId.indexOf("::");
+  return i >= 0 ? termId.slice(0, i) : termId;
+};
 
 // 用户手动重命名过的 Tab（termId→名字），持久化；自动命名遇到它会跳过、不覆盖。
 const CT_KEY = "htybox.customTitles.v1";
@@ -271,6 +290,8 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
   const [draft, setDraft] = useState("");
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null); // Tab 右键菜单
   const [tagEditor, setTagEditor] = useState<{ x: number; y: number } | null>(null); // 标签编辑器
+  const [wfPicker, setWfPicker] = useState<{ x: number; y: number } | null>(null); // 应用工作流选择器
+  const [confirmWfUnbind, setConfirmWfUnbind] = useState(false); // 解绑工作流确认
   useEffect(() => {
     const d = props.api.onDidTitleChange((e) => setTitle(e.title));
     return () => d.dispose();
@@ -371,15 +392,50 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
       <ContextMenu
         x={menu.x}
         y={menu.y}
-        items={[
-          { id: "rename", label: "重命名" },
-          { id: "tags", label: canTag ? "标签…" : "标签（会话初始化中…）" },
-        ]}
+        items={(() => {
+          const items: (MenuItem | typeof MENU_SEP)[] = [
+            { id: "rename", label: "重命名" },
+            { id: "tags", label: canTag ? "标签…" : "标签（会话初始化中…）" },
+          ];
+          // 终端面板才有工作流项（编辑器面板无 termId）；按当前是否已绑定动态出项
+          if (p2.termId) {
+            items.push(MENU_SEP);
+            if (getRun(p2.termId)) {
+              items.push({ id: "wf-reset", label: "重置工作流进度" });
+              items.push({ id: "wf-unbind", label: "解绑工作流", danger: true });
+            } else {
+              items.push({ id: "wf-apply", label: "应用工作流…" });
+            }
+          }
+          return items;
+        })()}
         onAction={(id) => {
           if (id === "rename") startRename();
           else if (id === "tags" && canTag) setTagEditor({ x: menu.x, y: menu.y });
+          else if (id === "wf-apply") setWfPicker({ x: menu.x, y: menu.y });
+          else if (id === "wf-reset" && p2.termId) resetRun(p2.termId);
+          else if (id === "wf-unbind") setConfirmWfUnbind(true);
         }}
         onClose={() => setMenu(null)}
+      />
+    )}
+    {wfPicker && p2.termId && (
+      <WorkflowPicker
+        scope={wsOfTerm(p2.termId)}
+        x={wfPicker.x}
+        y={wfPicker.y}
+        mode="apply"
+        onPick={(wf) => applyWorkflow(p2.termId as string, wf)}
+        onClose={() => setWfPicker(null)}
+      />
+    )}
+    {confirmWfUnbind && p2.termId && (
+      <ConfirmModal
+        title="解绑工作流"
+        message="将移除该终端的工作流进度（模板不受影响）。"
+        confirmText="解绑"
+        onConfirm={() => clearRun(p2.termId as string)}
+        onClose={() => setConfirmWfUnbind(false)}
       />
     )}
     {tagEditor && canTag && (
@@ -400,6 +456,8 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
 function DockTerminal(props: IDockviewPanelProps<TermParams>) {
   const { termId, shell, agentKind = "shell", cwd, env } = props.params;
   const ref = useRef<HTMLDivElement>(null);
+  // 拖入工作流但已有绑定 → 覆盖确认（覆盖=重置进度，破坏性，走确认弹窗）
+  const [confirmWf, setConfirmWf] = useState<Workflow | null>(null);
   useEffect(() => {
     const c = ref.current;
     if (!c) return;
@@ -464,6 +522,15 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
       e.preventDefault();
       try {
         const item = JSON.parse(raw) as DragItem;
+        // workflow：语义=绑定到本终端（非文本注入）；已有实例走覆盖确认（会重置进度）
+        if (item.kind === "workflow") {
+          const wf = item.workflowId ? getWorkflow(wsOfTerm(termId), item.workflowId) : undefined;
+          if (wf) {
+            if (getRun(termId)) setConfirmWf(wf);
+            else applyWorkflow(termId, wf);
+          }
+          return;
+        }
         const text = injectText(item, agentKind) + (e.shiftKey ? "\r" : "");
         invoke("write_terminal", { id: termId, data: text }).catch(() => {});
         focusEngine(termId);
@@ -487,8 +554,25 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
       detachEngine(termId);
     };
   }, [termId, shell, agentKind, cwd, props.api]);
-  // 内边距 + 终端底色：避免 xterm 内容贴边被面板边缘裁切
-  return <div ref={ref} className="h-full w-full bg-[#1f1e1d] p-2" />;
+  // 内边距 + 终端底色：避免 xterm 内容贴边被面板边缘裁切。
+  // flex-col：xterm 宿主(flex-1，ref 仍在宿主上、RO 观察它) + 底部工作流面板；
+  // 外层 relative 供 WorkflowBar 收起态浮标 absolute 定位。面板显隐引起的宿主高度变化由
+  // attachEngine 的 ResizeObserver + 防抖 fit 吸收。
+  return (
+    <div className="relative flex h-full w-full flex-col bg-[#1f1e1d]">
+      <div ref={ref} className="min-h-0 w-full flex-1 p-2" />
+      <WorkflowBar termId={termId} />
+      {confirmWf && (
+        <ConfirmModal
+          title="覆盖当前工作流"
+          message={`该终端已绑定工作流，改为应用「${confirmWf.name}」并重新开始？`}
+          confirmText="覆盖应用"
+          onConfirm={() => applyWorkflow(termId, confirmWf)}
+          onClose={() => setConfirmWf(null)}
+        />
+      )}
+    </div>
+  );
 }
 
 /** 工具栏图标：Claude / Codex 用 FanBox 仓库的官方 SVG 素材；PowerShell 用终端 >_。 */
@@ -612,6 +696,25 @@ export default function TerminalDock({
     [cwd],
   );
 
+  // 按工作流新建终端：选 agent + 工作流 → 新建终端并立即绑定（阶段 1 待执行）
+  const [spawnPicker, setSpawnPicker] = useState<{ x: number; y: number } | null>(null);
+  const spawnWithWorkflow = useCallback(
+    (profile: Profile, wf: Workflow) => {
+      const api = apiRef.current;
+      if (!api) return;
+      const id = mkId();
+      api.addPanel({
+        id,
+        component: "terminal",
+        title: titleFor(profile),
+        params: paramsFor(profile, id, cwd),
+      });
+      applyWorkflow(id, wf);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [cwd],
+  );
+
   // M9：dock 批量操作（关闭所有/其他/已保存编辑器）
   const closeAll = useCallback(() => {
     apiRef.current?.panels.slice().forEach((p) => p.api.close());
@@ -649,6 +752,15 @@ export default function TerminalDock({
         // 工作区关闭中：引擎已由 disposeByPrefix 统一结束，且要保留布局/自定义名供复原 → 跳过
         if (CLOSING.has(workspaceId)) return;
         disposeEngine(termId);
+        // 工作流实例：agent 终端且已捕获会话 id → 归档到会话维度（Session 复原时找回，
+        // 关闭终端 ≠ 丢进度）；shell / 未捕获 → 直接清理。须在下方 delete SESSION_IDS 之前读取。
+        {
+          const wfSid = SESSION_IDS[termId];
+          const ak = params?.agentKind;
+          if (wfSid && (ak === "claude" || ak === "codex"))
+            archiveRunToSession(termId, `${ak}:${wfSid}`);
+          else clearRun(termId);
+        }
         if (CUSTOM_TITLES[termId]) {
           delete CUSTOM_TITLES[termId];
           saveCT();
@@ -821,10 +933,12 @@ export default function TerminalDock({
         const api = apiRef.current;
         if (!api) return;
         const id = mkId();
-        // Session 面板复原：记下被复原的 session id，供退出重进后再按 id 精确复原
+        // Session 面板复原：记下被复原的 session id，供退出重进后再按 id 精确复原；
+        // 该会话若有归档的工作流进度（终端曾关闭），一并移回新终端
         if (opts.sessionId) {
           SESSION_IDS[id] = opts.sessionId;
           saveSI();
+          restoreRunFromSession(`${opts.agentKind}:${opts.sessionId}`, id);
         }
         api.addPanel({
           id,
@@ -839,6 +953,23 @@ export default function TerminalDock({
             sessionId: opts.sessionId,
           },
         });
+      },
+      activateTerminal: (termId) => {
+        const api = apiRef.current;
+        if (!api) return;
+        const panel = api.panels.find(
+          (p) => (p.params as TermParams | undefined)?.termId === termId,
+        );
+        if (panel) {
+          panel.api.setActive();
+          focusEngine(termId);
+        }
+      },
+      terminalTitle: (termId) => {
+        const api = apiRef.current;
+        // PanelApi 的 title 属性（DockTab 的 props.api.title 同源，已实证）
+        return api?.panels.find((p) => (p.params as TermParams | undefined)?.termId === termId)
+          ?.api.title;
       },
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -858,6 +989,22 @@ export default function TerminalDock({
             <ProfileIcon id={p.id} />
           </button>
         ))}
+        <button
+          onClick={(e) => {
+            const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+            setSpawnPicker({ x: r.left, y: r.bottom + 4 });
+          }}
+          title="按工作流新建终端"
+          className="flex h-7 items-center gap-0.5 rounded-md px-1.5 text-[var(--accent)] transition-colors hover:bg-[var(--elevated)]"
+        >
+          <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <circle cx="5" cy="12" r="2.4" fill="currentColor" stroke="none" />
+            <path d="M8.5 12h4" />
+            <circle cx="16" cy="12" r="2.4" fill="currentColor" stroke="none" />
+            <path d="M19.5 12h1.5" />
+          </svg>
+          <span className="text-[8px] text-[var(--text-3)]">▾</span>
+        </button>
         <div className="flex-1" />
         <RunConfigBar workspaceId={workspaceId} root={cwd} onRun={runCfg} />
         <DockActionsMenu
@@ -866,6 +1013,16 @@ export default function TerminalDock({
           onCloseSaved={closeSavedEditors}
         />
       </div>
+      {spawnPicker && (
+        <WorkflowPicker
+          scope={workspaceId}
+          x={spawnPicker.x}
+          y={spawnPicker.y}
+          mode="spawn"
+          onSpawn={spawnWithWorkflow}
+          onClose={() => setSpawnPicker(null)}
+        />
+      )}
       <div className="dockview-theme-light min-h-0 flex-1">
         <DockviewReact
           components={components}

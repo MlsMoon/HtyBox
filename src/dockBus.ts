@@ -5,6 +5,8 @@ interface DockHost {
   openEditor: (path: string) => void;
   openTerminalAt: (cwd: string) => void;
   openTerminalCmd: (opts: { command: string; agentKind: string; title: string; cwd?: string; sessionId?: string }) => void;
+  activateTerminal: (termId: string) => void;
+  terminalTitle: (termId: string) => string | undefined;
 }
 
 const hosts = new Map<string, DockHost>();
@@ -32,6 +34,16 @@ export function openTerminalCmd(
   opts: { command: string; agentKind: string; title: string; cwd?: string; sessionId?: string },
 ): void {
   hosts.get(workspaceId)?.openTerminalCmd(opts);
+}
+
+/** 激活并聚焦某终端面板（FlowPanel「进行中」总览点击跳转用）。 */
+export function activateTerminal(workspaceId: string, termId: string): void {
+  hosts.get(workspaceId)?.activateTerminal(termId);
+}
+
+/** 取某终端面板当前 Tab 标题（FlowPanel 总览行显示终端名用；面板不存在返回 undefined）。 */
+export function terminalTitle(workspaceId: string, termId: string): string | undefined {
+  return hosts.get(workspaceId)?.terminalTitle(termId);
 }
 
 // M9-N7：编辑器面板被激活时通知 FilePanel“揭示并定位”该文件。FilePanel 注册，TerminalDock 触发。

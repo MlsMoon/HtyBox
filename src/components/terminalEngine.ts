@@ -3,6 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { pingAgentActivity } from "../agentStatus";
+import { attachMiddleScroll } from "../middleScroll";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -37,6 +38,7 @@ interface Engine {
   lastOutputAt?: number; // 最近一次收到 PTY 输出的时间戳（M7-D：静默=回合物理结束、可安全注入）
   agentKind?: string; // "claude"|"codex"|"shell"：决定是否把 PTY 活动上报运行状态总线
   lastPingAt?: number; // 最近一次向 agentStatus 上报活动的时刻（节流 PTY 高频输出，避免每帧都 ping）
+  midScroll: () => void; // 解绑中键自动滚动（dispose 时调用；见 middleScroll.ts）
 }
 
 const engines = new Map<string, Engine>();
@@ -159,6 +161,8 @@ export function ensureEngine(
     created: false,
     launchArmed: false,
     launched: false,
+    // 中键自动滚动挂宿主 el（与 paste 拦截同位置）：跟随引擎生命周期，dockview 重排不丢
+    midScroll: attachMiddleScroll(term, el),
   });
 }
 
@@ -300,6 +304,7 @@ export function disposeEngine(termId: string): void {
   if (!e) return;
   e.ro?.disconnect();
   if (e.fitTimer) clearTimeout(e.fitTimer);
+  e.midScroll(); // 解绑中键滚动；若滚动会话正属于本终端则一并清场
   if (e.created) invoke("close_terminal", { id: termId }).catch(() => {});
   e.term.dispose();
   e.el.parentElement?.removeChild(e.el);

@@ -32,15 +32,30 @@ export interface Bookmark {
   updatedAt: number;
 }
 
-const KEY = "htybox.bookmarks.v1";
+// v2 起「数组物理顺序即展示序」（拖拽重排直接改数组）；v1 是 updatedAt 派生序旧语义，保留作回滚。
+const KEY = "htybox.bookmarks.v2";
+const LEGACY_KEY = "htybox.bookmarks.v1";
 
 // 空数组共享常量：getBookmarks 对无书签的 scope 返回它，保证 useSyncExternalStore 快照引用稳定。
 const EMPTY: Bookmark[] = [];
 
 function load(): Record<string, Bookmark[]> {
   try {
-    const v = JSON.parse(localStorage.getItem(KEY) || "{}");
+    const v = JSON.parse(localStorage.getItem(KEY) || "null");
     if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, Bookmark[]>;
+    // v2 缺失 → 从 v1 一次性迁移：按旧展示序（星标置顶 + updatedAt 降序）固化数组序，升级前后肉眼顺序一致
+    const legacy = JSON.parse(localStorage.getItem(LEGACY_KEY) || "null");
+    if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
+      const migrated: Record<string, Bookmark[]> = {};
+      for (const [scope, list] of Object.entries(legacy as Record<string, Bookmark[]>)) {
+        migrated[scope] = [...list].sort((a, b) => {
+          if (a.important !== b.important) return a.important ? -1 : 1;
+          return b.updatedAt - a.updatedAt;
+        });
+      }
+      localStorage.setItem(KEY, JSON.stringify(migrated));
+      return migrated;
+    }
   } catch {
     /* localStorage 不可用 / 损坏 → 降级空对象 */
   }
@@ -107,6 +122,32 @@ export function toggleImportant(scope: string, id: string): void {
   );
 }
 
+/** 拖拽重排：把 dragId 项移到 targetId 项之前/之后（数组物理位置）。
+ *  id 缺失/自移动=无操作（拖拽手势语义：目标已不存在则什么都不发生）。 */
+export function moveBookmark(
+  scope: string,
+  dragId: string,
+  targetId: string,
+  place: "before" | "after",
+): void {
+  if (dragId === targetId) return;
+  const list = getBookmarks(scope);
+  const drag = list.find((b) => b.id === dragId);
+  if (!drag) return;
+  const rest = list.filter((b) => b.id !== dragId);
+  const ti = rest.findIndex((b) => b.id === targetId);
+  if (ti < 0) return;
+  const at = place === "before" ? ti : ti + 1;
+  commit(scope, [...rest.slice(0, at), drag, ...rest.slice(at)]);
+}
+
+/** 撤销删除复位：把书签插回数组指定物理位置（越界钳到两端）。 */
+export function insertBookmarkAt(scope: string, b: Bookmark, index: number): void {
+  const list = getBookmarks(scope);
+  const at = Math.max(0, Math.min(index, list.length));
+  commit(scope, [...list.slice(0, at), b, ...list.slice(at)]);
+}
+
 function subscribe(l: () => void): () => void {
   listeners.add(l);
   return () => {
@@ -122,12 +163,11 @@ export function useBookmarks(scope: string): Bookmark[] {
   );
 }
 
-/** 排序：重要(星标)置顶，再按 updatedAt 降序。 */
+/** 展示序：星标区在前、普通区在后，区内保持数组相对顺序（filter 保序）。
+ *  数组物理顺序即展示序（对齐 SkillTemplateModal 模板重排范式），拖拽重排=直接改数组；
+ *  刻意不再按 updatedAt 排——编辑不跳位，否则手动排好的顺序会被编辑打乱。 */
 export function sortedBookmarks(list: Bookmark[]): Bookmark[] {
-  return [...list].sort((a, b) => {
-    if (a.important !== b.important) return a.important ? -1 : 1;
-    return b.updatedAt - a.updatedAt;
-  });
+  return [...list.filter((b) => b.important), ...list.filter((b) => !b.important)];
 }
 
 // —— 显示 / 复制 / 注入 文本规则（标题、内容均可空，见计划决策 7）——

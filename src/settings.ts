@@ -23,10 +23,14 @@ export interface Settings {
   openFileFromSearch: boolean;
   /** 编辑器可打开的文件大小上限（MB）；过大文件编辑可能卡顿。默认 10 */
   maxEditMB: number;
+  /** 终端底部工作流面板总开关：关闭后所有终端不显示面板（绑定与进度数据保留）。默认开 */
+  showWorkflowPanel: boolean;
+  /** 终端中键自动滚动：按下鼠标中键出滚轮锚点、移动即按距离自动滚动（仿浏览器）。默认开 */
+  middleClickScroll: boolean;
 }
 
 const KEY = "htybox.settings.v1";
-const DEFAULTS: Settings = { hoverPreview: true, autoRelay: false, fontFamily: "harmony", maxFiles: 100000, theme: "light", fileClickMode: "open", openFileFromSearch: false, maxEditMB: 10 };
+const DEFAULTS: Settings = { hoverPreview: true, autoRelay: false, fontFamily: "harmony", maxFiles: 100000, theme: "light", fileClickMode: "open", openFileFromSearch: false, maxEditMB: 10, showWorkflowPanel: true, middleClickScroll: true };
 
 function load(): Settings {
   try {

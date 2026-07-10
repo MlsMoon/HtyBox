@@ -47,6 +47,7 @@ const wsRunning = (ws: string): boolean => {
 export function pingAgentActivity(termId: string): void {
   const ws = wsOf(termId);
   const wasRunning = wsRunning(ws);
+  const wasTermRunning = running.get(termId) === true;
   running.set(termId, true);
   const t = idleTimers.get(termId);
   if (t) window.clearTimeout(t);
@@ -54,7 +55,9 @@ export function pingAgentActivity(termId: string): void {
     termId,
     window.setTimeout(() => markIdle(termId), IDLE_MS),
   );
-  if (!wasRunning) emit(); // 该工作区由非运行 → 运行
+  // 工作区聚合跳变（顶栏图标）或单终端跳变（WorkflowBar 徽记）都需要通知；
+  // 高频 ping 期间两者均已 true → 不 emit，无重渲染开销
+  if (!wasRunning || !wasTermRunning) emit();
 }
 
 function markIdle(termId: string): void {
@@ -105,4 +108,9 @@ export function workspaceStatus(ws: string): WsStatus {
   if (wsRunning(ws)) return "running";
   if (doneUnseen.has(ws)) return "done-unseen";
   return "idle";
+}
+
+/** 单终端是否正在跑（WorkflowBar「执行中/已静默」徽记、FlowPanel 总览运行点用）。 */
+export function isTermRunning(termId: string): boolean {
+  return running.get(termId) === true;
 }

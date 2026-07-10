@@ -3,10 +3,11 @@ import SkillPanel from "./SkillPanel";
 import MemoryPanel from "./MemoryPanel";
 import FilePanel from "./FilePanel";
 import SessionPanel from "./SessionPanel";
+import FlowPanel from "./FlowPanel";
 import { getWsState, setWsState } from "../wsState";
 import { registerSidebarTab } from "../dockBus";
 
-type Tab = "skill" | "memory" | "file" | "session";
+type Tab = "skill" | "memory" | "file" | "session" | "flow";
 
 function SkillIcon() {
   return (
@@ -72,16 +73,35 @@ function SessionIcon() {
   );
 }
 
+function FlowIcon() {
+  return (
+    <svg
+      className="h-3.5 w-3.5"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+    >
+      <circle cx="5" cy="12" r="2.2" fill="currentColor" stroke="none" />
+      <path d="M8 12h4.5" />
+      <circle cx="15.5" cy="12" r="2.2" fill="currentColor" stroke="none" />
+      <path d="M19 12h1.5" />
+    </svg>
+  );
+}
+
 const TABS: { id: Tab; label: string; icon: () => ReactElement }[] = [
   { id: "file", label: "File", icon: FileTreeIcon },
   { id: "skill", label: "Skill", icon: SkillIcon },
   { id: "memory", label: "Memory", icon: MemoryIcon },
   { id: "session", label: "Session", icon: SessionIcon },
+  { id: "flow", label: "Flow", icon: FlowIcon },
 ];
 
 // tab 选择按工作区独立持久化（每个工作区各记各的，跨重启保留）
 const TAB_KEY = "htybox.sidebarTab.v1";
-const VALID_TABS: Tab[] = ["file", "skill", "memory", "session"];
+const VALID_TABS: Tab[] = ["file", "skill", "memory", "session", "flow"];
 const readTab = (slug: string): Tab => {
   const t = getWsState<Tab>(TAB_KEY, slug, "skill");
   return VALID_TABS.includes(t) ? t : "skill";
@@ -146,8 +166,10 @@ export default function Sidebar({
           <SkillPanel projectDir={workspacePath} />
         ) : tab === "memory" ? (
           <MemoryPanel slug={workspaceSlug} />
-        ) : (
+        ) : tab === "session" ? (
           <SessionPanel root={workspacePath} workspaceId={workspaceSlug} />
+        ) : (
+          <FlowPanel projectDir={workspacePath} workspaceId={workspaceSlug} />
         )}
       </div>
     </div>
