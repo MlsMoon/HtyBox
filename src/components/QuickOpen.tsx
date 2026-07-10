@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { listAllFiles, type FileRef } from "../catalog";
 import { openEditor, emitActiveFile, emitActiveFolder, requestSidebarTab } from "../dockBus";
+import { loadFavFolders, toggleFavFolder, onFavFoldersChange } from "../favFolders";
 import { loadIgnore } from "../fileIgnore";
 import { searchScore } from "../search";
 import { useSettings } from "../settings";
@@ -24,6 +25,12 @@ export default function QuickOpen({
   const [q, setQ] = useState("");
   const [sel, setSel] = useState(0);
   const s = useSettings();
+  // 收藏文件夹：与 File 页签共享 favFolders.ts，收藏后不关面板、两处实时同步
+  const [favs, setFavs] = useState<string[]>(() => loadFavFolders(root));
+  useEffect(() => {
+    setFavs(loadFavFolders(root));
+    return onFavFoldersChange(() => setFavs(loadFavFolders(root)));
+  }, [root]);
 
   useEffect(() => {
     const ig = loadIgnore(root); // 排除被忽略的文件夹/扩展名
@@ -108,25 +115,49 @@ export default function QuickOpen({
               {all.length === 0 && allFolders.length === 0 ? "正在索引…" : "无匹配项"}
             </div>
           )}
-          {results.map((item, i) => (
-            <button
-              key={(item.isDir ? "d:" : "f:") + item.f.path}
-              onMouseEnter={() => setSel(i)}
-              onClick={() => act(item.f, item.isDir)}
-              className={
-                "flex w-full items-center gap-2 px-4 py-1.5 text-left " +
-                (i === sel ? "bg-[var(--accent)]/12" : "hover:bg-[var(--surface)]")
-              }
-            >
-              {item.isDir ? (
-                <svg className="h-3.5 w-3.5 shrink-0 text-[var(--accent-text)]" viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z" /></svg>
-              ) : (
-                <svg className="h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg>
-              )}
-              <span className="shrink-0 text-[13px] text-[var(--text)]">{item.f.name}</span>
-              <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-3)]">{item.f.rel}</span>
-            </button>
-          ))}
+          {results.map((item, i) => {
+            const isFav = item.isDir && favs.includes(item.f.path);
+            return (
+              <button
+                key={(item.isDir ? "d:" : "f:") + item.f.path}
+                onMouseEnter={() => setSel(i)}
+                onClick={() => act(item.f, item.isDir)}
+                className={
+                  "group flex w-full items-center gap-2 px-4 py-1.5 text-left " +
+                  (i === sel ? "bg-[var(--accent)]/12" : "hover:bg-[var(--surface)]")
+                }
+              >
+                {item.isDir ? (
+                  <svg className="h-3.5 w-3.5 shrink-0 text-[var(--accent-text)]" viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z" /></svg>
+                ) : (
+                  <svg className="h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg>
+                )}
+                <span className="shrink-0 text-[13px] text-[var(--text)]">{item.f.name}</span>
+                <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-3)]">{item.f.rel}</span>
+                {/* 文件夹可直接收藏（button 内不可嵌 button，用 span 热区）：已收藏常显实心，未收藏 hover/选中行显示 */}
+                {item.isDir && (
+                  <span
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleFavFolder(root, item.f.path);
+                    }}
+                    title={isFav ? "取消收藏" : "收藏文件夹"}
+                    className={
+                      "shrink-0 cursor-pointer p-0.5 " +
+                      (isFav
+                        ? "text-[var(--accent)]"
+                        : "text-[var(--text-faint)] hover:text-[var(--accent)] " +
+                          (i === sel ? "opacity-100" : "opacity-0 group-hover:opacity-100"))
+                    }
+                  >
+                    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill={isFav ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 1 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+                    </svg>
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </div>
         {(all.length > 0 || allFolders.length > 0) && (
           <div className="flex items-center justify-between gap-2 border-t border-[var(--border)] px-4 py-1.5 text-[11px] text-[var(--text-3)]">

@@ -18,6 +18,7 @@ import FileIgnoreModal from "./FileIgnoreModal";
 import PromptModal from "./ui/PromptModal";
 import ConfirmModal from "./ui/ConfirmModal";
 import { loadIgnore, saveIgnore, extOf, type IgnoreCfg } from "../fileIgnore";
+import { loadFavFolders, toggleFavFolder as toggleFavStored, remapFavPaths, onFavFoldersChange } from "../favFolders";
 import { getWsState, setWsState } from "../wsState";
 import { useSettings } from "../settings";
 
@@ -41,25 +42,6 @@ async function listEntries(dir: FileSystemDirectoryEntry): Promise<FileSystemEnt
   return all;
 }
 
-// 收藏的文件夹按工作区(root)持久化：{ [root]: 绝对路径[] }
-const FAV_KEY = "htybox.favFolders.v1";
-function loadFavFolders(root: string): string[] {
-  try {
-    const all = JSON.parse(localStorage.getItem(FAV_KEY) || "{}");
-    return Array.isArray(all[root]) ? all[root] : [];
-  } catch {
-    return [];
-  }
-}
-function saveFavFolders(root: string, paths: string[]): void {
-  try {
-    const all = JSON.parse(localStorage.getItem(FAV_KEY) || "{}");
-    all[root] = paths;
-    localStorage.setItem(FAV_KEY, JSON.stringify(all));
-  } catch {
-    /* ignore */
-  }
-}
 const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
 // 文件树展开状态按工作区(root)持久化：完整复原上次展开的目录层级（用户要"像没关过"）
@@ -211,14 +193,11 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
   }, [root, load]);
   useEffect(() => registerActiveFileReveal(workspaceId, reveal), [workspaceId, reveal]);
 
-  // 收藏文件夹：原树照常显示，仅在顶部独立区提供快速跳转
+  // 收藏文件夹：原树照常显示，顶部独立区提供快速跳转 + 就地展开子树（迷你树）。
+  // 读写走 favFolders.ts 公共模块（QuickOpen 共用），本地 state 靠事件订阅同步。
   const isFavFolder = (p: string) => favFolders.includes(p);
-  const toggleFavFolder = (p: string) =>
-    setFavFolders((prev) => {
-      const next = prev.includes(p) ? prev.filter((x) => x !== p) : [...prev, p];
-      saveFavFolders(root, next);
-      return next;
-    });
+  const toggleFavFolder = (p: string) => toggleFavStored(root, p);
+  useEffect(() => onFavFoldersChange(() => setFavFolders(loadFavFolders(root))), [root]);
   // 在树里展开各级祖先 + 该文件夹自身 + 高亮滚动到它（收藏跳转 / 全局搜索单击文件夹复用）
   const revealFolder = useCallback((p: string) => {
     const dirs: string[] = [];
@@ -332,8 +311,11 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
       const fails: string[] = [];
       for (const src of srcs) {
         if (src === dir || dir.startsWith(src) || dirOf(src) === dir) continue; // 跳过移入自身/子目录/原地
-        try { await moveEntry(src, dir); srcDirs.add(dirOf(src)); }
-        catch (err) { fails.push(`${baseName(src)}：${String(err)}`); }
+        try {
+          const np = await moveEntry(src, dir); // 后端返回新绝对路径
+          remapFavPaths(root, src, np); // 收藏路径跟随树内拖拽移动
+          srcDirs.add(dirOf(src));
+        } catch (err) { fails.push(`${baseName(src)}：${String(err)}`); }
       }
       expand(dir); reloadDir(dir); srcDirs.forEach(reloadDir);
       setSelected(new Set());
@@ -355,8 +337,11 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
         const dirs = new Set<string>();
         const fails: string[] = [];
         for (const p of paths) {
-          try { await deleteEntry(p); dirs.add(dirOf(p)); }
-          catch (e) { fails.push(`${baseName(p)}：${String(e)}`); }
+          try {
+            await deleteEntry(p);
+            remapFavPaths(root, p, null); // 被删路径（含子孙收藏）从收藏移除，不留死链
+            dirs.add(dirOf(p));
+          } catch (e) { fails.push(`${baseName(p)}：${String(e)}`); }
         }
         dirs.forEach(reloadDir);
         setSelected(new Set());
@@ -381,7 +366,11 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
           runPrompt("新建文件夹", "", "创建", async (v) => { await createEntry(dir, v, true); expand(dir); reloadDir(dir); });
           break;
         case "rename":
-          runPrompt("重命名", node.name, "重命名", async (v) => { await renameEntry(node.path, v); reloadDir(dirOf(node.path)); });
+          runPrompt("重命名", node.name, "重命名", async (v) => {
+            const np = await renameEntry(node.path, v); // 后端返回新绝对路径
+            remapFavPaths(root, node.path, np); // 收藏路径（含子孙收藏）跟随改名
+            reloadDir(dirOf(node.path));
+          });
           break;
         case "delete": askDeletePaths(targets); break;
         case "cut": setClip({ paths: targets, mode: "cut" }); break;
@@ -391,8 +380,10 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
             const fails: string[] = [];
             for (const p of clip.paths) {
               try {
-                if (clip.mode === "cut") await moveEntry(p, dir);
-                else await copyEntry(p, dir);
+                if (clip.mode === "cut") {
+                  const np = await moveEntry(p, dir); // 后端返回新绝对路径
+                  remapFavPaths(root, p, np); // 收藏路径跟随移动
+                } else await copyEntry(p, dir);
               } catch (err) { fails.push(`${baseName(p)}：${String(err)}`); }
             }
             expand(dir); reloadDir(dir);
@@ -413,10 +404,11 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
     }
   };
 
-  // 行点击：Ctrl 离散切换 / Shift 区间 / 无修饰键按 fileClickMode 决定「选中并打开/展开」或「仅选中」
-  const clickRow = (entry: DirEntry, e: React.MouseEvent) => {
+  // 行点击：Ctrl 离散切换 / Shift 区间 / 无修饰键按 fileClickMode 决定「选中并打开/展开」或「仅选中」。
+  // ctx="fav"（收藏区子树）时 Ctrl/Shift 退化为单选：visibleOrder 只含主树可见序，区间语义在收藏区不成立。
+  const clickRow = (entry: DirEntry, e: React.MouseEvent, ctx: "main" | "fav" = "main") => {
     const path = entry.path;
-    if (e.ctrlKey || e.metaKey) {
+    if (ctx === "main" && (e.ctrlKey || e.metaKey)) {
       setSelected((prev) => {
         const next = new Set(prev);
         if (next.has(path)) next.delete(path);
@@ -426,7 +418,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
       setAnchor(path);
       return;
     }
-    if (e.shiftKey) {
+    if (ctx === "main" && e.shiftKey) {
       const i = anchor ? visibleOrder.indexOf(anchor) : -1;
       const j = visibleOrder.indexOf(path);
       if (i >= 0 && j >= 0) {
@@ -452,7 +444,8 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
     else openEditor(workspaceId, entry.path);
   };
 
-  const renderNode = (entry: DirEntry, depth: number) => {
+  // ctx="fav"：收藏区子树复用本渲染，行为白名单——不绑定位滚动 ref（reveal 只滚主树）、点击单选（见 clickRow）
+  const renderNode = (entry: DirEntry, depth: number, ctx: "main" | "fav" = "main") => {
     const isOpen = expanded.has(entry.path);
     const pad = 8 + depth * 12;
     const isDrop = dropDir === entry.path;
@@ -462,7 +455,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
       <div key={entry.path}>
         <div
           ref={
-            isActive
+            isActive && ctx === "main"
               ? (el) => {
                   if (el && scrollDoneFor.current !== entry.path) {
                     scrollDoneFor.current = entry.path;
@@ -500,19 +493,20 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
           }
           onDragLeave={entry.isDir ? () => setDropDir((d) => (d === entry.path ? null : d)) : undefined}
           onDrop={entry.isDir ? (e) => onFolderDrop(entry.path, e) : undefined}
-          onClick={(e) => clickRow(entry, e)}
+          onClick={(e) => clickRow(entry, e, ctx)}
           onDoubleClick={() => dblRow(entry)}
           onContextMenu={(e) => {
             e.preventDefault();
             e.stopPropagation();
-            // 决策 5：命中未选中项→选区重置为该项；命中已选中项→保持选区、对整组生效
+            // 决策 5：命中未选中项→选区重置为该项；命中已选中项→保持选区、对整组生效。
+            // fav 区一律单选语义（多选/批量仅主树），避免主树多选残留串扰出 multi 菜单。
             let count = selected.size;
-            if (!selected.has(entry.path)) {
+            if (ctx === "fav" || !selected.has(entry.path)) {
               setSelected(new Set([entry.path]));
               setAnchor(entry.path);
               count = 1;
             }
-            setMenu({ x: e.clientX, y: e.clientY, node: entry, isTopLevel: depth === 0, count });
+            setMenu({ x: e.clientX, y: e.clientY, node: entry, isTopLevel: ctx === "main" && depth === 0, count });
           }}
           title={entry.path}
           style={{ paddingLeft: pad }}
@@ -539,7 +533,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
           <>
             {errors[entry.path] && <div style={{ paddingLeft: pad + 20 }} className="py-0.5 text-[10.5px] text-[var(--danger)]">读取失败</div>}
             {loading.has(entry.path) && !children[entry.path] && <div style={{ paddingLeft: pad + 20 }} className="py-0.5 text-[10.5px] text-[var(--text-3)]">加载中…</div>}
-            {filterEntries(children[entry.path] ?? [], depth + 1).map((c) => renderNode(c, depth + 1))}
+            {filterEntries(children[entry.path] ?? [], depth + 1).map((c) => renderNode(c, depth + 1, ctx))}
           </>
         )}
       </div>
@@ -668,28 +662,70 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
                 </svg>
                 收藏文件夹
               </div>
-              {favFolders.map((p) => (
-                <div
-                  key={p}
-                  onClick={() => revealFolder(p)}
-                  title={p}
-                  className="group flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-1 text-[12px] text-[var(--text-deep)] hover:bg-[var(--surface-hover)]"
-                >
-                  <FolderGlyph />
-                  <span className="shrink-0 truncate font-medium">{baseName(p)}</span>
-                  <span className="min-w-0 flex-1 truncate text-[10px] text-[var(--text-3)]">{relOf(dirOf(p))}</span>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      toggleFavFolder(p);
-                    }}
-                    title="取消收藏"
-                    className="shrink-0 text-[var(--text-faint)] opacity-0 hover:text-[var(--danger)] group-hover:opacity-100"
-                  >
-                    ✕
-                  </button>
-                </div>
-              ))}
+              {favFolders.map((p) => {
+                const isOpen = expanded.has(p);
+                const isDrop = dropDir === p;
+                return (
+                  <div key={p}>
+                    {/* 收藏根行：chevron 就地展开子树；名称单击仍 = 跳主树定位（旧语义保留） */}
+                    <div
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData(DRAG_MIME, JSON.stringify({ kind: "file", path: p, paths: [p] }));
+                        e.dataTransfer.effectAllowed = "copyMove";
+                        requestAnimationFrame(() => setDragActive(true));
+                      }}
+                      onDragEnd={() => {
+                        setDragActive(false);
+                        setDropDir(null);
+                      }}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "copy";
+                        if (dropDir !== p) setDropDir(p);
+                      }}
+                      onDragLeave={() => setDropDir((d) => (d === p ? null : d))}
+                      onDrop={(e) => onFolderDrop(p, e)}
+                      onClick={() => revealFolder(p)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setSelected(new Set([p]));
+                        setAnchor(p);
+                        setMenu({
+                          x: e.clientX,
+                          y: e.clientY,
+                          node: { name: baseName(p), path: p, isDir: true },
+                          isTopLevel: false,
+                          count: 1,
+                        });
+                      }}
+                      title={p}
+                      className={
+                        "flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-1 text-[12px] text-[var(--text-deep)] " +
+                        (isDrop
+                          ? "bg-[var(--accent)]/15 ring-1 ring-inset ring-[var(--accent-border)]"
+                          : "hover:bg-[var(--surface-hover)]")
+                      }
+                    >
+                      <span onClick={(e) => { e.stopPropagation(); toggle(p); }} className="-m-1 shrink-0 p-1" title="展开/折叠">
+                        <Chevron open={isOpen} />
+                      </span>
+                      <FolderGlyph />
+                      <span className="shrink-0 truncate font-medium">{baseName(p)}</span>
+                      <span className="min-w-0 flex-1 truncate text-[10px] text-[var(--text-3)]">{relOf(dirOf(p))}</span>
+                    </div>
+                    {/* 就地子树：与主树共享 children 缓存 + expanded 展开态，行为走 renderNode ctx="fav" */}
+                    {isOpen && (
+                      <>
+                        {errors[p] && <div style={{ paddingLeft: 28 }} className="py-0.5 text-[10.5px] text-[var(--danger)]">读取失败</div>}
+                        {loading.has(p) && !children[p] && <div style={{ paddingLeft: 28 }} className="py-0.5 text-[10.5px] text-[var(--text-3)]">加载中…</div>}
+                        {filterEntries(children[p] ?? [], 1).map((c) => renderNode(c, 1, "fav"))}
+                      </>
+                    )}
+                  </div>
+                );
+              })}
               <div className="my-1.5 border-t border-[var(--border)]" />
             </div>
           )}
