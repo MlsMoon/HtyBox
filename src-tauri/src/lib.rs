@@ -373,6 +373,13 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
     fs_tree::reveal_in_explorer(&path)
 }
 
+/// 剪贴板图片（截图等位图）存为 `<工作区>/.htybox/tmp/clip-<ts>.png`，返回绝对路径
+/// （终端/工作流输入框粘图用；剪贴板无图返回 Err）。
+#[tauri::command]
+fn save_clipboard_image(workspace_dir: String) -> Result<String, String> {
+    fs_tree::save_clipboard_image(&workspace_dir)
+}
+
 /// M9：编辑器打开文件时开始监听其外部变化（变化后 emit "file-changed"）。
 #[tauri::command]
 fn watch_file(path: String) -> Result<(), String> {
@@ -657,6 +664,7 @@ pub fn run() {
             import_make_dir,
             import_dropped_entry,
             reveal_in_explorer,
+            save_clipboard_image,
             watch_file,
             unwatch_file,
             list_all_files,

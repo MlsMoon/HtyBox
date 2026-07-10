@@ -12,6 +12,7 @@ import {
 import type { AgentSpec } from "../mcp";
 import TeamEditor from "./TeamEditor";
 import RunPanel from "./RunPanel";
+import { useMaskDismiss } from "./ui/maskDismiss";
 
 /** Team → 启动规格（一键开启时交给 launchAgents）。 */
 function teamToSpecs(team: Team): AgentSpec[] {
@@ -48,6 +49,7 @@ export default function CollabModal({
   const [editing, setEditing] = useState<Team | null>(null);
   const [tab, setTab] = useState<"library" | "run">("library");
   const [msg, setMsg] = useState("");
+  const mask = useMaskDismiss(onClose);
 
   const persist = (next: Team[]) => {
     setTeams(next);
@@ -94,7 +96,7 @@ export default function CollabModal({
   return (
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30 p-6"
-      onClick={onClose}
+      {...mask}
     >
       <div
         className="flex max-h-[80vh] w-[760px] max-w-full flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg)] shadow-2xl"

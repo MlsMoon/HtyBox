@@ -110,10 +110,24 @@ export function ensureEngine(
   // 复制粘贴：
   // · Ctrl+V → 用 navigator.clipboard 读剪贴板(本 WebView 实测可用；paste 事件的 clipboardData
   //   在 WebView2 读不到，故不用)，按 agent 规范化换行 + bracketed 包裹后注入。
+  //   读到空/异常且是 agent 终端 → 剪贴板多半是【图片/截图】：后端把剪贴板位图存到
+  //   <工作区>/.htybox/tmp/clip-<ts>.png（真存储，48h 自动清理），注入其 `@路径 ` 引用文本
+  //   （与拖文件进终端同一语义）。注：透传 0x16/win32 键事件均无法触发 claude 原生 imagePaste
+  //   （ConPTY 探针实证），勿再走键盘注入路线。
   // · Ctrl+C → 有选区复制并清选区，无选区放行(=SIGINT)。
   term.attachCustomKeyEventHandler((e) => {
     if (e.type !== "keydown" || !e.ctrlKey || e.altKey) return true;
     if (e.key === "v" || e.key === "V") {
+      const pasteClipImage = () => {
+        if (agentKind !== "claude" && agentKind !== "codex") return;
+        const ws = engines.get(termId)?.cwd;
+        if (!ws) return;
+        invoke<string>("save_clipboard_image", { workspaceDir: ws })
+          .then((p) =>
+            invoke("write_terminal", { id: termId, data: "@" + p + " " }),
+          )
+          .catch(() => {}); // 剪贴板无图 → 静默
+      };
       navigator.clipboard
         ?.readText()
         .then((raw) => {
@@ -122,8 +136,9 @@ export function ensureEngine(
               id: termId,
               data: pasteData(agentKind, raw),
             }).catch(() => {});
+          else pasteClipImage();
         })
-        .catch(() => {});
+        .catch(pasteClipImage);
       return false;
     }
     if ((e.key === "c" || e.key === "C") && !e.shiftKey) {

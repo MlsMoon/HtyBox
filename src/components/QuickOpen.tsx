@@ -5,6 +5,7 @@ import { loadFavFolders, toggleFavFolder, onFavFoldersChange } from "../favFolde
 import { loadIgnore } from "../fileIgnore";
 import { searchScore } from "../search";
 import { useSettings } from "../settings";
+import { useMaskDismiss } from "./ui/maskDismiss";
 
 /** M9：双击 Shift 唤出的全局文件搜索（统一搜索规则，排除忽略名单）。单击即决断：按 openFileFromSearch 直接在编辑器打开 / 仅在 File 页签定位选中。 */
 export default function QuickOpen({
@@ -25,6 +26,7 @@ export default function QuickOpen({
   const [q, setQ] = useState("");
   const [sel, setSel] = useState(0);
   const s = useSettings();
+  const mask = useMaskDismiss(onClose);
   // 收藏文件夹：与 File 页签共享 favFolders.ts，收藏后不关面板、两处实时同步
   const [favs, setFavs] = useState<string[]>(() => loadFavFolders(root));
   useEffect(() => {
@@ -84,7 +86,7 @@ export default function QuickOpen({
   };
 
   return (
-    <div className="fixed inset-0 z-[130] flex items-start justify-center bg-black/20 pt-[12vh]" onClick={onClose}>
+    <div className="fixed inset-0 z-[130] flex items-start justify-center bg-black/20 pt-[12vh]" {...mask}>
       <div
         className="w-[600px] max-w-[92vw] overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--elevated)] shadow-2xl"
         onClick={(e) => e.stopPropagation()}

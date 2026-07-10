@@ -1,4 +1,5 @@
 import type { SkillTemplate } from "../skillTemplates";
+import { useMaskDismiss } from "./ui/maskDismiss";
 
 /** M8-C：切换当前 Skill 模板的下拉框（锚定在模板栏按钮下方，非弹窗）。点某模板即应用并关闭。 */
 export default function TemplatePicker({
@@ -14,9 +15,10 @@ export default function TemplatePicker({
   onManage: () => void;
   onClose: () => void;
 }) {
+  const mask = useMaskDismiss(onClose);
   return (
     <>
-      <div className="fixed inset-0 z-[60]" onClick={onClose} />
+      <div className="fixed inset-0 z-[60]" {...mask} />
       <div className="absolute left-0 top-full z-[61] mt-1 max-h-[60vh] w-full min-w-[220px] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--elevated)] py-1 shadow-xl">
         {templates.length === 0 && (
           <div className="px-3 py-3 text-center text-[11px] text-[var(--text-3)]">还没有模板，点 ⚙ 新建</div>

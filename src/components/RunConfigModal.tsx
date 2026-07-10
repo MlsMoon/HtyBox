@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { saveConfigs, emptyConfig, parseImport, buildAiPrompt, type RunConfig } from "../runConfigs";
 import { readTextFile } from "../catalog";
+import { useMaskDismiss } from "./ui/maskDismiss";
 
 function PlayIcon() {
   return <svg className="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>;
@@ -30,6 +31,7 @@ export default function RunConfigModal({
   const [selId, setSelId] = useState<string | null>(activeId ?? configs[0]?.id ?? null);
   const sel = list.find((c) => c.id === selId) ?? null;
   const [importMsg, setImportMsg] = useState<string | null>(null);
+  const mask = useMaskDismiss(onClose);
 
   const persist = (next: RunConfig[]) => { setList(next); saveConfigs(workspaceId, next); onChange(next); };
   const add = () => { const c = emptyConfig(); c.name = "新配置"; persist([...list, c]); setSelId(c.id); onPickActive(c.id); };
@@ -59,7 +61,7 @@ export default function RunConfigModal({
   };
 
   return (
-    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/30" onClick={onClose}>
+    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/30" {...mask}>
       <div className="flex h-[64vh] w-[680px] max-w-[92vw] flex-col overflow-hidden rounded-2xl bg-[var(--elevated)] shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between gap-2 border-b border-[var(--border)] px-4 py-3">
           <span className="text-sm font-semibold text-[var(--text)]">运行配置</span>

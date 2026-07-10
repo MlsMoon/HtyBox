@@ -6,6 +6,7 @@ import {
   emptyAgent,
   validateTeam,
 } from "../teams";
+import { useMaskDismiss } from "./ui/maskDismiss";
 
 const inputCls =
   "rounded border border-[var(--border)] bg-[var(--elevated)] px-2 py-1 text-xs text-[var(--text)] outline-none focus:border-[var(--accent-border)]";
@@ -22,6 +23,7 @@ export default function TeamEditor({
 }) {
   const [team, setTeam] = useState<Team>(initial);
   const [err, setErr] = useState("");
+  const mask = useMaskDismiss(onCancel);
 
   const patchAgent = (id: string, p: Partial<TeamAgentDef>) =>
     setTeam({ ...team, agents: team.agents.map((a) => (a.id === id ? { ...a, ...p } : a)) });
@@ -35,7 +37,7 @@ export default function TeamEditor({
   };
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30 p-6" onClick={onCancel}>
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30 p-6" {...mask}>
       <datalist id="models-claude">
         {DEFAULT_MODELS.claude.map((m) => (
           <option key={m} value={m} />

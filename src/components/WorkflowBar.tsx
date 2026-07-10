@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { focusEngine } from "./terminalEngine";
+import { deleteEntry } from "../catalog";
 import { isTermRunning, onAgentStatusChange } from "../agentStatus";
 import { useSettings } from "../settings";
 import {
@@ -64,12 +65,16 @@ function StageDot({ state, title, green }: { state: string; title: string; green
   return <div title={title} className="h-2.5 w-2.5 shrink-0 rounded-full bg-[#4a453e]" />;
 }
 
-export default function WorkflowBar({ termId }: { termId: string }) {
+export default function WorkflowBar({ termId, cwd }: { termId: string; cwd?: string }) {
   const run = useRun(termId);
   const settings = useSettings();
   const [running, setRunning] = useState(() => isTermRunning(termId));
   const [inputOverride, setInputOverride] = useState<boolean | null>(null); // null=跟随阶段类型
   const [draft, setDraft] = useState("");
+  // 图片附件（真实模型）：粘贴的截图先存 temp png 暂存在此、不进终端；Enter 发送时才与文字
+  // 一起注入。附件状态完全归 HtyBox 所有——可见可删（删=真删临时文件），不存在"终端里删了
+  // 但提示不同步"的脱钩（此前"立即注入+本地计数"方案的缺陷，用户打回）。
+  const [attachments, setAttachments] = useState<string[]>([]);
   const [confirmUnbind, setConfirmUnbind] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const ranThisStage = useRef(false); // 本阶段注入后 agent 是否跑起来过（区分"未开跑"与"已静默"）
@@ -80,7 +85,7 @@ export default function WorkflowBar({ termId }: { termId: string }) {
   }, [termId]);
 
   const cursor = run?.cursor ?? -1;
-  // 进入新阶段：输入框回到自动逻辑、清"跑过"标记
+  // 进入新阶段：输入框回到自动逻辑、清"跑过"标记（附件同 draft：属"待发送内容"，不随阶段清）
   useEffect(() => {
     setInputOverride(null);
     ranThisStage.current = false;
@@ -126,11 +131,39 @@ export default function WorkflowBar({ termId }: { termId: string }) {
   };
   const send = () => {
     const t = draft.replace(/\r?\n/g, " ").trim();
-    if (!t) return;
-    invoke("write_terminal", { id: termId, data: t + "\r" }).catch(() => {});
+    if (!t && attachments.length === 0) return;
+    // 附件以 @路径 引用注入（与拖文件进终端同一语义），与文字拼一条消息提交
+    const refs = attachments.map((p) => "@" + p).join(" ");
+    const data = [refs, t].filter(Boolean).join(" ") + "\r";
+    invoke("write_terminal", { id: termId, data }).catch(() => {});
     setDraft("");
+    setAttachments([]);
     taRef.current?.focus(); // 支持多轮往返，焦点留在输入框
   };
+
+  // 粘贴图片/截图：后端把剪贴板位图存到 <工作区>/.htybox/tmp/clip-<ts>.png（真存储，48h 自动
+  // 清理），先作为附件暂存在输入框（可见可删），Enter 发送时才以 @路径 注入终端。
+  // readText 有文本 → 走 textarea 默认粘贴（不拦截）；空/异常（剪贴板为图片）→ 按图片处理。
+  // 注：0x16/win32 键盘注入均无法触发 claude 的原生粘图（ConPTY 探针实证），勿再走该路线。
+  const pasteImageProbe = () => {
+    if (!cwd) return;
+    const fwd = () => {
+      invoke<string>("save_clipboard_image", { workspaceDir: cwd })
+        .then((p) => setAttachments((a) => [...a, p]))
+        .catch(() => {}); // 剪贴板无图 → 静默
+    };
+    navigator.clipboard
+      ?.readText()
+      .then((raw) => {
+        if (!raw) fwd();
+      })
+      .catch(fwd);
+  };
+  const removeAttachment = (p: string) => {
+    setAttachments((a) => a.filter((x) => x !== p));
+    deleteEntry(p).catch(() => {}); // 真删临时文件；失败静默（48h 清理兜底）
+  };
+  const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
   // 输入框显隐：手动覆盖优先，否则人工阶段自动展开
   const showInput = !done && (inputOverride ?? cur?.kind === "manual");
@@ -161,7 +194,10 @@ export default function WorkflowBar({ termId }: { termId: string }) {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   send();
+                  return;
                 }
+                // Ctrl+V：文本走 textarea 默认粘贴；剪贴板为图片/截图时透传 0x16 给终端
+                if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
               }}
               placeholder={cur.kind === "manual" && cur.text ? cur.text : "输入内容，Enter 发送到终端…"}
               className="w-full resize-none rounded-xl border border-[var(--accent)]/60 bg-[#1f1e1d] px-3 py-2 pr-12 text-[12px] leading-relaxed text-[#e5e2dc] outline-none transition-colors placeholder:text-[#8c8a82]/60 focus:border-[var(--accent)]"
@@ -174,7 +210,30 @@ export default function WorkflowBar({ termId }: { termId: string }) {
               ↑
             </button>
           </div>
-          <div className="pt-1 text-[9px] text-[#8c8a82]/80">Enter 发送 · Shift+Enter 换行 · 多行将压成单行发送</div>
+          {/* 附件条（真实模型）：暂存在 <工作区>/.htybox/tmp 的截图，发送时以 @路径 注入 */}
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5 pt-1.5">
+              {attachments.map((p) => (
+                <span
+                  key={p}
+                  title={p}
+                  className="flex items-center gap-1 rounded-full bg-[#3a3631] px-2 py-0.5 text-[9.5px] font-semibold text-[var(--accent)]"
+                >
+                  📷 {baseName(p)}
+                  <button
+                    onClick={() => removeAttachment(p)}
+                    title="移除并删除该临时图片文件"
+                    className="ml-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full text-[9px] leading-none text-[#8c8a82] hover:bg-[#4a453e] hover:text-[#e5e2dc]"
+                  >
+                    ✕
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="pt-1 text-[9px] text-[#8c8a82]/80">
+            Enter 发送 · Shift+Enter 换行 · 多行将压成单行发送 · 截图/图片 Ctrl+V 附加（存于工作区 .htybox/tmp，发送时以 @路径 引用）
+          </div>
         </div>
       )}
       {/* ── 进度 strip（34px 常驻） ── */}

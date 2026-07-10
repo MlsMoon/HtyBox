@@ -20,6 +20,7 @@ import HtyBoxLogo from "./components/ui/HtyBoxLogo";
 import { checkForUpdate, getSkippedVersion, setSkippedVersion, type Update } from "./updater";
 import { getWsState, setWsState } from "./wsState";
 import { onAgentStatusChange, workspaceStatus, setActiveWorkspace, clearWorkspace, type WsStatus } from "./agentStatus";
+import { useMaskDismiss } from "./components/ui/maskDismiss";
 
 function GearIcon() {
   return (
@@ -160,6 +161,7 @@ export default function App() {
   const [showCollab, setShowCollab] = useState(false);
   const [showQuickOpen, setShowQuickOpen] = useState(false);
   const [showWsPicker, setShowWsPicker] = useState(false); // 顶栏「+」工作区选择下拉
+  const wsPickerMask = useMaskDismiss(() => setShowWsPicker(false));
   // 已挂载过的 workspace（懒挂载 + 挂载后常驻 → 切走/回欢迎页时 PTY 后台存活）
   // 复原时只挂载活动工作区，其余标签待点击时再挂载
   const [opened, setOpened] = useState<Set<string>>(
@@ -225,6 +227,15 @@ export default function App() {
       return u;
     });
     setShowUpdate(false);
+  };
+
+  // 设置界面手动检查发现新版本：手动=显式意图，无视「跳过此版本」直接弹窗；覆盖前 close 旧实例防 rid 泄漏
+  const handleUpdateFound = (u: Update) => {
+    setUpdate((prev) => {
+      if (prev && prev !== u) prev.close().catch(() => {});
+      return u;
+    });
+    setShowUpdate(true);
   };
 
   const openFolder = (path: string) => {
@@ -371,7 +382,7 @@ export default function App() {
               </button>
               {showWsPicker && (
                 <>
-                  <div className="fixed inset-0 z-[60]" onClick={() => setShowWsPicker(false)} />
+                  <div className="fixed inset-0 z-[60]" {...wsPickerMask} />
                   <div className="absolute left-0 top-full z-[61] mt-1.5 w-72 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--elevated)] py-1.5 shadow-2xl">
                     <button
                       onClick={pickFolder}
@@ -518,7 +529,7 @@ export default function App() {
 
       {/* 全局设置弹窗（盖在最上层） */}
       {showSettings && (
-        <SettingsModal root={active?.path ?? null} onClose={() => setShowSettings(false)} />
+        <SettingsModal root={active?.path ?? null} onClose={() => setShowSettings(false)} onUpdateFound={handleUpdateFound} />
       )}
 
       {/* 多 Agent 协作：团队库 + 一键开启（在当前工作区起整支团队） */}

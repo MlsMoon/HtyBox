@@ -5,6 +5,9 @@ import { THEMES, applyTheme, watchSystemTheme } from "../theme";
 import { loadIgnore } from "../fileIgnore";
 import { countWorkspaceFiles } from "../catalog";
 import ConnectionSettings from "./ConnectionSettings";
+import { getVersion } from "@tauri-apps/api/app";
+import { checkForUpdateDetailed, type Update } from "../updater";
+import { useMaskDismiss } from "./ui/maskDismiss";
 
 function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -147,6 +150,56 @@ function NumberField({
   );
 }
 
+/** 动作行：标题 + 描述 + 右侧按钮（busy 时禁用换文案），下方可选状态行（muted/accent/danger 三色） */
+function ActionRow({
+  title,
+  desc,
+  action,
+  busyLabel,
+  busy,
+  onAction,
+  hint,
+  hintTone = "muted",
+}: {
+  title: string;
+  desc: string;
+  action: string;
+  busyLabel: string;
+  busy: boolean;
+  onAction: () => void;
+  hint?: string;
+  hintTone?: "muted" | "accent" | "danger";
+}) {
+  const toneCls =
+    hintTone === "danger"
+      ? "text-[var(--danger)]"
+      : hintTone === "accent"
+        ? "text-[var(--accent)]"
+        : "text-[var(--text-faint)]";
+  return (
+    <div className="rounded-lg px-3 py-2.5 transition-colors hover:bg-[var(--surface-soft)]">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-[var(--text)]">{title}</div>
+          <div className="text-[11px] text-[var(--text-faint)]">{desc}</div>
+        </div>
+        <button
+          disabled={busy}
+          onClick={onAction}
+          className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--elevated)] px-3 py-1.5 text-[12px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent-text)] disabled:cursor-default disabled:opacity-60 disabled:hover:border-[var(--border)] disabled:hover:text-[var(--text)]"
+        >
+          {busy ? busyLabel : action}
+        </button>
+      </div>
+      {hint && (
+        <div className={"mt-1.5 truncate text-[11px] " + toneCls} title={hint}>
+          {hint}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const CLICK_MODES: { key: FileClickMode; label: string; desc: string }[] = [
   { key: "open", label: "单击打开（默认）", desc: "单击文件即在编辑器打开、文件夹即展开/折叠" },
   { key: "select", label: "单击选中 · 双击打开", desc: "单击仅选中(可 Ctrl/Shift 多选)，双击才打开/展开" },
@@ -168,11 +221,15 @@ const SECTION_KEY = "htybox.settingsSection.v1";
 export default function SettingsModal({
   root,
   onClose,
+  onUpdateFound,
 }: {
   root: string | null;
   onClose: () => void;
+  /** 手动检查发现新版本：上抛给 App 弹 UpdateModal + 点亮顶栏更新角标 */
+  onUpdateFound: (u: Update) => void;
 }) {
   const s = useSettings();
+  const mask = useMaskDismiss(onClose);
   const [section, setSection] = useState<SectionKey>(() => {
     const v = localStorage.getItem(SECTION_KEY);
     return SECTIONS.some((x) => x.key === v) ? (v as SectionKey) : "general";
@@ -225,6 +282,29 @@ export default function SettingsModal({
     }
   };
 
+  // 版本与更新：当前版本号 + 手动三态检查（发现新版本 → onUpdateFound 上抛弹 UpdateModal）
+  const [appVer, setAppVer] = useState("");
+  useEffect(() => {
+    getVersion().then(setAppVer).catch(() => {});
+  }, []);
+  const [checking, setChecking] = useState(false);
+  const [updHint, setUpdHint] = useState<{ text: string; tone: "muted" | "accent" | "danger" } | null>(null);
+  const doCheckUpdate = async () => {
+    if (checking) return;
+    setChecking(true);
+    setUpdHint(null);
+    const r = await checkForUpdateDetailed();
+    setChecking(false);
+    if (r.status === "update") {
+      setUpdHint({ text: `发现新版本 v${r.update.version}`, tone: "accent" });
+      onUpdateFound(r.update);
+    } else if (r.status === "none") {
+      setUpdHint({ text: `已是最新版本（v${appVer || "当前"}）`, tone: "muted" });
+    } else {
+      setUpdHint({ text: `检查失败：${r.message}`, tone: "danger" });
+    }
+  };
+
   const over = count !== null && count > s.maxFiles;
   const countLabel = !root
     ? "未打开工作区"
@@ -239,7 +319,7 @@ export default function SettingsModal({
   return (
     <div
       className="absolute inset-0 z-[100] flex items-center justify-center bg-black/30"
-      onClick={onClose}
+      {...mask}
     >
       <div
         onClick={(e) => e.stopPropagation()}
@@ -295,6 +375,16 @@ export default function SettingsModal({
                   desc="开：唤醒自动注入（终端静默后），团队无人工接力跑；关：半自动（弹提示，点击才唤醒）"
                   on={s.autoRelay}
                   onChange={(v) => setSetting("autoRelay", v)}
+                />
+                <ActionRow
+                  title="检查更新"
+                  desc={appVer ? `当前版本 v${appVer} · 手动向更新源查询新版本` : "手动向更新源查询新版本"}
+                  action="立即检查"
+                  busyLabel="检查中…"
+                  busy={checking}
+                  onAction={doCheckUpdate}
+                  hint={updHint?.text}
+                  hintTone={updHint?.tone}
                 />
               </div>
             )}

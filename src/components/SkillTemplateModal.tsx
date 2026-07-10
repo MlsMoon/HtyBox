@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { ManagedSkill } from "../catalog";
 import { saveTemplates, emptyTemplate, type SkillTemplate } from "../skillTemplates";
 import { searchMatch } from "../search";
+import { useMaskDismiss } from "./ui/maskDismiss";
 
 /** M8-C：Skill 模板管理模态。左列模板增删改、右列勾选该模板要上架的 skill（按 dir）。 */
 export default function SkillTemplateModal({
@@ -21,6 +22,7 @@ export default function SkillTemplateModal({
   const [selId, setSelId] = useState<string | null>(templates[0]?.id ?? null);
   const [q, setQ] = useState("");
   const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const mask = useMaskDismiss(onClose);
   const sel = list.find((t) => t.id === selId) ?? null;
 
   const persist = (next: SkillTemplate[]) => {
@@ -75,7 +77,7 @@ export default function SkillTemplateModal({
   };
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30" onClick={onClose}>
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30" {...mask}>
       <div className="flex h-[70vh] w-[680px] max-w-[92vw] flex-col overflow-hidden rounded-2xl bg-[var(--elevated)] shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
           <span className="text-sm font-semibold text-[var(--text)]">管理 Skill 模板</span>

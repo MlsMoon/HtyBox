@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useMaskDismiss } from "./ui/maskDismiss";
 import ContextMenu, { MENU_SEP } from "./ui/ContextMenu";
 import {
   useBookmarks,
@@ -303,6 +304,8 @@ export default function BookmarkBar({ scope }: { scope: string }) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropMark, setDropMark] = useState<{ id: string; place: "before" | "after" } | null>(null);
   const maskRef = useRef<HTMLDivElement>(null);
+  // close 定义在下方(TDZ),箭头包装延迟到事件触发时求值
+  const mask = useMaskDismiss(() => close());
 
   const clearUndo = () => {
     if (undoTimer.current) {
@@ -394,7 +397,7 @@ export default function BookmarkBar({ scope }: { scope: string }) {
       </button>
       {open && (
         <>
-          <div ref={maskRef} className="fixed inset-0 z-[60]" onClick={close} />
+          <div ref={maskRef} className="fixed inset-0 z-[60]" {...mask} />
           <div className="fixed right-2 top-[46px] z-[61] w-[360px] overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--elevated)] shadow-2xl">
             {editing ? (
               <BookmarkEditor

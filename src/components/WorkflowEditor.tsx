@@ -10,6 +10,7 @@ import {
 } from "../workflows";
 import { listManagedSkills, type ManagedSkill } from "../catalog";
 import SearchBox from "./ui/SearchBox";
+import { useMaskDismiss } from "./ui/maskDismiss";
 import { searchScore } from "../search";
 
 // 工作流编辑弹窗（新建/编辑共用，仿 TeamEditor 的居中自定义弹窗）：名称/描述 + 阶段列表
@@ -135,6 +136,7 @@ export default function WorkflowEditor({
   const [dragIdx, setDragIdx] = useState<number | null>(null);
   const [overIdx, setOverIdx] = useState<number | null>(null);
   const [armed, setArmed] = useState<number | null>(null);
+  const mask = useMaskDismiss(onClose);
 
   useEffect(() => {
     let alive = true;
@@ -178,7 +180,7 @@ export default function WorkflowEditor({
     "rounded-lg border border-[var(--border)] bg-[var(--bg)] px-2.5 py-1.5 text-[12px] text-[var(--text)] outline-none transition-colors focus:border-[var(--accent-border)]";
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30" onClick={onClose}>
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30" {...mask}>
       <div
         onClick={(e) => e.stopPropagation()}
         className="flex max-h-[86vh] w-[860px] max-w-[94vw] flex-col rounded-2xl bg-[var(--elevated)] p-5 shadow-2xl"

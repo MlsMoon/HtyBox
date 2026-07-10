@@ -561,7 +561,7 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
   return (
     <div className="relative flex h-full w-full flex-col bg-[#1f1e1d]">
       <div ref={ref} className="min-h-0 w-full flex-1 p-2" />
-      <WorkflowBar termId={termId} />
+      <WorkflowBar termId={termId} cwd={cwd} />
       {confirmWf && (
         <ConfirmModal
           title="覆盖当前工作流"

@@ -16,6 +16,7 @@ import { getWsState, setWsState } from "../wsState";
 import { getSessionTags, getSessionTagIds, useTagStore, clearSession, sessionKey } from "../sessionTags";
 import { tagDot } from "../tagColors";
 import TagEditor from "./TagEditor";
+import { useMaskDismiss } from "./ui/maskDismiss";
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
 
@@ -66,6 +67,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   const loadSeq = useRef(0); // 初始/手动/watcher 重拉共用代际，旧请求不得覆盖新名称
   const [q, setQ] = useState("");
   const [agentOpen, setAgentOpen] = useState(false);
+  const agentMask = useMaskDismiss(() => setAgentOpen(false));
   const [favs, setFavs] = useState<string[]>(() => loadSessFavs(root));
   useEffect(() => setFavs(loadSessFavs(root)), [root]); // 切工作区重载收藏
   useEffect(() => setAgentKindState(readAgent(root)), [root]); // 切工作区重载 agent 选择（持久化）
@@ -80,6 +82,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   const vocab = tagStore.vocab;
   const [tagEditor, setTagEditor] = useState<{ x: number; y: number; s: SessionRef } | null>(null);
   const [filterOpen, setFilterOpen] = useState(false); // tag 筛选下拉开关
+  const filterMask = useMaskDismiss(() => setFilterOpen(false));
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>(() => getWsState<string[]>(FILTER_KEY, root, []));
   useEffect(() => setSelectedTagIds(getWsState<string[]>(FILTER_KEY, root, [])), [root]); // 切工作区重载筛选
   const setFilter = (ids: string[]) => {
@@ -269,7 +272,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
           </button>
           {agentOpen && (
             <>
-              <div className="fixed inset-0 z-[60]" onClick={() => setAgentOpen(false)} />
+              <div className="fixed inset-0 z-[60]" {...agentMask} />
               <div className="absolute left-0 top-full z-[61] mt-1 w-full overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--elevated)] py-1 shadow-xl">
                 {AGENTS.map((a) => (
                   <button
@@ -369,7 +372,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
             </button>
             {filterOpen && (
               <>
-                <div className="fixed inset-0 z-[60]" onClick={() => setFilterOpen(false)} />
+                <div className="fixed inset-0 z-[60]" {...filterMask} />
                 <div className="absolute top-full right-0 left-0 z-[61] mt-1 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--elevated)] py-1 shadow-xl">
                   <div className="flex items-center justify-between px-3 py-1">
                     <span className="text-[10px] font-bold tracking-wide text-[var(--text-2)]">按标签筛选</span>

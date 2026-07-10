@@ -17,6 +17,7 @@ import FileContextMenu from "./FileContextMenu";
 import FileIgnoreModal from "./FileIgnoreModal";
 import PromptModal from "./ui/PromptModal";
 import ConfirmModal from "./ui/ConfirmModal";
+import { useMaskDismiss } from "./ui/maskDismiss";
 import { loadIgnore, saveIgnore, extOf, type IgnoreCfg } from "../fileIgnore";
 import { loadFavFolders, toggleFavFolder as toggleFavStored, remapFavPaths, onFavFoldersChange } from "../favFolders";
 import { getWsState, setWsState } from "../wsState";
@@ -85,6 +86,8 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
   // 多选（Windows 式）：selected=选中集(高亮+批量操作目标)，anchor=Shift 区间锚点。瞬时态，不持久化。
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [anchor, setAnchor] = useState<string | null>(null);
+  // 点树空白清多选:down+up 双判定,防"从文件行按住拖到空白松开"误清(与弹窗遮罩同 bug 同修)
+  const blankClear = useMaskDismiss(() => { setSelected(new Set()); setAnchor(null); });
   const s = useSettings();
   const [showIgnore, setShowIgnore] = useState(false);
   const [showTop, setShowTop] = useState(false); // 滚动超过阈值 → 浮现「回到顶部」按钮（瞬时态，不持久化）
@@ -632,7 +635,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
           ref={scrollRef}
           tabIndex={0}
           onScroll={(e) => setShowTop(e.currentTarget.scrollTop > 200)}
-          onClick={(e) => { if (e.target === e.currentTarget) { setSelected(new Set()); setAnchor(null); } }}
+          {...blankClear}
           onKeyDown={(e) => {
             // 有弹窗/输入聚焦时不接管，避免吞掉重命名框/确认框的按键
             if (prompt || confirm || menu || showIgnore) return;

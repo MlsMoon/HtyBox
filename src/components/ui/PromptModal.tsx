@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useMaskDismiss } from "./maskDismiss";
 
 /** M9：通用名称输入弹窗（新建/重命名用）；自定义风格，不用原生 prompt。 */
 export default function PromptModal({
@@ -15,12 +16,13 @@ export default function PromptModal({
   onClose: () => void;
 }) {
   const [v, setV] = useState(initial);
+  const mask = useMaskDismiss(onClose);
   const submit = () => {
     const t = v.trim();
     if (t) onConfirm(t);
   };
   return (
-    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/30" onClick={onClose}>
+    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/30" {...mask}>
       <div className="w-[360px] max-w-[90vw] rounded-2xl bg-[var(--elevated)] p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="mb-2 text-sm font-semibold text-[var(--text)]">{title}</div>
         <input

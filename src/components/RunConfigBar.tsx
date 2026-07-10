@@ -1,6 +1,7 @@
 import { useState } from "react";
 import RunConfigModal from "./RunConfigModal";
 import { loadConfigs, loadActiveConfig, saveActiveConfig, type RunConfig } from "../runConfigs";
+import { useMaskDismiss } from "./ui/maskDismiss";
 
 /** M9-N8：终端工具栏的运行配置控件——▶ 运行 + 配置名下拉选择(Cursor 式) + ⚙ 设置。 */
 export default function RunConfigBar({
@@ -16,6 +17,7 @@ export default function RunConfigBar({
   const [activeId, setActiveId] = useState<string | null>(() => loadActiveConfig(workspaceId));
   const [showModal, setShowModal] = useState(false);
   const [open, setOpen] = useState(false);
+  const mask = useMaskDismiss(() => setOpen(false));
   const active = configs.find((c) => c.id === activeId) ?? configs[0] ?? null;
 
   const pick = (id: string | null) => {
@@ -50,7 +52,7 @@ export default function RunConfigBar({
 
       {open && (
         <>
-          <div className="fixed inset-0 z-[60]" onClick={() => setOpen(false)} />
+          <div className="fixed inset-0 z-[60]" {...mask} />
           <div className="absolute right-0 top-full z-[61] mt-1 max-h-[60vh] w-64 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--elevated)] py-1 shadow-xl">
             {configs.length === 0 && (
               <div className="px-3 py-3 text-center text-[11px] text-[var(--text-3)]">还没有配置，点下方添加</div>

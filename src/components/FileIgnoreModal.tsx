@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { IgnoreCfg } from "../fileIgnore";
+import { useMaskDismiss } from "./ui/maskDismiss";
 
 /** M9-N6：文件树忽略名单管理（顶层文件夹名 + 扩展名）。自定义风格弹窗。 */
 export default function FileIgnoreModal({
@@ -13,6 +14,7 @@ export default function FileIgnoreModal({
 }) {
   const [folderInput, setFolderInput] = useState("");
   const [extInput, setExtInput] = useState("");
+  const mask = useMaskDismiss(onClose);
 
   const addFolder = () => {
     const v = folderInput.trim();
@@ -54,7 +56,7 @@ export default function FileIgnoreModal({
   );
 
   return (
-    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/30" onClick={onClose}>
+    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/30" {...mask}>
       <div className="w-[440px] max-w-[92vw] rounded-2xl bg-[var(--elevated)] p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-semibold text-[var(--text)]">文件树忽略名单</span>

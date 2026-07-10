@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useMaskDismiss } from "./ui/maskDismiss";
 
 /** M9：终端/编辑器区「⋯ 更多操作」菜单——批量关闭标签等通用功能。 */
 export default function DockActionsMenu({
@@ -11,6 +12,7 @@ export default function DockActionsMenu({
   onCloseSaved: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const mask = useMaskDismiss(() => setOpen(false));
   const item = (label: string, onClick: () => void, danger?: boolean) => (
     <button
       onClick={() => {
@@ -41,7 +43,7 @@ export default function DockActionsMenu({
       </button>
       {open && (
         <>
-          <div className="fixed inset-0 z-[60]" onClick={() => setOpen(false)} />
+          <div className="fixed inset-0 z-[60]" {...mask} />
           <div className="absolute right-0 top-full z-[61] mt-1 w-48 rounded-lg border border-[var(--border)] bg-[var(--elevated)] py-1 shadow-xl">
             {item("关闭已保存的编辑器", onCloseSaved)}
             {item("关闭其他标签", onCloseOthers)}

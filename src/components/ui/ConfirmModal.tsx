@@ -1,3 +1,5 @@
+import { useMaskDismiss } from "./maskDismiss";
+
 /** M9：危险操作确认弹窗（删除用）；自定义风格，不用原生 confirm。 */
 export default function ConfirmModal({
   title,
@@ -15,8 +17,9 @@ export default function ConfirmModal({
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  const mask = useMaskDismiss(onClose);
   return (
-    <div className="fixed inset-0 flex items-center justify-center bg-black/30" style={{ zIndex }} onClick={onClose}>
+    <div className="fixed inset-0 flex items-center justify-center bg-black/30" style={{ zIndex }} {...mask}>
       <div className="w-[360px] max-w-[90vw] rounded-2xl bg-[var(--elevated)] p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="mb-1 text-sm font-semibold text-[var(--text)]">{title}</div>
         {message && <div className="mb-3 text-[12px] leading-relaxed text-[var(--text-2)]">{message}</div>}
