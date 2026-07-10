@@ -3,17 +3,20 @@ export default function ConfirmModal({
   title,
   message,
   confirmText = "删除",
+  zIndex = 110,
   onConfirm,
   onClose,
 }: {
   title: string;
   message?: string;
   confirmText?: string;
+  /** 遮罩层级；在更高层 popover（如 TagEditor z=120）之上弹出时传更大值 */
+  zIndex?: number;
   onConfirm: () => void;
   onClose: () => void;
 }) {
   return (
-    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/30" onClick={onClose}>
+    <div className="fixed inset-0 flex items-center justify-center bg-black/30" style={{ zIndex }} onClick={onClose}>
       <div className="w-[360px] max-w-[90vw] rounded-2xl bg-[var(--elevated)] p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="mb-1 text-sm font-semibold text-[var(--text)]">{title}</div>
         {message && <div className="mb-3 text-[12px] leading-relaxed text-[var(--text-2)]">{message}</div>}

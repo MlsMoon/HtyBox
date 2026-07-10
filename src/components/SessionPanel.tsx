@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   listClaudeSessions,
@@ -88,6 +88,12 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   };
   const toggleFilter = (id: string) =>
     setFilter(selectedTagIds.includes(id) ? selectedTagIds.filter((x) => x !== id) : [...selectedTagIds, id]);
+  // 有效筛选集 = 选中集 ∩ 词表：deleteTag 后（或任何来源的）悬挂 id 永不参与过滤/激活态/计数。
+  // 写入端保留原始集、不跨工作区清洗持久化桶（wsState 无枚举 API 且读取端已免疫）。
+  const effectiveTagIds = useMemo(
+    () => selectedTagIds.filter((id) => vocab.some((t) => t.id === id)),
+    [selectedTagIds, vocab],
+  );
 
   const load = useCallback((kind: "claude" | "codex", silent = false) => {
     const seq = ++loadSeq.current;
@@ -151,10 +157,10 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   const tagNamesOf = (s: SessionRef) => getSessionTags(agentKind, s.id).map((t) => t.name);
   const filtered = (list ?? []).filter((s) => {
     if (!searchMatch(q, displayLabel(s), s.id, ...tagNamesOf(s))) return false;
-    // tag 筛选：OR（会话 tag 与选中集合有交集即显示）；空集合 = 不筛选
-    if (selectedTagIds.length > 0) {
+    // tag 筛选：OR（会话 tag 与选中集合有交集即显示）；空集合 = 不筛选（悬挂 id 经有效集剔除）
+    if (effectiveTagIds.length > 0) {
       const ids = getSessionTagIds(agentKind, s.id);
-      if (!selectedTagIds.some((tid) => ids.includes(tid))) return false;
+      if (!effectiveTagIds.some((tid) => ids.includes(tid))) return false;
     }
     return true;
   });
@@ -306,7 +312,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
               onClick={() => setFilterOpen((v) => !v)}
               className={
                 "flex w-full items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11.5px] transition-colors " +
-                (selectedTagIds.length > 0
+                (effectiveTagIds.length > 0
                   ? "border-[var(--accent-border)] bg-[var(--accent)]/10 text-[var(--text)]"
                   : "border-[var(--border)] bg-[var(--elevated)] text-[var(--text-2)] hover:bg-[var(--surface-soft)]")
               }
@@ -314,7 +320,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
               <svg className="h-3.5 w-3.5 shrink-0 text-[var(--text-2)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M3 5h18l-7 8v6l-4-2v-4z" />
               </svg>
-              {selectedTagIds.length === 0 ? (
+              {effectiveTagIds.length === 0 ? (
                 <>
                   <span>标签筛选</span>
                   <span className="ml-auto text-[10px] text-[var(--text-3)]">点击多选</span>
@@ -405,7 +411,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
                     <button onClick={() => setFilter([])} className="text-[10.5px] text-[var(--accent-text)] hover:underline">
                       清除全部
                     </button>
-                    <span className="text-[10px] text-[var(--text-3)]">已选 {selectedTagIds.length}</span>
+                    <span className="text-[10px] text-[var(--text-3)]">已选 {effectiveTagIds.length}</span>
                   </div>
                 </div>
               </>

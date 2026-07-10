@@ -129,6 +129,38 @@ export function toggleTag(key: string, tagId: string): void {
   else setSessionIds(key, [...ids, tagId]);
 }
 
+/** 更新 tag 名字/颜色（词表单一来源，所有引用处一并生效）。
+ *  改名 trim 后为空、或撞其它已有名（维持「名字唯一」不破坏 createTag 同名复用假设）→ 返回 false 拒绝。 */
+export function updateTag(tagId: string, patch: { name?: string; color?: TagColorKey }): boolean {
+  const cur = store.vocab.find((t) => t.id === tagId);
+  if (!cur) return false;
+  const name = patch.name !== undefined ? patch.name.trim() : cur.name;
+  if (!name) return false;
+  if (store.vocab.some((t) => t.id !== tagId && t.name === name)) return false;
+  setVocab(store.vocab.map((t) => (t.id === tagId ? { ...t, name, color: patch.color ?? t.color } : t)));
+  return true;
+}
+
+/** 打了某 tag 的会话数（删除前展示影响面用）。 */
+export function countSessionsWithTag(tagId: string): number {
+  return Object.values(store.bySession).filter((ids) => ids.includes(tagId)).length;
+}
+
+/** 从词表删除 tag：同时清掉所有会话对它的引用（清空后的会话键一并移除，防 bySession 膨胀）。
+ *  未受影响会话的 tagId[] 保持原引用，per-session 快照不触发无谓重渲染。 */
+export function deleteTag(tagId: string): void {
+  if (!store.vocab.some((t) => t.id === tagId)) return;
+  const vocab = store.vocab.filter((t) => t.id !== tagId);
+  const bySession: Record<string, string[]> = {};
+  for (const [k, ids] of Object.entries(store.bySession)) {
+    const next = ids.includes(tagId) ? ids.filter((x) => x !== tagId) : ids;
+    if (next.length > 0) bySession[k] = next;
+  }
+  store = { vocab, bySession };
+  save();
+  emit();
+}
+
 /** 清除某会话全部 tag 关联（删除会话时调；词表保留）。 */
 export function clearSession(key: string): void {
   if (!(key in store.bySession)) return;
