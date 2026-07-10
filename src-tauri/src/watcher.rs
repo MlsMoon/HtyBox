@@ -1,4 +1,4 @@
-//! 监听 skill / memory 目录，防抖后向前端发刷新事件（M3b）。
+//! 监听 skill / memory / Codex 会话名索引，防抖后向前端发刷新事件（M3b）。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -9,12 +9,25 @@ use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use tauri::{AppHandle, Emitter};
 
+fn watch_path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("//?/")
+        .to_lowercase()
+}
+
+fn is_codex_session_index(path: &Path, codex_root: &Path) -> bool {
+    watch_path_key(path) == watch_path_key(&codex_root.join("session_index.jsonl"))
+}
+
 pub fn start(app: AppHandle) {
     let _ = FILE_APP.set(app.clone()); // 供 watch_file 的回调 emit "file-changed"
     let Some(home) = dirs::home_dir() else {
         return;
     };
     let claude = home.join(".claude");
+    let codex = home.join(".codex");
+    let codex_for_handler = codex.clone();
 
     let handler_app = app.clone();
     let debouncer = new_debouncer(
@@ -25,6 +38,7 @@ pub fn start(app: AppHandle) {
             };
             let mut skills = false;
             let mut memory = false;
+            let mut codex_sessions = false;
             for e in &events {
                 let p = e.path.to_string_lossy().replace('\\', "/");
                 if p.contains("/.claude/skills/") || p.contains("/plugins/") {
@@ -33,12 +47,18 @@ pub fn start(app: AppHandle) {
                 if p.contains("/projects/") && p.contains("/memory/") {
                     memory = true;
                 }
+                if is_codex_session_index(&e.path, &codex_for_handler) {
+                    codex_sessions = true;
+                }
             }
             if skills {
                 let _ = handler_app.emit("skills-changed", ());
             }
             if memory {
                 let _ = handler_app.emit("memory-changed", ());
+            }
+            if codex_sessions {
+                let _ = handler_app.emit("codex-sessions-changed", ());
             }
         },
     );
@@ -54,6 +74,8 @@ pub fn start(app: AppHandle) {
         RecursiveMode::Recursive,
     );
     let _ = w.watch(&claude.join("projects"), RecursiveMode::Recursive);
+    // Codex 自动命名或 `/rename` 会更新根目录下的索引；监听目录可兼容索引尚未创建的情况。
+    let _ = w.watch(&codex, RecursiveMode::NonRecursive);
 
     // 保活到进程结束：drop 会停止监听
     std::mem::forget(debouncer);
@@ -138,4 +160,31 @@ pub fn unwatch_file(path: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_codex_session_index;
+    use std::path::Path;
+
+    #[test]
+    fn only_codex_session_index_triggers_session_refresh() {
+        let root = Path::new(r"C:\Users\tester\.codex");
+        assert!(is_codex_session_index(
+            Path::new(r"C:\Users\tester\.codex\session_index.jsonl"),
+            root
+        ));
+        assert!(is_codex_session_index(
+            Path::new(r"c:\users\TESTER\.codex\session_index.jsonl"),
+            root
+        ));
+        assert!(!is_codex_session_index(
+            Path::new(r"C:\Users\tester\.codex\state_5.sqlite"),
+            root
+        ));
+        assert!(!is_codex_session_index(
+            Path::new(r"C:\work\.codex\session_index.jsonl"),
+            root
+        ));
+    }
 }

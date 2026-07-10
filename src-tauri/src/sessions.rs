@@ -2,6 +2,7 @@
 //! - claude：会话存 ~/.claude/projects/<slug>/<id>.jsonl；标题取自会话内最新 ai-title(claude 自动起的会话标题，与 /resume 选择器一致)，回退 history.jsonl 的 display；
 //!   复原 `claude --resume <id>`(须在该 cwd 下跑)；无原生删除 → 删 <id>.jsonl 文件。
 //! - codex：会话 ~/.codex/sessions/Y/M/D/rollout-*.jsonl，首行 session_meta.payload{id,cwd}；
+//!   自动命名或 `/rename` 设置的原生名称取自 ~/.codex/session_index.jsonl，未命名时回退首条真实用户消息；
 //!   复原 `codex resume <id>`；删除走删 rollout 文件。
 //! 删除统一移入回收站(trash，非交互、可恢复)。
 
@@ -220,12 +221,59 @@ fn read_head_lines(path: &Path, max: usize) -> Vec<String> {
         .collect()
 }
 
+/// Codex 的原生会话名索引（自动命名 / `/rename`）是 append-only JSONL：
+/// `{ "id": "...", "thread_name": "...", "updated_at": "..." }`。
+/// 同一 id 可出现多次，后写入的有效记录覆盖旧值；空名称与坏行按 Codex batch reader 语义忽略。
+fn parse_codex_session_titles(reader: impl BufRead) -> HashMap<String, String> {
+    let mut titles = HashMap::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .filter(|x| !x.is_empty())
+        else {
+            continue;
+        };
+        let Some(title) = v.get("thread_name").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let title = title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        titles.insert(id.to_string(), title.to_string());
+    }
+    titles
+}
+
+fn read_codex_session_titles(home: &Path) -> HashMap<String, String> {
+    let path = home.join(".codex").join("session_index.jsonl");
+    let Ok(file) = std::fs::File::open(path) else {
+        return HashMap::new();
+    };
+    parse_codex_session_titles(BufReader::new(file))
+}
+
+fn codex_label(native_title: Option<&String>, fallback: String) -> String {
+    native_title.cloned().unwrap_or_else(|| {
+        if fallback.is_empty() {
+            "(无标题)".into()
+        } else {
+            fallback
+        }
+    })
+}
+
 /// codex 会话开头由 CLI 注入的系统消息（非用户真实输入）：以 < 开头的 XML 标签块 / # AGENTS.md 指令。
 fn is_codex_injection(t: &str) -> bool {
     t.starts_with('<') || t.starts_with("# AGENTS.md")
 }
 
-/// codex：扫 ~/.codex/sessions 的 rollout，session_meta.payload.cwd==cwd 的列出，标题=首条非环境用户消息。
+/// codex：扫 ~/.codex/sessions 的 rollout，session_meta.payload.cwd==cwd 的列出；
+/// 标题优先取 session_index.jsonl 的原生 thread_name，未命名时回退首条非环境用户消息。
 pub fn list_codex_sessions(cwd: &str) -> Vec<SessionRef> {
     let Some(h) = home() else {
         return Vec::new();
@@ -234,6 +282,7 @@ pub fn list_codex_sessions(cwd: &str) -> Vec<SessionRef> {
     if !root.is_dir() {
         return Vec::new();
     }
+    let native_titles = read_codex_session_titles(&h);
     let mut files: Vec<PathBuf> = WalkDir::new(&root)
         .max_depth(5)
         .into_iter()
@@ -309,12 +358,8 @@ pub fn list_codex_sessions(cwd: &str) -> Vec<SessionRef> {
             }
         }
         out.push(SessionRef {
+            label: codex_label(native_titles.get(&id), label),
             id,
-            label: if label.is_empty() {
-                "(无标题)".into()
-            } else {
-                label
-            },
             ts: mtime_ms(&p),
             path: p.to_string_lossy().into_owned(),
         });
@@ -449,4 +494,37 @@ fn capture_codex_ids(cwd: &str, since_ms: i64) -> Vec<String> {
     }
     hits.sort_by_key(|(t, _)| *t);
     hits.into_iter().map(|(_, id)| id).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{codex_label, parse_codex_session_titles};
+    use std::io::Cursor;
+
+    #[test]
+    fn codex_session_index_uses_latest_name_for_each_id() {
+        let input = concat!(
+            r#"{"id":"session-a","thread_name":"old name","updated_at":"2026-07-09T10:00:00Z"}"#,
+            "\n",
+            "not json\n",
+            r#"{"id":"session-b","thread_name":"another","updated_at":"2026-07-09T10:01:00Z"}"#,
+            "\n",
+            r#"{"id":"session-b","thread_name":"  ","updated_at":"2026-07-09T10:01:30Z"}"#,
+            "\n",
+            r#"{"id":"session-a","thread_name":"renamed","updated_at":"2026-07-09T10:02:00Z"}"#,
+            "\n",
+        );
+        let titles = parse_codex_session_titles(Cursor::new(input));
+
+        assert_eq!(titles.get("session-a").map(String::as_str), Some("renamed"));
+        assert_eq!(titles.get("session-b").map(String::as_str), Some("another"));
+    }
+
+    #[test]
+    fn codex_native_name_wins_and_fallback_remains_available() {
+        let native = "renamed in codex".to_string();
+        assert_eq!(codex_label(Some(&native), "first prompt".into()), native);
+        assert_eq!(codex_label(None, "first prompt".into()), "first prompt");
+        assert_eq!(codex_label(None, String::new()), "(无标题)");
+    }
 }

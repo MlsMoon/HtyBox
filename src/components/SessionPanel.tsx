@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   listClaudeSessions,
   listCodexSessions,
@@ -62,6 +63,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
     setWsState(AGENT_KEY, root, a);
   };
   const [list, setList] = useState<SessionRef[] | null>(null);
+  const loadSeq = useRef(0); // 初始/手动/watcher 重拉共用代际，旧请求不得覆盖新名称
   const [q, setQ] = useState("");
   const [agentOpen, setAgentOpen] = useState(false);
   const [favs, setFavs] = useState<string[]>(() => loadSessFavs(root));
@@ -87,20 +89,46 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   const toggleFilter = (id: string) =>
     setFilter(selectedTagIds.includes(id) ? selectedTagIds.filter((x) => x !== id) : [...selectedTagIds, id]);
 
-  const load = (kind: "claude" | "codex") => {
-    setList(null);
+  const load = useCallback((kind: "claude" | "codex", silent = false) => {
+    const seq = ++loadSeq.current;
+    if (!silent) setList(null);
     if (!root) {
-      setList([]);
+      if (seq === loadSeq.current) setList([]);
       return;
     }
     (kind === "claude" ? listClaudeSessions(root) : listCodexSessions(root))
-      .then(setList)
-      .catch(() => setList([]));
-  };
+      .then((next) => {
+        if (seq === loadSeq.current) setList(next);
+      })
+      .catch(() => {
+        if (seq === loadSeq.current) {
+          setList((prev) => (silent && prev !== null ? prev : []));
+        }
+      });
+  }, [root]);
   useEffect(() => {
     load(agentKind);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [root, agentKind]);
+  }, [agentKind, load]);
+  // Codex 自动命名或 `/rename` 更新 ~/.codex/session_index.jsonl 后，后端 watcher 发事件；
+  // Session 页签静默重拉（不置 loading，避免列表闪烁/滚动位置跳回顶部）。
+  useEffect(() => {
+    if (agentKind !== "codex") return;
+    let un: (() => void) | undefined;
+    let disposed = false;
+    listen("codex-sessions-changed", () => {
+      if (!disposed) load("codex", true);
+    }).then((u) => {
+      if (disposed) u();
+      else {
+        un = u;
+        load("codex", true); // 注册完成后补拉一次，关闭首次 load 与 listener 就绪间的丢事件窗口
+      }
+    });
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  }, [agentKind, load]);
 
   const resume = (s: SessionRef) => {
     const command = agentKind === "claude" ? `claude --resume ${s.id}` : `codex resume ${s.id}`;
