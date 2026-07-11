@@ -6,6 +6,7 @@ import SessionPanel from "./SessionPanel";
 import FlowPanel from "./FlowPanel";
 import { getWsState, setWsState } from "../wsState";
 import { registerSidebarTab } from "../dockBus";
+import { useSettings } from "../settings";
 
 type Tab = "skill" | "memory" | "file" | "session" | "flow";
 
@@ -114,6 +115,7 @@ export default function Sidebar({
   workspacePath: string;
   workspaceSlug: string;
 }) {
+  const { sidebarTabIconOnly: iconOnly } = useSettings();
   const [tab, setTabState] = useState<Tab>(() => readTab(workspaceSlug));
   // 切工作区 → 读该工作区各自的 tab（组件不 remount，state 不随 props 自动重置，需显式重载）
   useEffect(() => setTabState(readTab(workspaceSlug)), [workspaceSlug]);
@@ -144,6 +146,7 @@ export default function Sidebar({
               <button
                 key={t.id}
                 onClick={() => setTab(t.id)}
+                title={iconOnly ? t.label : undefined}
                 className={
                   "flex min-w-0 flex-1 items-center justify-center gap-1 rounded-lg px-1.5 py-1.5 text-xs font-semibold transition-all " +
                   (active
@@ -152,7 +155,7 @@ export default function Sidebar({
                 }
               >
                 <Icon />
-                <span className="truncate">{t.label}</span>
+                {!iconOnly && <span className="truncate">{t.label}</span>}
               </button>
             );
           })}

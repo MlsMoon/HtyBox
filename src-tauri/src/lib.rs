@@ -437,7 +437,19 @@ fn delete_codex_session(path: String) -> Result<(), String> {
     sessions::delete_codex_session(&path)
 }
 
-/// 运行后捕获 agent(claude/codex) 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
+/// 列本工作区 cursor 会话（~/.cursor/chats 按 meta.json.cwd）。
+#[tauri::command]
+fn list_cursor_sessions(cwd: String) -> Vec<sessions::SessionRef> {
+    sessions::list_cursor_sessions(&cwd)
+}
+
+/// 删除 cursor 会话（删整个 chat 目录入回收站）。
+#[tauri::command]
+fn delete_cursor_session(path: String) -> Result<(), String> {
+    sessions::delete_cursor_session(&path)
+}
+
+/// 运行后捕获 agent(claude/codex/cursor) 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
 #[tauri::command]
 fn capture_session_ids(agent: String, cwd: String, since_ms: i64) -> Vec<String> {
     sessions::capture_session_ids(&agent, &cwd, since_ms)
@@ -521,6 +533,41 @@ fn write_codex_config(cwd: &str, url: &str) -> Result<(), String> {
     std::fs::write(&path, doc.to_string()).map_err(|e| e.to_string())
 }
 
+/// 把 htybox 这个 MCP server **合并**进 `<cwd>/.cursor/mcp.json`（保留用户已有配置）。
+/// `cursor-agent mcp --help` 确认走 `.cursor/mcp.json`；格式已对照本机真实 ~/.cursor/mcp.json
+/// 现有条目(jetbrains/blueprint-editor 等)核实为 url + headers.Authorization，无 claude 那样的
+/// "type" 字段。**假设未 100% 验证**：`${HTYBOX_MCP_TOKEN}` 这种占位符是否被 cursor-agent 展开
+/// 尚未见到官方文档确认(本机已有的真实条目都是硬编码字面量 token，不是占位符写法)——按与 claude
+/// 一致的约定实现，实际是否握手成功以 Step 6 验证阶段真实跑一次为准。
+fn write_cursor_config(cwd: &str, url: &str) -> Result<(), String> {
+    let dir = std::path::Path::new(cwd).join(".cursor");
+    let path = dir.join("mcp.json");
+    let mut root: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let obj = root.as_object_mut().unwrap();
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        *servers = serde_json::json!({});
+    }
+    servers.as_object_mut().unwrap().insert(
+        "htybox".to_string(),
+        serde_json::json!({
+            "url": url,
+            "headers": { "Authorization": "Bearer ${HTYBOX_MCP_TOKEN}" }
+        }),
+    );
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&path, pretty).map_err(|e| e.to_string())
+}
+
 /// M7-A：注册一个 agent（token→身份）并把 htybox 合并进该 cwd 的 .mcp.json。
 /// 之后前端用 `HTYBOX_MCP_TOKEN=<token>` 等环境变量起该 agent 的终端。
 #[tauri::command]
@@ -544,7 +591,8 @@ fn setup_mcp_agent(
     );
     let url = format!("http://127.0.0.1:{}/mcp", state.broker.port());
     write_mcp_json(&cwd, &url)?; // claude 读
-    write_codex_config(&cwd, &url) // codex 读（信任项目时）
+    write_codex_config(&cwd, &url)?; // codex 读（信任项目时）
+    write_cursor_config(&cwd, &url) // cursor 读
 }
 
 /// M7-C：写某 agent 的协作简报到 `<cwd>/.htybox/brief-<agentId>.md`。
@@ -671,8 +719,10 @@ pub fn run() {
             count_workspace_files,
             list_claude_sessions,
             list_codex_sessions,
+            list_cursor_sessions,
             delete_claude_session,
             delete_codex_session,
+            delete_cursor_session,
             capture_session_ids,
             mcp_broker_url,
             setup_mcp_agent,

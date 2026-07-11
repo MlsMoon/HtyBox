@@ -27,10 +27,12 @@ export interface Settings {
   showWorkflowPanel: boolean;
   /** 终端中键自动滚动：按下鼠标中键出滚轮锚点、移动即按距离自动滚动（仿浏览器）。默认开 */
   middleClickScroll: boolean;
+  /** 左栏 File/Skill/Memory/Session/Flow 分段切换条：开=仅图标(更紧凑) / 关=图标+文字(现状,默认) */
+  sidebarTabIconOnly: boolean;
 }
 
 const KEY = "htybox.settings.v1";
-const DEFAULTS: Settings = { hoverPreview: true, autoRelay: false, fontFamily: "harmony", maxFiles: 100000, theme: "light", fileClickMode: "open", openFileFromSearch: false, maxEditMB: 10, showWorkflowPanel: true, middleClickScroll: true };
+const DEFAULTS: Settings = { hoverPreview: true, autoRelay: false, fontFamily: "harmony", maxFiles: 100000, theme: "light", fileClickMode: "open", openFileFromSearch: false, maxEditMB: 10, showWorkflowPanel: true, middleClickScroll: true, sidebarTabIconOnly: false };
 
 function load(): Settings {
   try {

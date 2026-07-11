@@ -74,7 +74,7 @@ export interface MemoryNode {
 export const listMemoryTree = (slug: string) =>
   invoke<MemoryNode[]>("list_memory_tree", { slug });
 
-// ---- M9：claude/codex 会话记录 ----
+// ---- M9：claude/codex/cursor 会话记录 ----
 export interface SessionRef {
   id: string;
   label: string;
@@ -85,11 +85,15 @@ export const listClaudeSessions = (cwd: string) =>
   invoke<SessionRef[]>("list_claude_sessions", { cwd });
 export const listCodexSessions = (cwd: string) =>
   invoke<SessionRef[]>("list_codex_sessions", { cwd });
+export const listCursorSessions = (cwd: string) =>
+  invoke<SessionRef[]>("list_cursor_sessions", { cwd });
 export const deleteClaudeSession = (id: string) =>
   invoke<void>("delete_claude_session", { id });
 export const deleteCodexSession = (path: string) =>
   invoke<void>("delete_codex_session", { path });
-/** 运行后捕获 agent(claude/codex) 在 cwd 下、启动时刻(sinceMs)之后新生成的会话 id（按时间升序）。 */
+export const deleteCursorSession = (path: string) =>
+  invoke<void>("delete_cursor_session", { path });
+/** 运行后捕获 agent(claude/codex/cursor) 在 cwd 下、启动时刻(sinceMs)之后新生成的会话 id（按时间升序）。 */
 export const captureSessionIds = (agent: string, cwd: string, sinceMs: number) =>
   invoke<string[]>("capture_session_ids", { agent, cwd, sinceMs });
 

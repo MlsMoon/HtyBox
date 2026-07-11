@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { AgentKind } from "./profiles";
 
 export type AgentRole = "lead" | "worker";
 
@@ -7,7 +8,7 @@ export interface AgentSpec {
   agentId: string;
   roleName: string;
   role: AgentRole;
-  agentKind: "claude" | "codex";
+  agentKind: Exclude<AgentKind, "shell">;
   model?: string; // 模型(--model)，空/缺省用 CLI 默认
   responsibility?: string; // 职责(自由文本)，注入 env(HTYBOX_RESPONSIBILITY) 供 M7-C 协议注入
 }
@@ -165,7 +166,7 @@ export interface TermAgentInfo {
   agentId: string;
   roleName: string;
   role: AgentRole;
-  agentKind: "claude" | "codex";
+  agentKind: Exclude<AgentKind, "shell">;
   model?: string;
   responsibility?: string;
   cwd: string;

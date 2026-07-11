@@ -20,9 +20,11 @@ export interface Team {
 }
 
 // 每类 agent 的默认可选模型（编辑器里作 datalist 建议，可自由输入）。未来可在设置里维护/探测 CLI。
-export const DEFAULT_MODELS: Record<"claude" | "codex", string[]> = {
+// cursor 实测 `cursor-agent --list-models` 返回 200+ 项，这里只精选几个常用的做建议、非强校验。
+export const DEFAULT_MODELS: Record<Exclude<AgentKind, "shell">, string[]> = {
   claude: ["opus", "sonnet", "haiku"],
   codex: ["gpt-5-codex", "o3"],
+  cursor: ["auto", "claude-sonnet-5-high", "gpt-5.2", "composer-2.5"],
 };
 
 const KEY = "htybox.teams.v1";
@@ -112,6 +114,8 @@ export function exportTeams(teams: Team[]): string {
   return JSON.stringify(teams, null, 2);
 }
 
+const VALID_AGENT_KINDS: Exclude<AgentKind, "shell">[] = ["claude", "codex", "cursor"];
+
 /** 解析导入 JSON（数组或单个），重新分配 id 避免与现有冲突。 */
 export function importTeams(json: string): Team[] {
   const parsed = JSON.parse(json);
@@ -123,7 +127,9 @@ export function importTeams(json: string): Team[] {
     agents: (Array.isArray(t?.agents) ? t.agents : []).map((a: Partial<TeamAgentDef>) => ({
       id: genId(),
       roleName: String(a?.roleName ?? ""),
-      agentKind: a?.agentKind === "codex" ? "codex" : "claude",
+      agentKind: VALID_AGENT_KINDS.includes(a?.agentKind as Exclude<AgentKind, "shell">)
+        ? (a!.agentKind as Exclude<AgentKind, "shell">)
+        : "claude",
       model: String(a?.model ?? ""),
       responsibility: String(a?.responsibility ?? ""),
       isLead: Boolean(a?.isLead),

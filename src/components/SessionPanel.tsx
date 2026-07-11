@@ -3,11 +3,14 @@ import { listen } from "@tauri-apps/api/event";
 import {
   listClaudeSessions,
   listCodexSessions,
+  listCursorSessions,
   deleteClaudeSession,
   deleteCodexSession,
+  deleteCursorSession,
   type SessionRef,
 } from "../catalog";
 import { openTerminalCmd } from "../dockBus";
+import { launchCmdFor, type AgentKind } from "../profiles";
 import { searchMatch } from "../search";
 import SearchBox from "./ui/SearchBox";
 import ContextMenu, { MENU_SEP } from "./ui/ContextMenu";
@@ -19,10 +22,12 @@ import TagEditor from "./TagEditor";
 import { useMaskDismiss } from "./ui/maskDismiss";
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
+import cursorIcon from "../assets/cursor.svg";
 
 const AGENTS = [
   { k: "claude" as const, label: "Claude Code", icon: claudeIcon },
   { k: "codex" as const, label: "Codex", icon: codexIcon },
+  { k: "cursor" as const, label: "Cursor", icon: cursorIcon },
 ];
 
 // 会话收藏：按工作区 root 分组，存 "agentKind:id"（持久化，跨重启），收藏的置顶成区显示。
@@ -45,10 +50,14 @@ function saveSessFavs(root: string, keys: string[]): void {
   }
 }
 
-// Session 的 claude/codex 选择按工作区持久化（用户点名要持久化的"有状态选择"）
+// Session 的 claude/codex/cursor 选择按工作区持久化（用户点名要持久化的"有状态选择"）
+type SessionAgentKind = Exclude<AgentKind, "shell">;
+const AGENT_KINDS: SessionAgentKind[] = ["claude", "codex", "cursor"];
 const AGENT_KEY = "htybox.sessionAgent.v1";
-const readAgent = (root: string): "claude" | "codex" =>
-  getWsState<"claude" | "codex">(AGENT_KEY, root, "claude") === "codex" ? "codex" : "claude";
+const readAgent = (root: string): SessionAgentKind => {
+  const v = getWsState<SessionAgentKind>(AGENT_KEY, root, "claude");
+  return AGENT_KINDS.includes(v) ? v : "claude";
+};
 
 // tag 筛选选中集合按工作区持久化（界面状态，scope=root；与 agent 选择同范式，符合"有状态选择按工作区"）。
 const FILTER_KEY = "htybox.sessionTagFilter.v1";
@@ -58,8 +67,8 @@ const FILTER_KEY = "htybox.sessionTagFilter.v1";
 
 /** 「Session」页签：claude/codex 会话列表，点击复原到终端、✕ 删除（移入回收站）。 */
 export default function SessionPanel({ root, workspaceId }: { root: string; workspaceId: string }) {
-  const [agentKind, setAgentKindState] = useState<"claude" | "codex">(() => readAgent(root));
-  const setAgentKind = (a: "claude" | "codex") => {
+  const [agentKind, setAgentKindState] = useState<SessionAgentKind>(() => readAgent(root));
+  const setAgentKind = (a: SessionAgentKind) => {
     setAgentKindState(a);
     setWsState(AGENT_KEY, root, a);
   };
@@ -98,14 +107,16 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
     [selectedTagIds, vocab],
   );
 
-  const load = useCallback((kind: "claude" | "codex", silent = false) => {
+  const load = useCallback((kind: SessionAgentKind, silent = false) => {
     const seq = ++loadSeq.current;
     if (!silent) setList(null);
     if (!root) {
       if (seq === loadSeq.current) setList([]);
       return;
     }
-    (kind === "claude" ? listClaudeSessions(root) : listCodexSessions(root))
+    const fetcher =
+      kind === "claude" ? listClaudeSessions : kind === "codex" ? listCodexSessions : listCursorSessions;
+    fetcher(root)
       .then((next) => {
         if (seq === loadSeq.current) setList(next);
       })
@@ -140,14 +151,16 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   }, [agentKind, load]);
 
   const resume = (s: SessionRef) => {
-    const command = agentKind === "claude" ? `claude --resume ${s.id}` : `codex resume ${s.id}`;
+    // 复原命令统一收敛到 launchCmdFor（决策3），不再手搓字符串——三种 agent 只用改一处。
+    const command = launchCmdFor(agentKind, true, s.id) ?? "";
     const name = getSessionTitle(agentKind, s.id) || s.label;
     openTerminalCmd(workspaceId, { command, agentKind, title: `↺ ${name.slice(0, 18)}`, sessionId: s.id });
   };
   const del = async (s: SessionRef) => {
     try {
       if (agentKind === "claude") await deleteClaudeSession(s.id);
-      else await deleteCodexSession(s.path);
+      else if (agentKind === "codex") await deleteCodexSession(s.path);
+      else await deleteCursorSession(s.path);
       // 乐观移除：直接从列表剔除该项，避免整列重载导致滚动条跳回顶部
       setList((prev) => (prev ? prev.filter((x) => x.id !== s.id) : prev));
       clearSession(sessionKey(agentKind, s.id)); // 删除会话 → 清其 tag 关联（词表保留，供他会话用）
@@ -264,7 +277,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
             onClick={() => setAgentOpen((v) => !v)}
             className="flex w-full items-center gap-2 rounded-lg bg-[var(--surface-hover)] px-3 py-1.5 text-xs font-semibold text-[var(--text)] hover:bg-[var(--border-soft)]"
           >
-            <img src={cur.icon} alt="" className={(cur.k === "codex" ? "codex-glyph " : "") + "h-4 w-4"} draggable={false} />
+            <img src={cur.icon} alt="" className={(cur.k === "codex" ? "codex-glyph " : cur.k === "cursor" ? "cursor-glyph " : "") + "h-4 w-4"} draggable={false} />
             <span className="min-w-0 flex-1 truncate text-left">{cur.label}</span>
             <svg className="h-3 w-3 shrink-0 text-[var(--text-3)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="m6 9 6 6 6-6" />
@@ -286,7 +299,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
                       (a.k === agentKind ? "bg-[var(--accent)]/10 text-[var(--text)]" : "text-[var(--text-deep)] hover:bg-[var(--surface)]")
                     }
                   >
-                    <img src={a.icon} alt="" className={(a.k === "codex" ? "codex-glyph " : "") + "h-4 w-4"} draggable={false} />
+                    <img src={a.icon} alt="" className={(a.k === "codex" ? "codex-glyph " : a.k === "cursor" ? "cursor-glyph " : "") + "h-4 w-4"} draggable={false} />
                     <span className="flex-1">{a.label}</span>
                     {a.k === agentKind && (
                       <svg className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">

@@ -414,6 +414,12 @@ export default function SettingsModal({
                     applyFont(k);
                   }}
                 />
+                <ToggleRow
+                  title="左栏页签仅图标"
+                  desc="File / Skill / Memory / Session / Flow 分段切换条只显示图标、不显示文字（更紧凑）"
+                  on={s.sidebarTabIconOnly}
+                  onChange={(v) => setSetting("sidebarTabIconOnly", v)}
+                />
               </div>
             )}
             {section === "terminal" && (

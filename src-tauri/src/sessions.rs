@@ -1,9 +1,13 @@
-//! M9：列出/删除 claude & codex 的工作区会话（"会话记录"按钮）。已按官方文档 + CLI --help 实证：
+//! M9：列出/删除 claude & codex & cursor 的工作区会话（"会话记录"按钮）。已按官方文档 + CLI --help 实证：
 //! - claude：会话存 ~/.claude/projects/<slug>/<id>.jsonl；标题取自会话内最新 ai-title(claude 自动起的会话标题，与 /resume 选择器一致)，回退 history.jsonl 的 display；
 //!   复原 `claude --resume <id>`(须在该 cwd 下跑)；无原生删除 → 删 <id>.jsonl 文件。
 //! - codex：会话 ~/.codex/sessions/Y/M/D/rollout-*.jsonl，首行 session_meta.payload{id,cwd}；
 //!   自动命名或 `/rename` 设置的原生名称取自 ~/.codex/session_index.jsonl，未命名时回退首条真实用户消息；
 //!   复原 `codex resume <id>`；删除走删 rollout 文件。
+//! - cursor：会话 ~/.cursor/chats/<hash>/<chatId>/meta.json（{schemaVersion,createdAtMs,updatedAtMs,hasConversation,title?,cwd}）；
+//!   外层 hash 目录大概率是 cwd 哈希分桶，不逆向算法、直接扫全部子目录按 meta.json.cwd 过滤；
+//!   标题优先取原生 title，未命名(hasConversation:false)的空壳会话跳过展示，其余回退 prompt_history.json 首条用户输入；
+//!   复原 `cursor-agent --resume <chatId>`(flag 风格，与 claude 同构，已实测)；删除走删整个 chat 目录。
 //! 删除统一移入回收站(trash，非交互、可恢复)。
 
 use std::collections::HashMap;
@@ -27,6 +31,7 @@ fn home() -> Option<PathBuf> {
 }
 
 const MAX_CODEX_SCAN: usize = 1200; // 最多扫描的 codex rollout 数（按文件名时间倒序）
+const MAX_CURSOR_SCAN: usize = 2000; // 最多扫描的 cursor chat meta.json 数（安全上限，文件名不含时间故按遍历序截断）
 
 /// claude：从 ~/.claude/history.jsonl 取本工作区(project==cwd)会话列表与时间；标题(label)取该会话 jsonl
 /// 内最新一条 ai-title(claude 自动生成的会话标题，= /resume 选择器所示)，无则回退首条非斜杠提示。
@@ -383,6 +388,101 @@ pub fn delete_codex_session(path: &str) -> Result<(), String> {
     trash::delete(p).map_err(|e| e.to_string())
 }
 
+// ---------------- cursor ----------------
+
+/// 原生标题优先，其次回退候选（如首条用户 prompt），都没有则"(无标题)"；规则同 codex_label。
+fn cursor_label(native_title: Option<&str>, fallback: Option<String>) -> String {
+    native_title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .or(fallback)
+        .unwrap_or_else(|| "(无标题)".into())
+}
+
+/// 从 prompt_history.json（用户实际输入的原始 prompt 字符串数组）取首条非空项，截断 80 字符做兜底标题。
+fn first_prompt_from_history(v: &serde_json::Value) -> Option<String> {
+    v.as_array()?
+        .iter()
+        .filter_map(|x| x.as_str())
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(|s| s.chars().take(80).collect())
+}
+
+fn read_cursor_first_prompt(chat_dir: &Path) -> Option<String> {
+    let txt = std::fs::read_to_string(chat_dir.join("prompt_history.json")).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&txt).ok()?;
+    first_prompt_from_history(&v)
+}
+
+/// cursor：递归扫 ~/.cursor/chats/<hash>/<chatId>/meta.json，cwd 字段匹配的列出；
+/// 跳过 hasConversation:false 的空壳会话(决策8)；标题取 meta.json 的 title，缺失回退首条用户 prompt。
+pub fn list_cursor_sessions(cwd: &str) -> Vec<SessionRef> {
+    let Some(h) = home() else {
+        return Vec::new();
+    };
+    let root = h.join(".cursor").join("chats");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for entry in WalkDir::new(&root)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_name().to_str() == Some("meta.json"))
+        .take(MAX_CURSOR_SCAN)
+    {
+        let p = entry.path();
+        let Ok(txt) = std::fs::read_to_string(p) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+            continue;
+        };
+        if v.get("cwd").and_then(|c| c.as_str()).map(|c| same_path(c, cwd)) != Some(true) {
+            continue;
+        }
+        if v.get("hasConversation").and_then(|b| b.as_bool()) != Some(true) {
+            continue; // 决策8：跳过从未真正开始对话的空壳会话
+        }
+        let Some(chat_dir) = p.parent() else {
+            continue;
+        };
+        let Some(id) = chat_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let ts = v.get("updatedAtMs").and_then(|t| t.as_i64()).unwrap_or(0);
+        let native_title = v.get("title").and_then(|t| t.as_str());
+        let label = cursor_label(native_title, read_cursor_first_prompt(chat_dir));
+        out.push(SessionRef {
+            label,
+            id: id.to_string(),
+            ts,
+            path: chat_dir.to_string_lossy().into_owned(),
+        });
+    }
+    out.sort_by(|a, b| b.ts.cmp(&a.ts));
+    out
+}
+
+/// 删除 cursor 会话：整个 chat 目录移入回收站（仅限 ~/.cursor/chats 内；chat-id 无法从目录结构反查，故按 path 删除）。
+pub fn delete_cursor_session(path: &str) -> Result<(), String> {
+    let Some(h) = home() else {
+        return Err("无 home 目录".into());
+    };
+    let p = Path::new(path);
+    if !p.starts_with(h.join(".cursor").join("chats")) {
+        return Err("路径不在 cursor chats 目录内".into());
+    }
+    if !p.is_dir() {
+        return Err("会话目录不存在".into());
+    }
+    trash::delete(p).map_err(|e| e.to_string())
+}
+
 // ---------------- 运行后捕获 agent 自生成的 session id ----------------
 
 /// Windows 路径规范化比较：统一分隔符、去尾分隔符、忽略大小写。
@@ -391,12 +491,13 @@ fn same_path(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
-/// 捕获某 agent(claude/codex) 在 cwd 下、启动时刻(since_ms)之后新生成的会话 id（按时间升序）。
-/// claude/codex 都不便在新建时预分配 id，故新建发裸命令、启动后由此关联各自终端的真实 session id。
+/// 捕获某 agent(claude/codex/cursor) 在 cwd 下、启动时刻(since_ms)之后新生成的会话 id（按时间升序）。
+/// 三者都不便在新建时预分配 id，故新建发裸命令、启动后由此关联各自终端的真实 session id。
 pub fn capture_session_ids(agent: &str, cwd: &str, since_ms: i64) -> Vec<String> {
     match agent {
         "claude" => capture_claude_ids(cwd, since_ms),
         "codex" => capture_codex_ids(cwd, since_ms),
+        "cursor" => capture_cursor_ids(cwd, since_ms),
         _ => Vec::new(),
     }
 }
@@ -496,9 +597,53 @@ fn capture_codex_ids(cwd: &str, since_ms: i64) -> Vec<String> {
     hits.into_iter().map(|(_, id)| id).collect()
 }
 
+/// cursor：扫 ~/.cursor/chats 的 meta.json，取 cwd 匹配、createdAtMs>=since 的 chat-id，按 createdAtMs 升序。
+/// 注意：这里不按 hasConversation 过滤——刚启动、还没来得及说第一句话的会话正是本函数要捕获的目标。
+fn capture_cursor_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+    let Some(h) = home() else {
+        return Vec::new();
+    };
+    let root = h.join(".cursor").join("chats");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(i64, String)> = Vec::new();
+    for entry in WalkDir::new(&root)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_name().to_str() == Some("meta.json"))
+        .take(MAX_CURSOR_SCAN)
+    {
+        let p = entry.path();
+        let Ok(txt) = std::fs::read_to_string(p) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+            continue;
+        };
+        let created = v.get("createdAtMs").and_then(|t| t.as_i64()).unwrap_or(0);
+        if created < since_ms {
+            continue;
+        }
+        if v.get("cwd").and_then(|c| c.as_str()).map(|c| same_path(c, cwd)) != Some(true) {
+            continue;
+        }
+        let Some(chat_dir) = p.parent() else {
+            continue;
+        };
+        if let Some(id) = chat_dir.file_name().and_then(|n| n.to_str()) {
+            hits.push((created, id.to_string()));
+        }
+    }
+    hits.sort_by_key(|(t, _)| *t);
+    hits.into_iter().map(|(_, id)| id).collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{codex_label, parse_codex_session_titles};
+    use super::{codex_label, cursor_label, first_prompt_from_history, parse_codex_session_titles};
     use std::io::Cursor;
 
     #[test]
@@ -526,5 +671,28 @@ mod tests {
         assert_eq!(codex_label(Some(&native), "first prompt".into()), native);
         assert_eq!(codex_label(None, "first prompt".into()), "first prompt");
         assert_eq!(codex_label(None, String::new()), "(无标题)");
+    }
+
+    #[test]
+    fn cursor_native_title_wins_and_fallback_remains_available() {
+        assert_eq!(cursor_label(Some("原生标题"), Some("首条prompt".into())), "原生标题");
+        assert_eq!(cursor_label(None, Some("首条prompt".into())), "首条prompt");
+        assert_eq!(cursor_label(Some("  "), Some("首条prompt".into())), "首条prompt");
+        assert_eq!(cursor_label(None, None), "(无标题)");
+    }
+
+    #[test]
+    fn cursor_first_prompt_skips_empty_and_truncates() {
+        let long_prompt = format!("/plan-create {}", "很长".repeat(50)); // 前缀13 + 100 CJK字符，确保超过80
+        let arr = serde_json::json!(["", "  ", long_prompt]);
+        let got = first_prompt_from_history(&arr).expect("应跳过前两个空白项，取到第三个非空候选");
+        assert_eq!(got.chars().count(), 80);
+        assert!(got.starts_with("/plan-create"));
+
+        let empty = serde_json::json!([]);
+        assert_eq!(first_prompt_from_history(&empty), None);
+
+        let all_blank = serde_json::json!(["", "   "]);
+        assert_eq!(first_prompt_from_history(&all_blank), None);
     }
 }

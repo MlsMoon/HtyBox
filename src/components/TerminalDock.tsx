@@ -22,12 +22,15 @@ import {
   DEFAULT_PROFILE,
   injectText,
   launchCmdFor,
+  isAgentTerminal,
   type AgentKind,
   type DragItem,
   type Profile,
 } from "../profiles";
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
+import cursorIcon from "../assets/cursor.svg";
+import { ProfileIcon } from "./ProfileIcon";
 import HtyBoxLogo from "./ui/HtyBoxLogo";
 import {
   setupMcpAgent,
@@ -191,7 +194,7 @@ function applyTabTitle(
   agentKind: AgentKind,
   api: { setTitle: (t: string) => void },
 ): void {
-  const isAgent = agentKind === "claude" || agentKind === "codex";
+  const isAgent = isAgentTerminal(agentKind);
   const [prefix, body] = isAgent
     ? splitStatusPrefix(LAST_OSC[termId] ?? "")
     : ["", (LAST_OSC[termId] ?? "").trim()];
@@ -230,6 +233,7 @@ function TabTypeIcon({ params }: { params: TermParams & { editorPath?: string } 
   if (!ep) {
     if (params.agentKind === "claude") return <img src={claudeIcon} alt="" className={cls} draggable={false} />;
     if (params.agentKind === "codex") return <img src={codexIcon} alt="" className={"codex-glyph " + cls} draggable={false} />;
+    if (params.agentKind === "cursor") return <img src={cursorIcon} alt="" className={"cursor-glyph " + cls} draggable={false} />;
     return (
       <svg className={cls} viewBox="0 0 24 24">
         <rect x="2" y="3.5" width="20" height="17" rx="5" fill="var(--text)" />
@@ -303,7 +307,7 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
     const sid = tid ? SESSION_IDS[tid] : undefined;
     // 编辑"纯会话名"（不含状态前缀/身份装饰）：避免带出 ✳ 后保留导致与实时前缀重复成两份
     const pure =
-      (sid && (p.agentKind === "claude" || p.agentKind === "codex")
+      (sid && isAgentTerminal(p.agentKind)
         ? getSessionTitle(p.agentKind, sid)
         : "") ||
       (tid ? CUSTOM_TITLES[tid] : "") ||
@@ -318,8 +322,8 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
     if (t) {
       const p = props.params as TermParams & { editorPath?: string };
       const sid = p.termId ? SESSION_IDS[p.termId] : undefined;
-      if (p.termId && sid && (p.agentKind === "claude" || p.agentKind === "codex")) {
-        // claude/codex 终端：写"会话自定义名"，与 Session 列表联动；OSC 状态前缀仍实时跟随（见 applyTabTitle）
+      if (p.termId && sid && isAgentTerminal(p.agentKind)) {
+        // claude/codex/cursor 终端：写"会话自定义名"，与 Session 列表联动；OSC 状态前缀仍实时跟随（见 applyTabTitle）
         setSessionTitle(p.agentKind, sid, t);
       } else {
         // shell / session id 未捕获 / 编辑器面板：回退到按终端(或文件)的自定义名
@@ -351,12 +355,12 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
     );
   }
 
-  // Tab 取会话标识（与 commit() 同款）：claude/codex 且 sid 已捕获才能打 tag；shell / sid 未就绪不可。
+  // Tab 取会话标识（与 commit() 同款）：agent 终端且 sid 已捕获才能打 tag；shell / sid 未就绪不可。
   const p2 = props.params as TermParams & { editorPath?: string };
   const sid = p2.termId ? SESSION_IDS[p2.termId] : undefined;
-  const canTag = !!sid && (p2.agentKind === "claude" || p2.agentKind === "codex");
+  const canTag = !!sid && isAgentTerminal(p2.agentKind);
   const tabSessionName =
-    sid && (p2.agentKind === "claude" || p2.agentKind === "codex")
+    sid && isAgentTerminal(p2.agentKind)
       ? getSessionTitle(p2.agentKind, sid) || splitStatusPrefix(title)[1] || title
       : title;
   return (
@@ -442,7 +446,7 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
       <TagEditor
         x={tagEditor.x}
         y={tagEditor.y}
-        agentKind={p2.agentKind as "claude" | "codex"}
+        agentKind={p2.agentKind as Exclude<AgentKind, "shell">}
         sessionId={sid as string}
         sessionName={tabSessionName}
         onClose={() => setTagEditor(null)}
@@ -478,8 +482,8 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     ensureEngine(termId, shell, launch, cwd, env, agentKind);
     attachEngine(termId, c);
 
-    // 新建的空 claude/codex 会话(非复原、非 Session 透传 id)：启动后捕获其真实 session id 供日后精确复原
-    if (!restored && !sid && cwd && (agentKind === "claude" || agentKind === "codex")) {
+    // 新建的空 agent 会话(非复原、非 Session 透传 id)：启动后捕获其真实 session id 供日后精确复原
+    if (!restored && !sid && cwd && isAgentTerminal(agentKind)) {
       void captureSessionId(termId, agentKind, cwd);
     }
 
@@ -497,7 +501,7 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
       LAST_OSC[termId] = raw;
       applyTabTitle(termId, agentKind, props.api);
       // OSC 标题"活动检测"：内容真变 + 是 agent 终端 → 标记该工作区运行中（agentStatus 三态总线）
-      if (changed && (agentKind === "claude" || agentKind === "codex")) pingAgentActivity(termId);
+      if (changed && isAgentTerminal(agentKind)) pingAgentActivity(termId);
     });
     // 会话自定义名改变(本终端在 Tab 改、或在 Session 列表改同一会话)→ 实时刷新本 Tab
     const titleSub = onSessionTitlesChange(() => applyTabTitle(termId, agentKind, props.api));
@@ -572,32 +576,6 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
         />
       )}
     </div>
-  );
-}
-
-/** 工具栏图标：Claude / Codex 用 FanBox 仓库的官方 SVG 素材；PowerShell 用终端 >_。 */
-function ProfileIcon({ id }: { id: string }) {
-  if (id === "claude")
-    return (
-      <img src={claudeIcon} alt="Claude" className="h-4 w-4" draggable={false} />
-    );
-  if (id === "codex")
-    return (
-      <img src={codexIcon} alt="Codex" className="codex-glyph h-4 w-4" draggable={false} />
-    );
-  return (
-    <svg
-      className="h-4 w-4"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <polyline points="4 7 9 12 4 17" />
-      <line x1="11" y1="17" x2="19" y2="17" />
-    </svg>
   );
 }
 
@@ -757,7 +735,7 @@ export default function TerminalDock({
         {
           const wfSid = SESSION_IDS[termId];
           const ak = params?.agentKind;
-          if (wfSid && (ak === "claude" || ak === "codex"))
+          if (wfSid && isAgentTerminal(ak))
             archiveRunToSession(termId, `${ak}:${wfSid}`);
           else clearRun(termId);
         }

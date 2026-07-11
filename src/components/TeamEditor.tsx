@@ -48,6 +48,11 @@ export default function TeamEditor({
           <option key={m} value={m} />
         ))}
       </datalist>
+      <datalist id="models-cursor">
+        {DEFAULT_MODELS.cursor.map((m) => (
+          <option key={m} value={m} />
+        ))}
+      </datalist>
       <div
         className="flex max-h-[82vh] w-[680px] max-w-full flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg)] shadow-2xl"
         onClick={(e) => e.stopPropagation()}
@@ -104,14 +109,15 @@ export default function TeamEditor({
                 <select
                   className={inputCls}
                   value={a.agentKind}
-                  onChange={(e) => patchAgent(a.id, { agentKind: e.target.value as "claude" | "codex" })}
+                  onChange={(e) => patchAgent(a.id, { agentKind: e.target.value as TeamAgentDef["agentKind"] })}
                 >
                   <option value="claude">ClaudeCode</option>
                   <option value="codex">Codex</option>
+                  <option value="cursor">Cursor</option>
                 </select>
                 <input
                   className={inputCls + " w-[120px]"}
-                  list={a.agentKind === "codex" ? "models-codex" : "models-claude"}
+                  list={`models-${a.agentKind}`}
                   placeholder="模型（默认）"
                   value={a.model}
                   onChange={(e) => patchAgent(a.id, { model: e.target.value })}

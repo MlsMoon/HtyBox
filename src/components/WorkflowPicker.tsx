@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useWorkflows, ensureSeed, type Workflow } from "../workflows";
 import { PROFILES, type Profile } from "../profiles";
+import { ProfileIcon } from "./ProfileIcon";
 
 // 工作流锚定选择器（fixed 坐标 + portal + 边界回弹，交互同 ContextMenu）。双模式：
 //   apply：Tab 右键「应用工作流…」→ 点某工作流 onPick(wf)，绑定到该终端
@@ -71,14 +72,15 @@ export default function WorkflowPicker({
             <button
               key={p.id}
               onClick={() => setAgentIdx(i)}
+              title={p.label}
               className={
-                "flex-1 rounded-md px-2 py-1 text-[10.5px] font-semibold transition-colors " +
+                "flex flex-1 items-center justify-center rounded-md py-1.5 transition-colors " +
                 (i === agentIdx
-                  ? "bg-[var(--accent)] text-white"
-                  : "text-[var(--text-2)] hover:text-[var(--text)]")
+                  ? "bg-[var(--accent)]/15 ring-1 ring-inset ring-[var(--accent)]"
+                  : "hover:bg-[var(--surface)]")
               }
             >
-              {p.label}
+              <ProfileIcon id={p.id} />
             </button>
           ))}
         </div>

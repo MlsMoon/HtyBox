@@ -1,4 +1,11 @@
-export type AgentKind = "claude" | "codex" | "shell";
+export type AgentKind = "claude" | "codex" | "cursor" | "shell";
+
+/** 是否为真正的 agent 终端(区别于裸 shell)；未来新增 agent 类型无需再逐处补分支。
+ *  写成类型谓词(k is ...)而非裸 boolean，是为了保留原 `agentKind === "claude" || agentKind === "codex"`
+ *  内联写法自带的 TS 控制流窄化效果——调用处很多地方窄化后紧接着把 agentKind 传给要求非 undefined 的函数。 */
+export function isAgentTerminal(k?: string): k is Exclude<AgentKind, "shell"> {
+  return !!k && k !== "shell";
+}
 
 export interface Profile {
   id: string;
@@ -36,6 +43,14 @@ export const PROFILES: Profile[] = [
     launchCmd: "codex\r",
     dotColor: "#10a37f",
   },
+  {
+    id: "cursor",
+    label: "Cursor",
+    agentKind: "cursor",
+    shell: "powershell.exe",
+    launchCmd: "cursor-agent\r",
+    dotColor: "#000000",
+  },
 ];
 
 export const DEFAULT_PROFILE = PROFILES[0];
@@ -47,6 +62,7 @@ export const DEFAULT_PROFILE = PROFILES[0];
  * 捕获逻辑 + SESSION_IDS)，复原时按捕获到的 id 精确复原 → 不依赖 OSC 标题、不受状态符号(✳)影响。
  * - claude：新建 `claude`；复原 `claude --resume <id>`；无 id 退回 `claude --resume`(选择器)
  * - codex：新建 `codex`；复原 `codex resume <id>`；无 id 退回 `codex resume`(选择器)
+ * - cursor：新建 `cursor-agent`；复原 `cursor-agent --resume <id>`(与 claude 同为 flag 风格，已实测)；无 id 退回 `cursor-agent --resume`(选择器)
  * - shell：无启动命令。
  */
 export function launchCmdFor(
@@ -79,6 +95,12 @@ export function launchCmdFor(
     if (resume) return sid ? `codex resume ${sid}\r` : "codex resume\r";
     return `codex${m}${ip}\r`;
   }
+  // cursor-agent 不支持新建时预分配 id，其 id 由 cursor-agent 自生成、HtyBox 启动后捕获。
+  // 复原：--resume 是 flag 风格(与 claude 同构，已实测)，有 id 精确复原，无 id 落到官方选择器。
+  if (agent === "cursor") {
+    if (resume) return sid ? `cursor-agent --resume ${sid}\r` : "cursor-agent --resume\r";
+    return `cursor-agent${m}${ip}\r`;
+  }
   return undefined;
 }
 
@@ -98,8 +120,9 @@ export function injectText(item: DragItem, agent: AgentKind): string {
   // text(书签)：直接注入文本内容，三种 agent 一致；多行压成单行防 agent 输入框逐行误提交。
   if (item.kind === "text") return (item.text ?? "").replace(/\r?\n/g, " ").trim();
   if (item.kind === "skill") {
-    if (agent === "claude") return item.invoke ?? item.path ?? ""; // /skill-name
-    if (agent === "codex") return "@" + (item.path ?? ""); // codex 用文件路径
+    // cursor-agent 与 claude 同走原生 /skill-name slash-invoke(已实测确认，非文本转发)。
+    if (agent === "claude" || agent === "cursor") return item.invoke ?? item.path ?? ""; // /skill-name
+    if (agent === "codex") return "@" + (item.path ?? ""); // codex 无原生机制，用文件路径
     return item.path ?? ""; // 裸 shell：纯路径
   }
   // memory / file：shell 用裸路径，claude/codex 用 @路径；file 多选时各路径转换后以空格拼接

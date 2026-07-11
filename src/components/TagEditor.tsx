@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { TAG_COLORS, tagDot, type TagColorKey } from "../tagColors";
+import type { AgentKind } from "../profiles";
 import {
   useSessionTags,
   useVocab,
@@ -53,7 +54,7 @@ export default function TagEditor({
 }: {
   x: number;
   y: number;
-  agentKind: "claude" | "codex";
+  agentKind: Exclude<AgentKind, "shell">;
   sessionId: string;
   sessionName?: string;
   onClose: () => void;

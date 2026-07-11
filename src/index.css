@@ -172,6 +172,11 @@ html.dark .codex-glyph {
   filter: invert(1);
 }
 
+/* cursor 官方图标同为 fill:currentColor 单色线条，与 codex 同款处理：深色反相成白。 */
+html.dark .cursor-glyph {
+  filter: invert(1);
+}
+
 /* dockview 浅色主题对齐 Claude 奶油配色；终端面板内容区保持暖深 */
 .dockview-theme-light {
   --dv-group-view-background-color: var(--term-bg);

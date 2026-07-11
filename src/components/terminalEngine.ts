@@ -4,6 +4,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { pingAgentActivity } from "../agentStatus";
 import { attachMiddleScroll } from "../middleScroll";
+import { isAgentTerminal } from "../profiles";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -36,7 +37,7 @@ interface Engine {
   lastRows?: number;
   fitTimer?: number; // 防抖句柄：合并连续尺寸变化（挂载布局抖动 / 拖动分屏），稳定后只 fit 一次
   lastOutputAt?: number; // 最近一次收到 PTY 输出的时间戳（M7-D：静默=回合物理结束、可安全注入）
-  agentKind?: string; // "claude"|"codex"|"shell"：决定是否把 PTY 活动上报运行状态总线
+  agentKind?: string; // "claude"|"codex"|"cursor"|"shell"：决定是否把 PTY 活动上报运行状态总线
   lastPingAt?: number; // 最近一次向 agentStatus 上报活动的时刻（节流 PTY 高频输出，避免每帧都 ping）
   midScroll: () => void; // 解绑中键自动滚动（dispose 时调用；见 middleScroll.ts）
 }
@@ -49,7 +50,7 @@ const engines = new Map<string, Engine>();
  * (codex 实测 \n 折叠；claude 原生 Alt+V 内部也用 \n)。普通 shell 不包裹、换行转 \r 当逐行回车。
  */
 function pasteData(agentKind: string | undefined, raw: string): string {
-  if (agentKind === "claude" || agentKind === "codex") {
+  if (isAgentTerminal(agentKind)) {
     const t = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     return `\x1b[200~${t}\x1b[201~`;
   }
@@ -63,7 +64,7 @@ export function ensureEngine(
   launchCmd?: string,
   cwd?: string,
   env?: Record<string, string>,
-  agentKind?: string, // "claude"|"codex"|"shell"：决定粘贴的换行/包裹方式
+  agentKind?: string, // "claude"|"codex"|"cursor"|"shell"：决定粘贴的换行/包裹方式
 ): void {
   if (engines.has(termId)) return;
 
@@ -119,7 +120,7 @@ export function ensureEngine(
     if (e.type !== "keydown" || !e.ctrlKey || e.altKey) return true;
     if (e.key === "v" || e.key === "V") {
       const pasteClipImage = () => {
-        if (agentKind !== "claude" && agentKind !== "codex") return;
+        if (!isAgentTerminal(agentKind)) return;
         const ws = engines.get(termId)?.cwd;
         if (!ws) return;
         invoke<string>("save_clipboard_image", { workspaceDir: ws })
@@ -199,7 +200,7 @@ function createPty(termId: string): void {
     // —— TUI 的 spinner 是【正文行高频重绘】(走 PTY)，而 OSC 标题(OSC 2)仅在状态/会话名切换时低频更新；
     // 只盯标题会在"spinner 在转但标题静默"时把运行中误判为完成。节流 250ms，避免每帧 ping。
     if (
-      (e.agentKind === "claude" || e.agentKind === "codex") &&
+      isAgentTerminal(e.agentKind) &&
       now - (e.lastPingAt ?? 0) >= 250
     ) {
       e.lastPingAt = now;
