@@ -1,6 +1,6 @@
 [package]
 name = "htybox-app"
-version = "1.7.0"
+version = "1.7.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -32,6 +32,11 @@ tauri-plugin-dialog = "2.7.1"
 tiny_http = "0.12.0"
 toml_edit = "0.25.12"
 trash = "5"
+zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+tempfile = "3.27.0"
+sha2 = "0.10.9"
+md5 = "0.8.1"
+rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled", "backup"] }
 tauri-plugin-process = "2"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time"] }
 axum = { version = "0.8.9", features = ["ws"] }
@@ -45,4 +50,3 @@ tauri-plugin-updater = "2"
 
 [dev-dependencies]
 # tokio-tungstenite 已提为正式依赖（relay 反连）；测试沿用同一 crate
-

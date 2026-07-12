@@ -10,7 +10,7 @@
 //!   复原 `cursor-agent --resume <chatId>`(flag 风格，与 claude 同构，已实测)；删除走删整个 chat 目录。
 //! 删除统一移入回收站(trash，非交互、可恢复)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -33,12 +33,393 @@ fn home() -> Option<PathBuf> {
 const MAX_CODEX_SCAN: usize = 1200; // 最多扫描的 codex rollout 数（按文件名时间倒序）
 const MAX_CURSOR_SCAN: usize = 2000; // 最多扫描的 cursor chat meta.json 数（安全上限，文件名不含时间故按遍历序截断）
 
+pub const CLAUDE_SESSION_SCHEMA: &str = "claude-transcript-jsonl-v1";
+pub const CODEX_SESSION_SCHEMA: &str = "codex-rollout-jsonl-v1";
+pub const CURSOR_SESSION_SCHEMA: &str = "cursor-chat-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAgent {
+    Claude,
+    Codex,
+    Cursor,
+}
+
+impl TryFrom<&str> for SessionAgent {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "cursor" => Ok(Self::Cursor),
+            _ => Err(format!("不支持的 Session Agent：{value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ExistingPathKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaudeSessionLocation {
+    pub id: String,
+    pub source_cwd: String,
+    pub source_agent_version: String,
+    pub project_dir: PathBuf,
+    pub transcript: PathBuf,
+    pub history: PathBuf,
+    pub sidecar_dir: Option<PathBuf>,
+    pub subagents_dir: Option<PathBuf>,
+    pub tool_results_dir: Option<PathBuf>,
+    pub tasks_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexSessionLocation {
+    pub id: String,
+    pub source_cwd: String,
+    pub source_agent_version: String,
+    pub rollout: PathBuf,
+    pub relative_rollout: PathBuf,
+    pub native_title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CursorSessionLocation {
+    pub id: String,
+    pub source_cwd: String,
+    pub schema_version: u32,
+    pub chat_dir: PathBuf,
+    pub meta: PathBuf,
+    pub prompt_history: Option<PathBuf>,
+    pub store_db: PathBuf,
+    pub native_title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LocatedSession {
+    Claude(ClaudeSessionLocation),
+    Codex(CodexSessionLocation),
+    Cursor(CursorSessionLocation),
+}
+
+pub fn validate_session_id(id: &str) -> Result<(), String> {
+    if id.len() != 36 {
+        return Err("Session ID 必须是 36 字符小写 UUID".into());
+    }
+    for (index, byte) in id.bytes().enumerate() {
+        let is_dash = matches!(index, 8 | 13 | 18 | 23);
+        if (is_dash && byte != b'-')
+            || (!is_dash && !(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err("Session ID 必须是规范小写 UUID".into());
+        }
+    }
+    Ok(())
+}
+
+fn reject_dot_components(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("路径必须是绝对路径：{}", path.display()));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(format!("路径不能含 . 或 ..：{}", path.display()));
+    }
+    Ok(())
+}
+
+pub fn canonical_existing_under(
+    root: &Path,
+    candidate: &Path,
+    expected_kind: ExistingPathKind,
+) -> Result<PathBuf, String> {
+    reject_dot_components(root)?;
+    reject_dot_components(candidate)?;
+    let root_metadata = crate::portable_archive::reject_link_or_reparse(root)?;
+    if !root_metadata.is_dir() {
+        return Err(format!("权威根目录不存在：{}", root.display()));
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("解析权威根目录失败：{e}"))?;
+    let metadata = crate::portable_archive::reject_link_or_reparse(candidate)?;
+    let candidate = candidate
+        .canonicalize()
+        .map_err(|e| format!("解析候选路径失败：{e}"))?;
+    if candidate.strip_prefix(&root).is_err() || candidate == root {
+        return Err(format!("路径不在权威根目录内：{}", candidate.display()));
+    }
+    let kind_matches = match expected_kind {
+        ExistingPathKind::File => metadata.is_file(),
+        ExistingPathKind::Directory => metadata.is_dir(),
+    };
+    if !kind_matches {
+        return Err(format!("候选路径类型不正确：{}", candidate.display()));
+    }
+    Ok(candidate)
+}
+
+pub fn canonical_same_existing_path(left: &Path, right: &Path) -> Result<bool, String> {
+    reject_dot_components(left)?;
+    reject_dot_components(right)?;
+    crate::portable_archive::reject_link_or_reparse(left)?;
+    crate::portable_archive::reject_link_or_reparse(right)?;
+    let left = left
+        .canonicalize()
+        .map_err(|e| format!("解析路径失败 {}：{e}", left.display()))?;
+    let right = right
+        .canonicalize()
+        .map_err(|e| format!("解析路径失败 {}：{e}", right.display()))?;
+    Ok(left == right)
+}
+
+pub fn validate_source_hint(hint: Option<&str>, authoritative: &Path) -> Result<(), String> {
+    let Some(hint) = hint.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    if !canonical_same_existing_path(Path::new(hint), authoritative)? {
+        return Err("前端 sourcePath 与权威 Session 来源不一致".into());
+    }
+    Ok(())
+}
+
+pub fn cursor_bucket(cwd: &str) -> String {
+    format!("{:x}", md5::compute(cwd.as_bytes()))
+}
+
+fn canonical_workspace(cwd: &str) -> Result<PathBuf, String> {
+    let path = Path::new(cwd);
+    reject_dot_components(path)?;
+    let metadata = crate::portable_archive::reject_link_or_reparse(path)?;
+    if !metadata.is_dir() {
+        return Err("Session cwd 不是现存目录".into());
+    }
+    path.canonicalize()
+        .map_err(|e| format!("解析 Session cwd 失败：{e}"))
+}
+
+fn path_matches_workspace(value: &str, workspace: &Path) -> Result<bool, String> {
+    let path = Path::new(value);
+    reject_dot_components(path)?;
+    let metadata = crate::portable_archive::reject_link_or_reparse(path)?;
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    Ok(path.canonicalize().map_err(|e| e.to_string())? == workspace)
+}
+
+fn inspect_claude_transcript(
+    path: &Path,
+    id: &str,
+    workspace: &Path,
+) -> Result<(String, String), String> {
+    const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    let mut authoritative: Option<(String, String)> = None;
+    loop {
+        buffer.clear();
+        let read = reader
+            .read_until(b'\n', &mut buffer)
+            .map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        if buffer.len() > MAX_LINE_BYTES {
+            return Err("Claude transcript 单行超过 16 MiB".into());
+        }
+        let complete = buffer.ends_with(b"\n");
+        let line = buffer.strip_suffix(b"\n").unwrap_or(&buffer);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let value = match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(value) => value,
+            Err(_) if !complete => break,
+            Err(error) => return Err(format!("Claude transcript 含损坏 JSONL：{error}")),
+        };
+        if let Some(found_id) = value.get("sessionId").and_then(|value| value.as_str()) {
+            if found_id != id {
+                return Err("Claude transcript 内 sessionId 冲突".into());
+            }
+        }
+        let record_type = value.get("type").and_then(|value| value.as_str());
+        if matches!(
+            record_type,
+            Some("user" | "assistant" | "system" | "attachment")
+        ) {
+            let Some(record_id) = value.get("sessionId").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(record_cwd) = value.get("cwd").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(version) = value
+                .get("version")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            if record_id == id && path_matches_workspace(record_cwd, workspace).unwrap_or(false) {
+                authoritative = Some((record_cwd.to_string(), version.to_string()));
+            }
+        }
+    }
+    authoritative.ok_or_else(|| "Claude transcript 缺少 id/cwd/version 权威正文记录".into())
+}
+
+fn claude_history_contains(history: &Path, id: &str, workspace: &Path) -> Result<bool, String> {
+    let file = std::fs::File::open(history).map_err(|e| e.to_string())?;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("sessionId").and_then(|value| value.as_str()) != Some(id) {
+            continue;
+        }
+        if let Some(project) = value.get("project").and_then(|value| value.as_str()) {
+            if path_matches_workspace(project, workspace).unwrap_or(false) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn optional_directory(root: &Path, candidate: PathBuf) -> Result<Option<PathBuf>, String> {
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(_) => canonical_existing_under(root, &candidate, ExistingPathKind::Directory).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("读取可选目录失败 {}：{error}", candidate.display())),
+    }
+}
+
+pub(crate) fn locate_claude_session_in(
+    home: &Path,
+    id: &str,
+    cwd: &str,
+) -> Result<ClaudeSessionLocation, String> {
+    validate_session_id(id)?;
+    let workspace = canonical_workspace(cwd)?;
+    let claude_root = home.join(".claude");
+    let projects_root = claude_root.join("projects");
+    let expected_slug = crate::catalog::claude_project_slug(cwd)?;
+    let root_metadata = crate::portable_archive::reject_link_or_reparse(&projects_root)?;
+    if !root_metadata.is_dir() {
+        return Err("Claude projects 根目录不存在".into());
+    }
+
+    let mut candidates = Vec::new();
+    let file_name = format!("{id}.jsonl");
+    for entry in std::fs::read_dir(&projects_root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let project = entry.path();
+        let Ok(metadata) = crate::portable_archive::reject_link_or_reparse(&project) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let candidate = project.join(&file_name);
+        if std::fs::symlink_metadata(&candidate).is_ok() {
+            candidates.push(canonical_existing_under(
+                &projects_root,
+                &candidate,
+                ExistingPathKind::File,
+            )?);
+        }
+    }
+    if candidates.len() != 1 {
+        return Err(format!(
+            "Claude Session 来源必须全局唯一，实际找到 {} 个",
+            candidates.len()
+        ));
+    }
+    let transcript = candidates.remove(0);
+    let project_dir = transcript
+        .parent()
+        .ok_or_else(|| "Claude transcript 缺少 project 父目录".to_string())?
+        .to_path_buf();
+    let actual_slug = project_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if !actual_slug.eq_ignore_ascii_case(&expected_slug) {
+        return Err("Claude transcript 不在当前工作区对应 project bucket".into());
+    }
+    let (source_cwd, source_agent_version) =
+        inspect_claude_transcript(&transcript, id, &workspace)?;
+    let history = canonical_existing_under(
+        &claude_root,
+        &claude_root.join("history.jsonl"),
+        ExistingPathKind::File,
+    )?;
+    if !claude_history_contains(&history, id, &workspace)? {
+        return Err("Claude history 缺少当前 Session 的工作区记录".into());
+    }
+    let sidecar_dir = optional_directory(&project_dir, project_dir.join(id))?;
+    let subagents_dir = sidecar_dir
+        .as_ref()
+        .map(|root| optional_directory(root, root.join("subagents")))
+        .transpose()?
+        .flatten();
+    let tool_results_dir = sidecar_dir
+        .as_ref()
+        .map(|root| optional_directory(root, root.join("tool-results")))
+        .transpose()?
+        .flatten();
+    let tasks_root = claude_root.join("tasks");
+    let tasks_dir = if tasks_root.is_dir() {
+        optional_directory(&tasks_root, tasks_root.join(id))?
+    } else {
+        None
+    };
+    Ok(ClaudeSessionLocation {
+        id: id.to_string(),
+        source_cwd,
+        source_agent_version,
+        project_dir,
+        transcript,
+        history,
+        sidecar_dir,
+        subagents_dir,
+        tool_results_dir,
+        tasks_dir,
+    })
+}
+
+pub fn locate_claude_session(id: &str, cwd: &str) -> Result<ClaudeSessionLocation, String> {
+    let home = home().ok_or_else(|| "无 home 目录".to_string())?;
+    locate_claude_session_in(&home, id, cwd)
+}
+
+pub fn locate_session(agent: SessionAgent, id: &str, cwd: &str) -> Result<LocatedSession, String> {
+    match agent {
+        SessionAgent::Claude => locate_claude_session(id, cwd).map(LocatedSession::Claude),
+        SessionAgent::Codex => locate_codex_session(id, cwd).map(LocatedSession::Codex),
+        SessionAgent::Cursor => locate_cursor_session(id, cwd).map(LocatedSession::Cursor),
+    }
+}
+
 /// claude：从 ~/.claude/history.jsonl 取本工作区(project==cwd)会话列表与时间；标题(label)取该会话 jsonl
 /// 内最新一条 ai-title(claude 自动生成的会话标题，= /resume 选择器所示)，无则回退首条非斜杠提示。
 pub fn list_claude_sessions(cwd: &str) -> Vec<SessionRef> {
-    let Some(h) = home() else {
+    let Some(home_dir) = home() else {
         return Vec::new();
     };
+    list_claude_sessions_in(&home_dir, cwd)
+}
+
+pub(crate) fn list_claude_sessions_in(home_dir: &Path, cwd: &str) -> Vec<SessionRef> {
+    let h = home_dir;
     let Ok(f) = std::fs::File::open(h.join(".claude").join("history.jsonl")) else {
         return Vec::new();
     };
@@ -85,17 +466,16 @@ pub fn list_claude_sessions(cwd: &str) -> Vec<SessionRef> {
     let mut out: Vec<SessionRef> = order
         .into_iter()
         .filter_map(|id| {
+            let transcript = files.get(&id)?;
             map.get(&id).map(|(display, ts, _)| {
-                let label = files
-                    .get(&id)
-                    .and_then(|p| read_ai_title(p))
+                let label = read_ai_title(transcript)
                     .or_else(|| (!display.is_empty()).then(|| display.clone()))
                     .unwrap_or_else(|| "(无标题)".into());
                 SessionRef {
                     label,
                     id: id.clone(),
                     ts: *ts,
-                    path: String::new(),
+                    path: transcript.to_string_lossy().into_owned(),
                 }
             })
         })
@@ -107,6 +487,7 @@ pub fn list_claude_sessions(cwd: &str) -> Vec<SessionRef> {
 /// 建 sessionId -> <id>.jsonl 路径映射（遍历 ~/.claude/projects/*/*.jsonl）。
 fn session_files(home: &Path) -> HashMap<String, PathBuf> {
     let mut m = HashMap::new();
+    let mut duplicates = HashSet::new();
     let Ok(dirs) = std::fs::read_dir(home.join(".claude").join("projects")) else {
         return m;
     };
@@ -118,7 +499,14 @@ fn session_files(home: &Path) -> HashMap<String, PathBuf> {
             let fp = fe.path();
             if fp.extension().and_then(|e| e.to_str()) == Some("jsonl") {
                 if let Some(stem) = fp.file_stem().and_then(|s| s.to_str()) {
-                    m.entry(stem.to_string()).or_insert(fp);
+                    let stem = stem.to_string();
+                    if duplicates.contains(&stem) {
+                        continue;
+                    }
+                    if m.insert(stem.clone(), fp).is_some() {
+                        m.remove(&stem);
+                        duplicates.insert(stem);
+                    }
                 }
             }
         }
@@ -272,6 +660,179 @@ fn codex_label(native_title: Option<&String>, fallback: String) -> String {
     })
 }
 
+pub(crate) fn validate_codex_relative_path(relative: &Path, id: &str) -> Result<(), String> {
+    let parts: Vec<_> = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => value
+                .to_str()
+                .ok_or_else(|| "Codex rollout 路径不是 UTF-8".to_string()),
+            _ => Err("Codex rollout 含非法相对路径组件".into()),
+        })
+        .collect::<Result<_, _>>()?;
+    if parts.len() != 4
+        || parts[0].len() != 4
+        || parts[1].len() != 2
+        || parts[2].len() != 2
+        || !parts[..3]
+            .iter()
+            .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err("Codex rollout 日期层级必须为 YYYY/MM/DD".into());
+    }
+    let year: u32 = parts[0].parse().map_err(|_| "Codex rollout 年份无效")?;
+    let month: u32 = parts[1].parse().map_err(|_| "Codex rollout 月份无效")?;
+    let day: u32 = parts[2].parse().map_err(|_| "Codex rollout 日期无效")?;
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Err("Codex rollout 月份必须在 01..12".into()),
+    };
+    if year == 0 || day == 0 || day > max_day {
+        return Err("Codex rollout 日期不是有效公历日期".into());
+    }
+    let expected_prefix = format!("rollout-{}-{}-{}T", parts[0], parts[1], parts[2]);
+    let expected_suffix = format!("-{id}.jsonl");
+    let Some(clock) = parts[3]
+        .strip_prefix(&expected_prefix)
+        .and_then(|value| value.strip_suffix(&expected_suffix))
+    else {
+        return Err("Codex rollout 文件名与日期/Session ID 不一致".into());
+    };
+    let clock_parts: Vec<_> = clock.split('-').collect();
+    if clock_parts.len() != 3
+        || clock_parts
+            .iter()
+            .any(|part| part.len() != 2 || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err("Codex rollout 时间必须为 HH-MM-SS".into());
+    }
+    let hour: u32 = clock_parts[0]
+        .parse()
+        .map_err(|_| "Codex rollout 小时无效")?;
+    let minute: u32 = clock_parts[1]
+        .parse()
+        .map_err(|_| "Codex rollout 分钟无效")?;
+    let second: u32 = clock_parts[2].parse().map_err(|_| "Codex rollout 秒无效")?;
+    if hour >= 24 || minute >= 60 || second >= 60 {
+        return Err("Codex rollout 时间超出有效范围".into());
+    }
+    Ok(())
+}
+
+fn inspect_codex_meta(
+    rollout: &Path,
+    id: &str,
+    workspace: &Path,
+) -> Result<(String, String), String> {
+    let file = std::fs::File::open(rollout).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    reader
+        .read_until(b'\n', &mut line)
+        .map_err(|e| e.to_string())?;
+    if line.is_empty() || line.len() > 1024 * 1024 || !line.ends_with(b"\n") {
+        return Err("Codex rollout 首行缺失、不完整或超过 1 MiB".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&line).map_err(|e| format!("Codex session_meta JSON 无效：{e}"))?;
+    if value.get("type").and_then(|value| value.as_str()) != Some("session_meta") {
+        return Err("Codex rollout 首行不是 session_meta".into());
+    }
+    let payload = value
+        .get("payload")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| "Codex session_meta 缺少 payload".to_string())?;
+    if payload.get("id").and_then(|value| value.as_str()) != Some(id) {
+        return Err("Codex session_meta payload.id 不匹配".into());
+    }
+    let source_cwd = payload
+        .get("cwd")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Codex session_meta 缺少 cwd".to_string())?;
+    if !path_matches_workspace(source_cwd, workspace)? {
+        return Err("Codex session_meta cwd 与目标工作区不一致".into());
+    }
+    let version = payload
+        .get("cli_version")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Codex session_meta 缺少 cli_version".to_string())?;
+    Ok((source_cwd.to_string(), version.to_string()))
+}
+
+pub(crate) fn locate_codex_session_in(
+    home: &Path,
+    id: &str,
+    cwd: &str,
+) -> Result<CodexSessionLocation, String> {
+    validate_session_id(id)?;
+    let workspace = canonical_workspace(cwd)?;
+    let root = home.join(".codex").join("sessions");
+    let root_metadata = crate::portable_archive::reject_link_or_reparse(&root)?;
+    if !root_metadata.is_dir() {
+        return Err("Codex sessions 根目录不存在".into());
+    }
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let suffix = format!("-{id}.jsonl");
+    let zst_suffix = format!("-{id}.jsonl.zst");
+    let mut saw_zst = false;
+    let mut matches = Vec::new();
+    for item in WalkDir::new(&root).max_depth(5).follow_links(false) {
+        let item = item.map_err(|e| format!("扫描 Codex sessions 失败：{e}"))?;
+        if !item.file_type().is_file() {
+            continue;
+        }
+        let Some(name) = item.file_name().to_str() else {
+            continue;
+        };
+        if name.ends_with(&zst_suffix) {
+            saw_zst = true;
+            continue;
+        }
+        if !name.ends_with(&suffix) || !name.starts_with("rollout-") {
+            continue;
+        }
+        let rollout = canonical_existing_under(&root, item.path(), ExistingPathKind::File)?;
+        let relative = rollout
+            .strip_prefix(&canonical_root)
+            .map_err(|_| "Codex rollout 逃逸 sessions 根".to_string())?
+            .to_path_buf();
+        validate_codex_relative_path(&relative, id)?;
+        let (source_cwd, source_agent_version) = inspect_codex_meta(&rollout, id, &workspace)?;
+        matches.push((rollout, relative, source_cwd, source_agent_version));
+    }
+    if matches.is_empty() && saw_zst {
+        return Err("该 Codex Session 仅有 .jsonl.zst，V1 暂不支持导出".into());
+    }
+    if matches.len() != 1 || saw_zst {
+        return Err(format!(
+            "Codex Session 来源不唯一或含冲突压缩格式：jsonl={} zst={}",
+            matches.len(),
+            saw_zst
+        ));
+    }
+    let (rollout, relative_rollout, source_cwd, source_agent_version) = matches.remove(0);
+    let native_title = read_codex_session_titles(home).remove(id);
+    Ok(CodexSessionLocation {
+        id: id.to_string(),
+        source_cwd,
+        source_agent_version,
+        rollout,
+        relative_rollout,
+        native_title,
+    })
+}
+
+pub fn locate_codex_session(id: &str, cwd: &str) -> Result<CodexSessionLocation, String> {
+    let home = home().ok_or_else(|| "无 home 目录".to_string())?;
+    locate_codex_session_in(&home, id, cwd)
+}
+
 /// codex 会话开头由 CLI 注入的系统消息（非用户真实输入）：以 < 开头的 XML 标签块 / # AGENTS.md 指令。
 fn is_codex_injection(t: &str) -> bool {
     t.starts_with('<') || t.starts_with("# AGENTS.md")
@@ -280,9 +841,14 @@ fn is_codex_injection(t: &str) -> bool {
 /// codex：扫 ~/.codex/sessions 的 rollout，session_meta.payload.cwd==cwd 的列出；
 /// 标题优先取 session_index.jsonl 的原生 thread_name，未命名时回退首条非环境用户消息。
 pub fn list_codex_sessions(cwd: &str) -> Vec<SessionRef> {
-    let Some(h) = home() else {
+    let Some(home_dir) = home() else {
         return Vec::new();
     };
+    list_codex_sessions_in(&home_dir, cwd)
+}
+
+pub(crate) fn list_codex_sessions_in(home_dir: &Path, cwd: &str) -> Vec<SessionRef> {
+    let h = home_dir;
     let root = h.join(".codex").join("sessions");
     if !root.is_dir() {
         return Vec::new();
@@ -378,14 +944,47 @@ pub fn delete_codex_session(path: &str) -> Result<(), String> {
     let Some(h) = home() else {
         return Err("无 home 目录".into());
     };
-    let p = Path::new(path);
-    if !p.starts_with(h.join(".codex").join("sessions")) {
-        return Err("路径不在 codex sessions 目录内".into());
+    let root = h.join(".codex").join("sessions");
+    let path = canonical_existing_under(&root, Path::new(path), ExistingPathKind::File)?;
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let relative = path
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "Codex 删除路径逃逸 sessions 根".to_string())?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Codex rollout 文件名不是 UTF-8".to_string())?;
+    let stem = name
+        .strip_suffix(".jsonl")
+        .ok_or_else(|| "Codex 删除目标不是 .jsonl rollout".to_string())?;
+    if stem.len() < 37 {
+        return Err("Codex rollout 文件名缺少 Session ID".into());
     }
-    if !p.is_file() {
-        return Err("会话文件不存在".into());
+    let id_start = stem.len() - 36;
+    if stem.as_bytes().get(id_start.wrapping_sub(1)) != Some(&b'-') {
+        return Err("Codex rollout 文件名缺少 Session ID 分隔符".into());
     }
-    trash::delete(p).map_err(|e| e.to_string())
+    let id = &stem[id_start..];
+    validate_session_id(id)?;
+    validate_codex_relative_path(relative, id)?;
+    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let first = BufReader::new(file)
+        .lines()
+        .next()
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Codex rollout 是空文件".to_string())?;
+    let meta: serde_json::Value = serde_json::from_str(&first).map_err(|e| e.to_string())?;
+    if meta.get("type").and_then(|value| value.as_str()) != Some("session_meta")
+        || meta
+            .get("payload")
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_str())
+            != Some(id)
+    {
+        return Err("Codex rollout 的 session_meta ID 与文件名不一致".into());
+    }
+    trash::delete(path).map_err(|e| e.to_string())
 }
 
 // ---------------- cursor ----------------
@@ -416,12 +1015,190 @@ fn read_cursor_first_prompt(chat_dir: &Path) -> Option<String> {
     first_prompt_from_history(&v)
 }
 
+fn read_small_json(path: &Path, label: &str) -> Result<serde_json::Value, String> {
+    let metadata = crate::portable_archive::reject_link_or_reparse(path)?;
+    if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+        return Err(format!("{label} 不是普通小文件"));
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("{label} JSON 无效：{e}"))
+}
+
+fn inspect_cursor_meta(
+    meta: &Path,
+    id: &str,
+    workspace: &Path,
+) -> Result<(serde_json::Value, String, u32), String> {
+    let value = read_small_json(meta, "Cursor meta.json")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Cursor meta.json 根必须是 object".to_string())?;
+    let schema = object
+        .get("schemaVersion")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "Cursor meta.json 缺少 schemaVersion".to_string())?;
+    if schema != 1 {
+        return Err(format!("不支持的 Cursor chat schemaVersion：{schema}"));
+    }
+    if let Some(meta_id) = object.get("id") {
+        if meta_id.as_str() != Some(id) {
+            return Err("Cursor meta.json id 与 chat 目录不一致".into());
+        }
+    }
+    for field in ["createdAtMs", "updatedAtMs"] {
+        if object
+            .get(field)
+            .and_then(|value| value.as_i64())
+            .is_none_or(|value| value < 0)
+        {
+            return Err(format!("Cursor meta.json {field} 必须是非负整数"));
+        }
+    }
+    if object
+        .get("hasConversation")
+        .and_then(|value| value.as_bool())
+        != Some(true)
+    {
+        return Err("Cursor chat 尚无可导出的 conversation".into());
+    }
+    if object
+        .get("title")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("Cursor meta.json title 类型无效".into());
+    }
+    let source_cwd = object
+        .get("cwd")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Cursor meta.json 缺少 cwd".to_string())?
+        .to_string();
+    if !path_matches_workspace(&source_cwd, workspace)? {
+        return Err("Cursor meta.json cwd 与目标工作区不一致".into());
+    }
+    Ok((value, source_cwd, schema))
+}
+
+fn validate_prompt_history(path: &Path) -> Result<(), String> {
+    let value = read_small_json(path, "Cursor prompt_history.json")?;
+    let Some(items) = value.as_array() else {
+        return Err("Cursor prompt_history.json 必须是字符串数组".into());
+    };
+    if items.iter().any(|item| !item.is_string()) {
+        return Err("Cursor prompt_history.json 必须是字符串数组".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn locate_cursor_session_in(
+    home: &Path,
+    id: &str,
+    cwd: &str,
+) -> Result<CursorSessionLocation, String> {
+    validate_session_id(id)?;
+    let workspace = canonical_workspace(cwd)?;
+    let root = home.join(".cursor").join("chats");
+    let root_metadata = crate::portable_archive::reject_link_or_reparse(&root)?;
+    if !root_metadata.is_dir() {
+        return Err("Cursor chats 根目录不存在".into());
+    }
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(&root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let bucket = entry.path();
+        let Ok(metadata) = crate::portable_archive::reject_link_or_reparse(&bucket) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let candidate = bucket.join(id);
+        if std::fs::symlink_metadata(&candidate).is_ok() {
+            matches.push(canonical_existing_under(
+                &root,
+                &candidate,
+                ExistingPathKind::Directory,
+            )?);
+        }
+    }
+    if matches.len() != 1 {
+        return Err(format!(
+            "Cursor Session 来源必须全局唯一，实际找到 {} 个",
+            matches.len()
+        ));
+    }
+    let chat_dir = matches.remove(0);
+    let bucket_name = chat_dir
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Cursor chat 缺少 bucket".to_string())?;
+    if bucket_name.len() != 32
+        || !bucket_name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("Cursor chat bucket 不是 32 位小写 MD5".into());
+    }
+    let meta = canonical_existing_under(
+        &chat_dir,
+        &chat_dir.join("meta.json"),
+        ExistingPathKind::File,
+    )?;
+    let (meta_value, source_cwd, schema_version) = inspect_cursor_meta(&meta, id, &workspace)?;
+    if bucket_name != cursor_bucket(&source_cwd) {
+        return Err("Cursor chat bucket 与 meta.cwd 的 MD5 不一致".into());
+    }
+    let store_db = canonical_existing_under(
+        &chat_dir,
+        &chat_dir.join("store.db"),
+        ExistingPathKind::File,
+    )?;
+    let prompt_path = chat_dir.join("prompt_history.json");
+    let prompt_history = match std::fs::symlink_metadata(&prompt_path) {
+        Ok(_) => {
+            let path = canonical_existing_under(&chat_dir, &prompt_path, ExistingPathKind::File)?;
+            validate_prompt_history(&path)?;
+            Some(path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("读取 Cursor prompt history 失败：{error}")),
+    };
+    let native_title = meta_value
+        .get("title")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok(CursorSessionLocation {
+        id: id.to_string(),
+        source_cwd,
+        schema_version,
+        chat_dir,
+        meta,
+        prompt_history,
+        store_db,
+        native_title,
+    })
+}
+
+pub fn locate_cursor_session(id: &str, cwd: &str) -> Result<CursorSessionLocation, String> {
+    let home = home().ok_or_else(|| "无 home 目录".to_string())?;
+    locate_cursor_session_in(&home, id, cwd)
+}
+
 /// cursor：递归扫 ~/.cursor/chats/<hash>/<chatId>/meta.json，cwd 字段匹配的列出；
 /// 跳过 hasConversation:false 的空壳会话(决策8)；标题取 meta.json 的 title，缺失回退首条用户 prompt。
 pub fn list_cursor_sessions(cwd: &str) -> Vec<SessionRef> {
-    let Some(h) = home() else {
+    let Some(home_dir) = home() else {
         return Vec::new();
     };
+    list_cursor_sessions_in(&home_dir, cwd)
+}
+
+pub(crate) fn list_cursor_sessions_in(home_dir: &Path, cwd: &str) -> Vec<SessionRef> {
+    let h = home_dir;
     let root = h.join(".cursor").join("chats");
     if !root.is_dir() {
         return Vec::new();
@@ -442,7 +1219,13 @@ pub fn list_cursor_sessions(cwd: &str) -> Vec<SessionRef> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
             continue;
         };
-        if v.get("cwd").and_then(|c| c.as_str()).map(|c| same_path(c, cwd)) != Some(true) {
+        if v.get("schemaVersion").and_then(|value| value.as_u64()) != Some(1) {
+            continue;
+        }
+        let Some(meta_cwd) = v.get("cwd").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !same_path(meta_cwd, cwd) {
             continue;
         }
         if v.get("hasConversation").and_then(|b| b.as_bool()) != Some(true) {
@@ -454,6 +1237,27 @@ pub fn list_cursor_sessions(cwd: &str) -> Vec<SessionRef> {
         let Some(id) = chat_dir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+        if v.get("id").is_some_and(|value| value.as_str() != Some(id)) {
+            continue;
+        }
+        let Some(bucket) = chat_dir
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|value| value.to_str())
+        else {
+            continue;
+        };
+        if bucket != cursor_bucket(meta_cwd) {
+            continue;
+        }
+        let Ok(store_metadata) =
+            crate::portable_archive::reject_link_or_reparse(&chat_dir.join("store.db"))
+        else {
+            continue;
+        };
+        if !store_metadata.is_file() {
+            continue;
+        }
         let ts = v.get("updatedAtMs").and_then(|t| t.as_i64()).unwrap_or(0);
         let native_title = v.get("title").and_then(|t| t.as_str());
         let label = cursor_label(native_title, read_cursor_first_prompt(chat_dir));
@@ -473,22 +1277,59 @@ pub fn delete_cursor_session(path: &str) -> Result<(), String> {
     let Some(h) = home() else {
         return Err("无 home 目录".into());
     };
-    let p = Path::new(path);
-    if !p.starts_with(h.join(".cursor").join("chats")) {
-        return Err("路径不在 cursor chats 目录内".into());
+    let root = h.join(".cursor").join("chats");
+    let path = canonical_existing_under(&root, Path::new(path), ExistingPathKind::Directory)?;
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let relative = path
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "Cursor 删除路径逃逸 chats 根".to_string())?;
+    let parts: Vec<_> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect();
+    if parts.len() != 2 {
+        return Err("Cursor 删除目标必须恰为 bucket/chatId".into());
     }
-    if !p.is_dir() {
-        return Err("会话目录不存在".into());
+    let bucket = parts[0];
+    let id = parts[1];
+    validate_session_id(id)?;
+    if bucket.len() != 32
+        || !bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("Cursor 删除目标 bucket 不是小写 MD5".into());
     }
-    trash::delete(p).map_err(|e| e.to_string())
+    let meta_path =
+        canonical_existing_under(&path, &path.join("meta.json"), ExistingPathKind::File)?;
+    let meta = read_small_json(&meta_path, "Cursor meta.json")?;
+    if meta.get("schemaVersion").and_then(|value| value.as_u64()) != Some(1)
+        || meta
+            .get("id")
+            .is_some_and(|value| value.as_str() != Some(id))
+    {
+        return Err("Cursor 删除目标 meta schema/id 无效".into());
+    }
+    let meta_cwd = meta
+        .get("cwd")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Cursor 删除目标 meta 缺少 cwd".to_string())?;
+    if bucket != cursor_bucket(meta_cwd) {
+        return Err("Cursor 删除目标 bucket 与 meta.cwd 不一致".into());
+    }
+    canonical_existing_under(&path, &path.join("store.db"), ExistingPathKind::File)?;
+    trash::delete(path).map_err(|e| e.to_string())
 }
 
 // ---------------- 运行后捕获 agent 自生成的 session id ----------------
 
-/// Windows 路径规范化比较：统一分隔符、去尾分隔符、忽略大小写。
+/// 只比较两个现存目录的 canonical identity；解析失败即不匹配。
 fn same_path(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
-    norm(a) == norm(b)
+    canonical_same_existing_path(Path::new(a), Path::new(b)).unwrap_or(false)
 }
 
 /// 捕获某 agent(claude/codex/cursor) 在 cwd 下、启动时刻(since_ms)之后新生成的会话 id（按时间升序）。
@@ -523,7 +1364,11 @@ fn capture_claude_ids(cwd: &str, since_ms: i64) -> Vec<String> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
             continue;
         };
-        if v.get("cwd").and_then(|c| c.as_str()).map(|c| same_path(c, cwd)) != Some(true) {
+        if v.get("cwd")
+            .and_then(|c| c.as_str())
+            .map(|c| same_path(c, cwd))
+            != Some(true)
+        {
             continue;
         }
         let started = v.get("startedAt").and_then(|t| t.as_i64()).unwrap_or(0);
@@ -627,7 +1472,11 @@ fn capture_cursor_ids(cwd: &str, since_ms: i64) -> Vec<String> {
         if created < since_ms {
             continue;
         }
-        if v.get("cwd").and_then(|c| c.as_str()).map(|c| same_path(c, cwd)) != Some(true) {
+        if v.get("cwd")
+            .and_then(|c| c.as_str())
+            .map(|c| same_path(c, cwd))
+            != Some(true)
+        {
             continue;
         }
         let Some(chat_dir) = p.parent() else {
@@ -643,8 +1492,455 @@ fn capture_cursor_ids(cwd: &str, since_ms: i64) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_label, cursor_label, first_prompt_from_history, parse_codex_session_titles};
+    use super::{
+        canonical_existing_under, codex_label, cursor_bucket, cursor_label,
+        first_prompt_from_history, locate_claude_session_in, locate_codex_session_in,
+        locate_cursor_session_in, parse_codex_session_titles, validate_codex_relative_path,
+        validate_session_id, ExistingPathKind,
+    };
+    use serde_json::{json, Value};
+    use std::fs;
     use std::io::Cursor;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    const TEST_ID: &str = "12345678-1234-4abc-8def-1234567890ab";
+    const OTHER_ID: &str = "87654321-4321-4cba-8fed-ba0987654321";
+
+    struct TestHome {
+        _temp: TempDir,
+        home: PathBuf,
+        workspace: PathBuf,
+        other_workspace: PathBuf,
+    }
+
+    fn test_home() -> TestHome {
+        let temp = tempfile::tempdir().expect("create temp fixture root");
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        let other_workspace = temp.path().join("other-workspace");
+        fs::create_dir_all(&home).expect("create fixture home");
+        fs::create_dir_all(&workspace).expect("create fixture workspace");
+        fs::create_dir_all(&other_workspace).expect("create alternate workspace");
+        TestHome {
+            _temp: temp,
+            home,
+            workspace,
+            other_workspace,
+        }
+    }
+
+    fn path_text(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    fn write_json_lines(path: &Path, values: &[Value]) {
+        fs::create_dir_all(path.parent().expect("fixture file parent"))
+            .expect("create fixture parent");
+        let mut text = values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push('\n');
+        fs::write(path, text).expect("write JSONL fixture");
+    }
+
+    fn write_claude_fixture(ctx: &TestHome, record_id: &str, record_cwd: &Path) -> PathBuf {
+        let cwd = path_text(&ctx.workspace);
+        let slug = crate::catalog::claude_project_slug(&cwd).expect("derive Claude slug");
+        let project = ctx.home.join(".claude").join("projects").join(slug);
+        let transcript = project.join(format!("{TEST_ID}.jsonl"));
+        write_json_lines(
+            &transcript,
+            &[
+                json!({"type": "file-history-snapshot", "snapshot": {}}),
+                json!({
+                    "type": "user",
+                    "sessionId": record_id,
+                    "cwd": path_text(record_cwd),
+                    "version": "2.1.0",
+                    "message": {"role": "user", "content": "hello"}
+                }),
+            ],
+        );
+        write_json_lines(
+            &ctx.home.join(".claude").join("history.jsonl"),
+            &[json!({"sessionId": TEST_ID, "project": cwd, "display": "hello"})],
+        );
+        fs::create_dir_all(project.join(TEST_ID).join("subagents"))
+            .expect("create Claude subagents");
+        fs::create_dir_all(project.join(TEST_ID).join("tool-results"))
+            .expect("create Claude tool results");
+        fs::create_dir_all(ctx.home.join(".claude").join("tasks").join(TEST_ID))
+            .expect("create Claude tasks");
+        transcript
+    }
+
+    fn write_codex_rollout(ctx: &TestHome, date: [&str; 3], meta_cwd: &Path) -> PathBuf {
+        let file_name = format!(
+            "rollout-{}-{}-{}T12-34-56-{TEST_ID}.jsonl",
+            date[0], date[1], date[2]
+        );
+        let rollout = ctx
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join(date[0])
+            .join(date[1])
+            .join(date[2])
+            .join(file_name);
+        write_json_lines(
+            &rollout,
+            &[json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": TEST_ID,
+                    "session_id": OTHER_ID,
+                    "cwd": path_text(meta_cwd),
+                    "cli_version": "0.101.0"
+                }
+            })],
+        );
+        write_json_lines(
+            &ctx.home.join(".codex").join("session_index.jsonl"),
+            &[json!({"id": TEST_ID, "thread_name": "native title"})],
+        );
+        rollout
+    }
+
+    fn cursor_meta(cwd: &Path) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "createdAtMs": 1,
+            "updatedAtMs": 2,
+            "hasConversation": true,
+            "title": "Cursor title",
+            "cwd": path_text(cwd)
+        })
+    }
+
+    fn write_cursor_fixture(
+        ctx: &TestHome,
+        bucket: &str,
+        meta: &Value,
+        prompt: Option<&Value>,
+        with_store: bool,
+    ) -> PathBuf {
+        let chat = ctx
+            .home
+            .join(".cursor")
+            .join("chats")
+            .join(bucket)
+            .join(TEST_ID);
+        fs::create_dir_all(&chat).expect("create Cursor chat fixture");
+        fs::write(
+            chat.join("meta.json"),
+            serde_json::to_vec(meta).expect("serialize Cursor meta"),
+        )
+        .expect("write Cursor meta");
+        if let Some(prompt) = prompt {
+            fs::write(
+                chat.join("prompt_history.json"),
+                serde_json::to_vec(prompt).expect("serialize prompt history"),
+            )
+            .expect("write prompt history");
+        }
+        if with_store {
+            fs::write(chat.join("store.db"), b"sqlite fixture").expect("write Cursor store");
+        }
+        chat
+    }
+
+    #[test]
+    fn locator_rejects_noncanonical_session_ids() {
+        assert!(validate_session_id(TEST_ID).is_ok());
+        for invalid in [
+            "12345678-1234-4ABC-8def-1234567890ab",
+            "1234567812344abc8def1234567890ab",
+            "12345678-1234-4abc-8def-1234567890ag",
+            "../../12345678-1234-4abc-8def-1234567890ab",
+        ] {
+            assert!(
+                validate_session_id(invalid).is_err(),
+                "unexpected accepted id: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_containment_rejects_same_prefix_sibling() {
+        let temp = tempfile::tempdir().expect("create containment fixture");
+        let root = temp.path().join("authority");
+        let sibling = temp.path().join("authority-escape");
+        fs::create_dir_all(&root).expect("create authority root");
+        fs::create_dir_all(&sibling).expect("create sibling");
+        let escaped = sibling.join("session.jsonl");
+        fs::write(&escaped, b"fixture").expect("write sibling fixture");
+
+        assert!(canonical_existing_under(&root, &escaped, ExistingPathKind::File).is_err());
+    }
+
+    #[test]
+    fn claude_locator_accepts_later_body_record_and_collects_sidecars() {
+        let ctx = test_home();
+        let transcript = write_claude_fixture(&ctx, TEST_ID, &ctx.workspace);
+        let mut transcript_text = fs::read_to_string(&transcript).unwrap();
+        transcript_text.push_str(
+            &json!({
+                "type": "user",
+                "sessionId": TEST_ID,
+                "cwd": path_text(&ctx.other_workspace),
+                "version": "2.1.1",
+                "message": {"role": "user", "content": "switched cwd"}
+            })
+            .to_string(),
+        );
+        transcript_text.push('\n');
+        fs::write(&transcript, transcript_text).unwrap();
+        let location = locate_claude_session_in(&ctx.home, TEST_ID, &path_text(&ctx.workspace))
+            .expect("locate valid Claude fixture");
+
+        assert_eq!(location.transcript, transcript.canonicalize().unwrap());
+        assert_eq!(location.source_agent_version, "2.1.0");
+        assert!(location.history.is_file());
+        assert!(location.sidecar_dir.is_some());
+        assert!(location.subagents_dir.is_some());
+        assert!(location.tool_results_dir.is_some());
+        assert!(location.tasks_dir.is_some());
+    }
+
+    #[test]
+    fn claude_locator_rejects_record_cwd_id_and_duplicate_sources() {
+        let wrong_cwd = test_home();
+        write_claude_fixture(&wrong_cwd, TEST_ID, &wrong_cwd.other_workspace);
+        assert!(locate_claude_session_in(
+            &wrong_cwd.home,
+            TEST_ID,
+            &path_text(&wrong_cwd.workspace)
+        )
+        .is_err());
+
+        let wrong_id = test_home();
+        write_claude_fixture(&wrong_id, OTHER_ID, &wrong_id.workspace);
+        assert!(
+            locate_claude_session_in(&wrong_id.home, TEST_ID, &path_text(&wrong_id.workspace))
+                .is_err()
+        );
+
+        let duplicate = test_home();
+        let transcript = write_claude_fixture(&duplicate, TEST_ID, &duplicate.workspace);
+        let second = duplicate
+            .home
+            .join(".claude")
+            .join("projects")
+            .join("duplicate-bucket")
+            .join(format!("{TEST_ID}.jsonl"));
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::copy(transcript, second).unwrap();
+        assert!(locate_claude_session_in(
+            &duplicate.home,
+            TEST_ID,
+            &path_text(&duplicate.workspace)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn codex_locator_accepts_date_rollout_and_ignores_payload_session_id() {
+        let ctx = test_home();
+        let rollout = write_codex_rollout(&ctx, ["2026", "07", "11"], &ctx.workspace);
+        let location = locate_codex_session_in(&ctx.home, TEST_ID, &path_text(&ctx.workspace))
+            .expect("locate valid Codex fixture");
+
+        assert_eq!(location.rollout, rollout.canonicalize().unwrap());
+        assert_eq!(
+            location.relative_rollout,
+            PathBuf::from("2026")
+                .join("07")
+                .join("11")
+                .join(format!("rollout-2026-07-11T12-34-56-{TEST_ID}.jsonl"))
+        );
+        assert_eq!(location.source_agent_version, "0.101.0");
+        assert_eq!(location.native_title.as_deref(), Some("native title"));
+    }
+
+    #[test]
+    fn codex_relative_path_rejects_invalid_calendar_and_clock() {
+        for relative in [
+            format!("2026/99/11/rollout-2026-99-11T12-34-56-{TEST_ID}.jsonl"),
+            format!("2026/02/30/rollout-2026-02-30T12-34-56-{TEST_ID}.jsonl"),
+            format!("2026/07/11/rollout-2026-07-11T24-00-00-{TEST_ID}.jsonl"),
+            format!("2026/07/11/rollout-2026-07-11T12-60-00-{TEST_ID}.jsonl"),
+        ] {
+            assert!(
+                validate_codex_relative_path(Path::new(&relative), TEST_ID).is_err(),
+                "unexpected accepted rollout path: {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_locator_rejects_zst_duplicate_and_wrong_cwd() {
+        let zst = test_home();
+        let rollout = write_codex_rollout(&zst, ["2026", "07", "11"], &zst.workspace);
+        fs::write(rollout.with_extension("jsonl.zst"), b"compressed").unwrap();
+        assert!(locate_codex_session_in(&zst.home, TEST_ID, &path_text(&zst.workspace)).is_err());
+
+        let duplicate = test_home();
+        write_codex_rollout(&duplicate, ["2026", "07", "11"], &duplicate.workspace);
+        write_codex_rollout(&duplicate, ["2026", "07", "12"], &duplicate.workspace);
+        assert!(locate_codex_session_in(
+            &duplicate.home,
+            TEST_ID,
+            &path_text(&duplicate.workspace)
+        )
+        .is_err());
+
+        let wrong_cwd = test_home();
+        write_codex_rollout(&wrong_cwd, ["2026", "07", "11"], &wrong_cwd.other_workspace);
+        assert!(locate_codex_session_in(
+            &wrong_cwd.home,
+            TEST_ID,
+            &path_text(&wrong_cwd.workspace)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cursor_bucket_matches_md5_fixed_vector() {
+        assert_eq!(cursor_bucket("hello"), "5d41402abc4b2a76b9719d911017c592");
+        assert_eq!(
+            cursor_bucket(r"G:\hty_workflows"),
+            "a5be933639be67a913c398fd5904e6b1"
+        );
+        assert_eq!(
+            cursor_bucket(r"E:\UnityProject\BoardGameEditor"),
+            "d603a8c29eca8a85a18f7c5ea0a803d7"
+        );
+    }
+
+    #[test]
+    fn cursor_locator_accepts_schema_one_without_meta_id() {
+        let ctx = test_home();
+        let cwd = path_text(&ctx.workspace);
+        let bucket = cursor_bucket(&cwd);
+        let chat = write_cursor_fixture(
+            &ctx,
+            &bucket,
+            &cursor_meta(&ctx.workspace),
+            Some(&json!(["first prompt"])),
+            true,
+        );
+        let location = locate_cursor_session_in(&ctx.home, TEST_ID, &cwd)
+            .expect("locate valid Cursor fixture without meta id");
+
+        assert_eq!(location.chat_dir, chat.canonicalize().unwrap());
+        assert_eq!(location.schema_version, 1);
+        assert!(location.prompt_history.is_some());
+        assert!(location.store_db.is_file());
+        assert_eq!(location.native_title.as_deref(), Some("Cursor title"));
+    }
+
+    #[test]
+    fn cursor_locator_rejects_bucket_cwd_and_schema_mismatch() {
+        let wrong_bucket = test_home();
+        write_cursor_fixture(
+            &wrong_bucket,
+            "00000000000000000000000000000000",
+            &cursor_meta(&wrong_bucket.workspace),
+            None,
+            true,
+        );
+        assert!(locate_cursor_session_in(
+            &wrong_bucket.home,
+            TEST_ID,
+            &path_text(&wrong_bucket.workspace)
+        )
+        .is_err());
+
+        let wrong_cwd = test_home();
+        let bucket = cursor_bucket(&path_text(&wrong_cwd.workspace));
+        write_cursor_fixture(
+            &wrong_cwd,
+            &bucket,
+            &cursor_meta(&wrong_cwd.other_workspace),
+            None,
+            true,
+        );
+        assert!(locate_cursor_session_in(
+            &wrong_cwd.home,
+            TEST_ID,
+            &path_text(&wrong_cwd.workspace)
+        )
+        .is_err());
+
+        let schema = test_home();
+        let bucket = cursor_bucket(&path_text(&schema.workspace));
+        let mut meta = cursor_meta(&schema.workspace);
+        meta["schemaVersion"] = json!(2);
+        write_cursor_fixture(&schema, &bucket, &meta, None, true);
+        assert!(
+            locate_cursor_session_in(&schema.home, TEST_ID, &path_text(&schema.workspace)).is_err()
+        );
+    }
+
+    #[test]
+    fn cursor_locator_rejects_invalid_prompt_missing_store_and_duplicates() {
+        let prompt = test_home();
+        let bucket = cursor_bucket(&path_text(&prompt.workspace));
+        write_cursor_fixture(
+            &prompt,
+            &bucket,
+            &cursor_meta(&prompt.workspace),
+            Some(&json!([1, "valid"])),
+            true,
+        );
+        assert!(
+            locate_cursor_session_in(&prompt.home, TEST_ID, &path_text(&prompt.workspace)).is_err()
+        );
+
+        let missing_store = test_home();
+        let bucket = cursor_bucket(&path_text(&missing_store.workspace));
+        write_cursor_fixture(
+            &missing_store,
+            &bucket,
+            &cursor_meta(&missing_store.workspace),
+            None,
+            false,
+        );
+        assert!(locate_cursor_session_in(
+            &missing_store.home,
+            TEST_ID,
+            &path_text(&missing_store.workspace)
+        )
+        .is_err());
+
+        let duplicate = test_home();
+        let bucket = cursor_bucket(&path_text(&duplicate.workspace));
+        write_cursor_fixture(
+            &duplicate,
+            &bucket,
+            &cursor_meta(&duplicate.workspace),
+            None,
+            true,
+        );
+        fs::create_dir_all(
+            duplicate
+                .home
+                .join(".cursor")
+                .join("chats")
+                .join("11111111111111111111111111111111")
+                .join(TEST_ID),
+        )
+        .unwrap();
+        assert!(locate_cursor_session_in(
+            &duplicate.home,
+            TEST_ID,
+            &path_text(&duplicate.workspace)
+        )
+        .is_err());
+    }
 
     #[test]
     fn codex_session_index_uses_latest_name_for_each_id() {
@@ -675,9 +1971,15 @@ mod tests {
 
     #[test]
     fn cursor_native_title_wins_and_fallback_remains_available() {
-        assert_eq!(cursor_label(Some("原生标题"), Some("首条prompt".into())), "原生标题");
+        assert_eq!(
+            cursor_label(Some("原生标题"), Some("首条prompt".into())),
+            "原生标题"
+        );
         assert_eq!(cursor_label(None, Some("首条prompt".into())), "首条prompt");
-        assert_eq!(cursor_label(Some("  "), Some("首条prompt".into())), "首条prompt");
+        assert_eq!(
+            cursor_label(Some("  "), Some("首条prompt".into())),
+            "首条prompt"
+        );
         assert_eq!(cursor_label(None, None), "(无标题)");
     }
 

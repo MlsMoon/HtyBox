@@ -334,6 +334,200 @@ fn projects_root() -> Option<PathBuf> {
     home().map(|h| h.join(".claude").join("projects"))
 }
 
+/// Claude 原生 project bucket 的权威解析结果。
+///
+/// `exists` 只表示 project storage 已存在；`memory_dir` 可以尚未创建。
+/// 当 `exists == false` 时，`actual_slug` 等于未来应使用的 `expected_slug`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeProjectPaths {
+    pub workspace: PathBuf,
+    pub projects_root: PathBuf,
+    pub expected_slug: String,
+    pub actual_slug: String,
+    pub storage_dir: PathBuf,
+    pub memory_dir: PathBuf,
+    pub exists: bool,
+}
+
+/// 与前端 `slugify` 完全一致：逐字符把 `: \\ / _` 替换为 `-`，不折叠连字符。
+pub(crate) fn claude_project_slug(project_dir: &str) -> Result<String, String> {
+    if project_dir.is_empty() {
+        return Err("工作区路径不能为空".to_string());
+    }
+    if !Path::new(project_dir).is_absolute() {
+        return Err(format!("工作区路径必须是绝对路径：{project_dir}"));
+    }
+    if Path::new(project_dir).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err("工作区路径不能包含 . 或 ..".into());
+    }
+    Ok(project_dir
+        .chars()
+        .map(|ch| match ch {
+            ':' | '\\' | '/' | '_' => '-',
+            other => other,
+        })
+        .collect())
+}
+
+fn metadata_if_present(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("无法检查路径 {}：{error}", path.display())),
+    }
+}
+
+fn is_reparse_or_symlink(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn validate_plain_directory(path: &Path, label: &str) -> Result<(), String> {
+    let metadata =
+        metadata_if_present(path)?.ok_or_else(|| format!("{label}不存在：{}", path.display()))?;
+    if is_reparse_or_symlink(&metadata) {
+        return Err(format!(
+            "{label}不能是符号链接或 reparse point：{}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{label}必须是目录：{}", path.display()));
+    }
+    Ok(())
+}
+
+fn validate_optional_plain_directory(path: &Path, label: &str) -> Result<bool, String> {
+    let Some(metadata) = metadata_if_present(path)? else {
+        return Ok(false);
+    };
+    if is_reparse_or_symlink(&metadata) {
+        return Err(format!(
+            "{label}不能是符号链接或 reparse point：{}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{label}存在同名文件，必须是目录：{}",
+            path.display()
+        ));
+    }
+    Ok(true)
+}
+
+fn case_insensitive_key(value: &str) -> String {
+    value.chars().flat_map(char::to_lowercase).collect()
+}
+
+fn select_project_match(
+    expected_slug: &str,
+    candidates: Vec<(String, PathBuf)>,
+) -> Result<Option<(String, PathBuf)>, String> {
+    let expected_key = case_insensitive_key(expected_slug);
+    let mut matches: Vec<_> = candidates
+        .into_iter()
+        .filter(|(name, _)| case_insensitive_key(name) == expected_key)
+        .collect();
+    matches.sort_by(|left, right| left.0.cmp(&right.0));
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(format!(
+            "Claude projects 下存在多个大小写不敏感同名目录，无法确定目标：{}",
+            matches
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// 只解析、不创建目录；测试可注入隔离的 home。
+pub(crate) fn resolve_claude_project_in_home(
+    project_dir: &str,
+    home_dir: &Path,
+) -> Result<ClaudeProjectPaths, String> {
+    let expected_slug = claude_project_slug(project_dir)?;
+    let workspace = PathBuf::from(project_dir);
+    validate_plain_directory(&workspace, "工作区")?;
+    validate_plain_directory(home_dir, "用户 home")?;
+
+    let claude_root = home_dir.join(".claude");
+    let claude_exists = validate_optional_plain_directory(&claude_root, "Claude 配置目录")?;
+    let projects_root = claude_root.join("projects");
+    let projects_exists = if claude_exists {
+        validate_optional_plain_directory(&projects_root, "Claude projects 目录")?
+    } else {
+        false
+    };
+
+    let selected = if projects_exists {
+        let entries = std::fs::read_dir(&projects_root)
+            .map_err(|error| format!("无法读取 Claude projects 目录：{error}"))?;
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("无法读取 Claude project 条目：{error}"))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            candidates.push((name, entry.path()));
+        }
+        select_project_match(&expected_slug, candidates)?
+    } else {
+        None
+    };
+
+    let (actual_slug, storage_dir, exists) = match selected {
+        Some((actual_slug, storage_dir)) => {
+            validate_plain_directory(&storage_dir, "Claude project storage")?;
+            (actual_slug, storage_dir, true)
+        }
+        None => (
+            expected_slug.clone(),
+            projects_root.join(&expected_slug),
+            false,
+        ),
+    };
+    let memory_dir = storage_dir.join("memory");
+    if exists {
+        validate_optional_plain_directory(&memory_dir, "Claude memory 目录")?;
+    }
+
+    Ok(ClaudeProjectPaths {
+        workspace,
+        projects_root,
+        expected_slug,
+        actual_slug,
+        storage_dir,
+        memory_dir,
+        exists,
+    })
+}
+
+pub(crate) fn resolve_claude_project(project_dir: &str) -> Result<ClaudeProjectPaths, String> {
+    let home_dir = home().ok_or_else(|| "无法定位用户 home 目录".to_string())?;
+    resolve_claude_project_in_home(project_dir, &home_dir)
+}
+
 fn count_memory_md(mem_dir: &Path) -> usize {
     std::fs::read_dir(mem_dir)
         .map(|rd| {
@@ -500,10 +694,204 @@ fn build_memory_nodes(dir: &Path) -> Vec<MemoryNode> {
     out
 }
 
+#[cfg(test)]
+fn scan_memory_tree_in_home(project_dir: &str, home_dir: &Path) -> Result<Vec<MemoryNode>, String> {
+    let resolved = resolve_claude_project_in_home(project_dir, home_dir)?;
+    Ok(build_memory_nodes(&resolved.memory_dir))
+}
+
 /// 扫某工作区记忆为树（分组文件夹 → topic）。
-pub fn scan_memory_tree(slug: &str) -> Vec<MemoryNode> {
-    let Some(root) = projects_root() else {
-        return Vec::new();
-    };
-    build_memory_nodes(&root.join(slug).join("memory"))
+///
+/// 接收真实工作区路径，并通过 Claude project resolver 复用实际 bucket；不再信任前端 slug。
+pub fn scan_memory_tree(project_dir: &str) -> Result<Vec<MemoryNode>, String> {
+    let resolved = resolve_claude_project(project_dir)?;
+    Ok(build_memory_nodes(&resolved.memory_dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    struct ResolverFixture {
+        _temp: TempDir,
+        home: PathBuf,
+        workspace: PathBuf,
+        projects: PathBuf,
+    }
+
+    impl ResolverFixture {
+        fn new(workspace_name: &str) -> Self {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let home = temp.path().join("home");
+            let workspace = temp.path().join(workspace_name);
+            std::fs::create_dir_all(&home).expect("home");
+            std::fs::create_dir_all(&workspace).expect("workspace");
+            let projects = home.join(".claude").join("projects");
+            Self {
+                _temp: temp,
+                home,
+                workspace,
+                projects,
+            }
+        }
+
+        fn workspace_str(&self) -> &str {
+            self.workspace.to_str().expect("UTF-8 fixture path")
+        }
+    }
+
+    #[test]
+    fn slug_matches_frontend_replacement_without_collapsing() {
+        #[cfg(windows)]
+        let (input, expected) = (r"C:\work__area/foo", "C--work--area-foo");
+        #[cfg(not(windows))]
+        let (input, expected) = ("/work:__area/foo", "-work---area-foo");
+
+        assert_eq!(claude_project_slug(input).unwrap(), expected);
+        assert!(claude_project_slug("relative/path").is_err());
+    }
+
+    #[test]
+    fn resolver_returns_vacant_paths_without_creating_them() {
+        let fixture = ResolverFixture::new("Workspace__One");
+        let resolved =
+            resolve_claude_project_in_home(fixture.workspace_str(), &fixture.home).unwrap();
+
+        assert!(!resolved.exists);
+        assert_eq!(resolved.actual_slug, resolved.expected_slug);
+        assert_eq!(
+            resolved.storage_dir,
+            fixture.projects.join(&resolved.expected_slug)
+        );
+        assert_eq!(resolved.memory_dir, resolved.storage_dir.join("memory"));
+        assert!(!fixture.home.join(".claude").exists());
+    }
+
+    #[test]
+    fn resolver_reuses_the_unique_case_insensitive_directory() {
+        let fixture = ResolverFixture::new("CaseWorkspace");
+        let expected = claude_project_slug(fixture.workspace_str()).unwrap();
+        let mut actual = expected.to_uppercase();
+        if actual == expected {
+            actual = expected.to_lowercase();
+        }
+        assert_ne!(actual, expected);
+        let storage = fixture.projects.join(&actual);
+        std::fs::create_dir_all(&storage).unwrap();
+
+        let resolved =
+            resolve_claude_project_in_home(fixture.workspace_str(), &fixture.home).unwrap();
+        assert!(resolved.exists);
+        assert_eq!(resolved.expected_slug, expected);
+        assert_eq!(resolved.actual_slug, actual);
+        assert_eq!(resolved.storage_dir, storage);
+    }
+
+    #[test]
+    fn memory_tree_reads_the_resolved_actual_bucket() {
+        let fixture = ResolverFixture::new("MemoryWorkspace");
+        let expected = claude_project_slug(fixture.workspace_str()).unwrap();
+        let mut actual = expected.to_uppercase();
+        if actual == expected {
+            actual = expected.to_lowercase();
+        }
+        let memory = fixture.projects.join(&actual).join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        std::fs::write(memory.join("project_actual.md"), b"actual bucket").unwrap();
+
+        let nodes = scan_memory_tree_in_home(fixture.workspace_str(), &fixture.home).unwrap();
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "project_actual");
+        assert_eq!(
+            nodes[0].path,
+            memory
+                .join("project_actual.md")
+                .to_string_lossy()
+                .into_owned()
+        );
+    }
+
+    #[test]
+    fn selection_rejects_case_insensitive_ambiguity() {
+        let result = select_project_match(
+            "Project-A",
+            vec![
+                ("project-a".into(), PathBuf::from("one")),
+                ("PROJECT-A".into(), PathBuf::from("two")),
+            ],
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("多个"));
+        assert!(error.contains("PROJECT-A"));
+        assert!(error.contains("project-a"));
+    }
+
+    #[test]
+    fn resolver_rejects_missing_or_non_directory_workspace() {
+        let fixture = ResolverFixture::new("Workspace");
+        let relative_error =
+            resolve_claude_project_in_home("relative/path", &fixture.home).unwrap_err();
+        assert!(relative_error.contains("绝对路径"));
+
+        let child = fixture.workspace.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let with_parent = child.join("..");
+        let error = resolve_claude_project_in_home(with_parent.to_str().unwrap(), &fixture.home)
+            .unwrap_err();
+        assert!(error.contains("不能包含"));
+
+        let missing = fixture.workspace.join("missing");
+        assert!(resolve_claude_project_in_home(missing.to_str().unwrap(), &fixture.home).is_err());
+
+        let file = fixture.workspace.join("file.txt");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let error =
+            resolve_claude_project_in_home(file.to_str().unwrap(), &fixture.home).unwrap_err();
+        assert!(error.contains("必须是目录"));
+    }
+
+    #[test]
+    fn resolver_rejects_a_matching_file_in_projects() {
+        let fixture = ResolverFixture::new("Workspace");
+        let expected = claude_project_slug(fixture.workspace_str()).unwrap();
+        std::fs::create_dir_all(&fixture.projects).unwrap();
+        std::fs::write(fixture.projects.join(expected), b"collision").unwrap();
+
+        let error =
+            resolve_claude_project_in_home(fixture.workspace_str(), &fixture.home).unwrap_err();
+        assert!(error.contains("必须是目录"));
+    }
+
+    #[test]
+    fn resolver_rejects_a_memory_file_collision() {
+        let fixture = ResolverFixture::new("Workspace");
+        let expected = claude_project_slug(fixture.workspace_str()).unwrap();
+        let storage = fixture.projects.join(expected);
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(storage.join("memory"), b"collision").unwrap();
+
+        let error =
+            resolve_claude_project_in_home(fixture.workspace_str(), &fixture.home).unwrap_err();
+        assert!(error.contains("同名文件"));
+    }
+
+    #[test]
+    fn resolver_rejects_symlink_workspace_when_supported() {
+        let fixture = ResolverFixture::new("RealWorkspace");
+        let link = fixture._temp.path().join("LinkedWorkspace");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&fixture.workspace, &link).is_ok();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&fixture.workspace, &link).is_ok();
+        #[cfg(not(any(windows, unix)))]
+        let linked = false;
+
+        if linked {
+            let error =
+                resolve_claude_project_in_home(link.to_str().unwrap(), &fixture.home).unwrap_err();
+            assert!(error.contains("符号链接") || error.contains("reparse point"));
+        }
+    }
 }

@@ -168,7 +168,7 @@ export default function Sidebar({
         ) : tab === "skill" ? (
           <SkillPanel projectDir={workspacePath} />
         ) : tab === "memory" ? (
-          <MemoryPanel slug={workspaceSlug} />
+          <MemoryPanel slug={workspaceSlug} workspacePath={workspacePath} />
         ) : tab === "session" ? (
           <SessionPanel root={workspacePath} workspaceId={workspaceSlug} />
         ) : (

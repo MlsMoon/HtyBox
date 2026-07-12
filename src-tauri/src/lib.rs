@@ -2,8 +2,12 @@ mod broker;
 mod catalog;
 mod fs_tree;
 mod host_identity;
+mod memory_transfer;
+mod portable_archive;
 mod pty;
 mod relay_client;
+mod session_import;
+mod session_transfer;
 mod sessions;
 mod terminal_core;
 mod watcher;
@@ -16,7 +20,7 @@ use host_identity::HostIdentity;
 use pty::SpawnOptions;
 use terminal_core::TerminalCore;
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{Emitter, State};
 
 struct AppState {
     terminal: Arc<TerminalCore>,
@@ -258,8 +262,95 @@ fn list_memories(slug: String) -> Vec<catalog::MemoryItem> {
 
 /// M9：列某工作区记忆树（分级文件夹结构；隐藏 MEMORY.md/index_* 脚手架）。
 #[tauri::command]
-fn list_memory_tree(slug: String) -> Vec<catalog::MemoryNode> {
-    catalog::scan_memory_tree(&slug)
+async fn list_memory_tree(project_dir: String) -> Result<Vec<catalog::MemoryNode>, String> {
+    tauri::async_runtime::spawn_blocking(move || catalog::scan_memory_tree(&project_dir))
+        .await
+        .map_err(|error| format!("Memory 树读取任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn export_session_archive(
+    agent: String,
+    id: String,
+    cwd: String,
+    source_path: Option<String>,
+    destination: String,
+) -> Result<session_transfer::SessionExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        session_transfer::export_session_archive(
+            &agent,
+            &id,
+            &cwd,
+            source_path.as_deref(),
+            &destination,
+        )
+    })
+    .await
+    .map_err(|error| format!("Session 导出任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn import_session_archive(
+    archive_path: String,
+    target_cwd: String,
+    target_project_dir: String,
+) -> Result<session_import::SessionImportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        session_import::import_session_archive(&archive_path, &target_cwd, &target_project_dir)
+    })
+    .await
+    .map_err(|error| format!("Session 导入任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn export_memory_archive(
+    project_dir: String,
+    destination: String,
+) -> Result<memory_transfer::MemoryExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        memory_transfer::export_memory_archive(&project_dir, &destination)
+    })
+    .await
+    .map_err(|error| format!("Memory 导出任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn inspect_memory_archive(
+    project_dir: String,
+    archive_path: String,
+) -> Result<memory_transfer::MemoryImportPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        memory_transfer::inspect_memory_archive(&project_dir, &archive_path)
+    })
+    .await
+    .map_err(|error| format!("Memory 导入预检任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn import_memory_archive(
+    app: tauri::AppHandle,
+    project_dir: String,
+    archive_path: String,
+    expected_archive_sha256: String,
+    expected_target_revision: String,
+) -> Result<memory_transfer::MemoryImportResult, String> {
+    let imported = tauri::async_runtime::spawn_blocking(move || {
+        memory_transfer::import_memory_archive(
+            &project_dir,
+            &archive_path,
+            &expected_archive_sha256,
+            &expected_target_revision,
+        )
+    })
+    .await
+    .map_err(|error| format!("Memory 导入任务失败：{error}"))?;
+    let mut imported = imported?;
+    if let Err(error) = app.emit("memory-changed", ()) {
+        imported.warnings.push(format!(
+            "Memory 已成功导入，但刷新通知发送失败，请手动刷新：{error}"
+        ));
+    }
+    Ok(imported)
 }
 
 #[tauri::command]
@@ -695,6 +786,11 @@ pub fn run() {
             list_project_skills,
             list_memories,
             list_memory_tree,
+            export_session_archive,
+            import_session_archive,
+            export_memory_archive,
+            inspect_memory_archive,
+            import_memory_archive,
             list_projects,
             list_managed_skills,
             set_skill_enabled,

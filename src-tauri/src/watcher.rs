@@ -20,14 +20,50 @@ fn is_codex_session_index(path: &Path, codex_root: &Path) -> bool {
     watch_path_key(path) == watch_path_key(&codex_root.join("session_index.jsonl"))
 }
 
+/// `projects/<slug>/memory` 本身或其任意后代才是原生 Memory 变化。
+/// 同级导入 staging/old/conflict 即使内部含 `payload/memory` 也不能暴露。
+fn is_claude_memory_path(path: &Path, projects_root: &Path) -> bool {
+    let path = watch_path_key(path);
+    let root = watch_path_key(projects_root)
+        .trim_end_matches('/')
+        .to_string();
+    let Some(relative) = path.strip_prefix(&format!("{root}/")) else {
+        return false;
+    };
+    let mut parts = relative.split('/');
+    let Some(slug) = parts.next() else {
+        return false;
+    };
+    let Some(memory) = parts.next() else {
+        return false;
+    };
+    !slug.is_empty() && memory == "memory"
+}
+
+fn claude_memory_watch_root(claude: &Path, projects: &Path) -> Option<std::path::PathBuf> {
+    if projects.is_dir() {
+        Some(projects.to_path_buf())
+    } else if claude.is_dir() {
+        // Watching the nearest existing Claude ancestor lets an externally
+        // created `projects/<slug>/memory` become visible without an app restart.
+        Some(claude.to_path_buf())
+    } else {
+        // A first in-app import explicitly emits `memory-changed` in the Step 6
+        // wrapper. External creation before `.claude` exists requires restart.
+        None
+    }
+}
+
 pub fn start(app: AppHandle) {
     let _ = FILE_APP.set(app.clone()); // 供 watch_file 的回调 emit "file-changed"
     let Some(home) = dirs::home_dir() else {
         return;
     };
     let claude = home.join(".claude");
+    let claude_projects = claude.join("projects");
     let codex = home.join(".codex");
     let codex_for_handler = codex.clone();
+    let projects_for_handler = claude_projects.clone();
 
     let handler_app = app.clone();
     let debouncer = new_debouncer(
@@ -44,7 +80,7 @@ pub fn start(app: AppHandle) {
                 if p.contains("/.claude/skills/") || p.contains("/plugins/") {
                     skills = true;
                 }
-                if p.contains("/projects/") && p.contains("/memory/") {
+                if is_claude_memory_path(&e.path, &projects_for_handler) {
                     memory = true;
                 }
                 if is_codex_session_index(&e.path, &codex_for_handler) {
@@ -73,7 +109,9 @@ pub fn start(app: AppHandle) {
         &claude.join("plugins").join("marketplaces"),
         RecursiveMode::Recursive,
     );
-    let _ = w.watch(&claude.join("projects"), RecursiveMode::Recursive);
+    if let Some(memory_watch_root) = claude_memory_watch_root(&claude, &claude_projects) {
+        let _ = w.watch(&memory_watch_root, RecursiveMode::Recursive);
+    }
     // Codex 自动命名或 `/rename` 会更新根目录下的索引；监听目录可兼容索引尚未创建的情况。
     let _ = w.watch(&codex, RecursiveMode::NonRecursive);
 
@@ -164,7 +202,7 @@ pub fn unwatch_file(path: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_codex_session_index;
+    use super::{claude_memory_watch_root, is_claude_memory_path, is_codex_session_index};
     use std::path::Path;
 
     #[test]
@@ -186,5 +224,50 @@ mod tests {
             Path::new(r"C:\work\.codex\session_index.jsonl"),
             root
         ));
+    }
+
+    #[test]
+    fn memory_root_and_descendants_trigger_but_transport_siblings_do_not() {
+        let root = Path::new(r"C:\Users\tester\.claude\projects");
+        assert!(is_claude_memory_path(
+            Path::new(r"C:\Users\tester\.claude\projects\slug\memory"),
+            root
+        ));
+        assert!(is_claude_memory_path(
+            Path::new(r"c:\users\TESTER\.claude\projects\SLUG\MEMORY\nested\topic.md"),
+            root
+        ));
+        assert!(!is_claude_memory_path(
+            Path::new(r"C:\Users\tester\.claude\projects\slug\memory-old"),
+            root
+        ));
+        assert!(!is_claude_memory_path(
+            Path::new(
+                r"C:\Users\tester\.claude\projects\slug\.htybox-stage-1\payload\memory\topic.md"
+            ),
+            root
+        ));
+        assert!(!is_claude_memory_path(
+            Path::new(r"C:\elsewhere\projects\slug\memory\topic.md"),
+            root
+        ));
+    }
+
+    #[test]
+    fn memory_watch_uses_projects_or_nearest_existing_claude_ancestor() {
+        let fixture = tempfile::tempdir().unwrap();
+        let claude = fixture.path().join(".claude");
+        let projects = claude.join("projects");
+        assert_eq!(claude_memory_watch_root(&claude, &projects), None);
+        std::fs::create_dir(&claude).unwrap();
+        assert_eq!(
+            claude_memory_watch_root(&claude, &projects).as_deref(),
+            Some(claude.as_path())
+        );
+        std::fs::create_dir(&projects).unwrap();
+        assert_eq!(
+            claude_memory_watch_root(&claude, &projects).as_deref(),
+            Some(projects.as_path())
+        );
     }
 }

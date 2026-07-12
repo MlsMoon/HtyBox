@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   listClaudeSessions,
   listCodexSessions,
@@ -7,13 +8,17 @@ import {
   deleteClaudeSession,
   deleteCodexSession,
   deleteCursorSession,
+  exportSessionArchive,
+  importSessionArchive,
+  type SessionAgent,
   type SessionRef,
 } from "../catalog";
 import { openTerminalCmd } from "../dockBus";
-import { launchCmdFor, type AgentKind } from "../profiles";
+import { launchCmdFor } from "../profiles";
 import { searchMatch } from "../search";
 import SearchBox from "./ui/SearchBox";
 import ContextMenu, { MENU_SEP } from "./ui/ContextMenu";
+import TransferNotice, { type TransferNoticeValue } from "./ui/TransferNotice";
 import { getSessionTitle, setSessionTitle, onSessionTitlesChange } from "../sessionTitles";
 import { getWsState, setWsState } from "../wsState";
 import { getSessionTags, getSessionTagIds, useTagStore, clearSession, sessionKey } from "../sessionTags";
@@ -51,7 +56,7 @@ function saveSessFavs(root: string, keys: string[]): void {
 }
 
 // Session 的 claude/codex/cursor 选择按工作区持久化（用户点名要持久化的"有状态选择"）
-type SessionAgentKind = Exclude<AgentKind, "shell">;
+type SessionAgentKind = SessionAgent;
 const AGENT_KINDS: SessionAgentKind[] = ["claude", "codex", "cursor"];
 const AGENT_KEY = "htybox.sessionAgent.v1";
 const readAgent = (root: string): SessionAgentKind => {
@@ -62,25 +67,61 @@ const readAgent = (root: string): SessionAgentKind => {
 // tag 筛选选中集合按工作区持久化（界面状态，scope=root；与 agent 选择同范式，符合"有状态选择按工作区"）。
 const FILTER_KEY = "htybox.sessionTagFilter.v1";
 
+const sessionAgentLabel = (agent: SessionAgent): string =>
+  AGENTS.find((item) => item.k === agent)?.label ?? agent;
+
+const sessionArchiveName = (title: string, agent: SessionAgent, id: string): string => {
+  const cleaned = title
+    .replace(/[\u0000-\u001f\u007f<>:"/\\|?*]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/g, "");
+  const shortened = Array.from(cleaned || "session").slice(0, 80).join("").replace(/[. ]+$/g, "");
+  return `${shortened || "session"}-${agent}-${id.slice(0, 8)}.htybox-session`;
+};
+
 // 会话自定义名（用户手动重命名覆盖显示）统一收口到 ../sessionTitles，与终端 Tab【共享同一份】：
 // 在 Session 列表重命名 ↔ 在终端 Tab 重命名 改的是同一会话名，两处显示一致（见 sessionTitles.ts）。
 
 /** 「Session」页签：claude/codex 会话列表，点击复原到终端、✕ 删除（移入回收站）。 */
 export default function SessionPanel({ root, workspaceId }: { root: string; workspaceId: string }) {
   const [agentKind, setAgentKindState] = useState<SessionAgentKind>(() => readAgent(root));
+  const [list, setList] = useState<SessionRef[] | null>(null);
+  const loadSeq = useRef(0); // 初始/手动/watcher 重拉共用代际，旧请求不得覆盖新名称
   const setAgentKind = (a: SessionAgentKind) => {
+    if (a === agentKind) return;
+    loadSeq.current += 1;
+    setList(null);
     setAgentKindState(a);
     setWsState(AGENT_KEY, root, a);
   };
-  const [list, setList] = useState<SessionRef[] | null>(null);
-  const loadSeq = useRef(0); // 初始/手动/watcher 重拉共用代际，旧请求不得覆盖新名称
+  const transferGeneration = useRef(0);
+  const currentRoot = useRef(root);
+  const busyRef = useRef<"import" | "export" | null>(null);
+  const [busy, setBusy] = useState<"import" | "export" | null>(null);
+  const [notice, setNotice] = useState<TransferNoticeValue | null>(null);
   const [q, setQ] = useState("");
   const [agentOpen, setAgentOpen] = useState(false);
   const agentMask = useMaskDismiss(() => setAgentOpen(false));
   const [favs, setFavs] = useState<string[]>(() => loadSessFavs(root));
+  const [menu, setMenu] = useState<{ x: number; y: number; s: SessionRef } | null>(null);
   useEffect(() => setFavs(loadSessFavs(root)), [root]); // 切工作区重载收藏
   useEffect(() => setAgentKindState(readAgent(root)), [root]); // 切工作区重载 agent 选择（持久化）
-  const [menu, setMenu] = useState<{ x: number; y: number; s: SessionRef } | null>(null);
+  useLayoutEffect(() => {
+    currentRoot.current = root;
+    loadSeq.current += 1;
+    transferGeneration.current += 1;
+    busyRef.current = null;
+    setList(null);
+    setBusy(null);
+    setNotice(null);
+    setAgentOpen(false);
+    setMenu(null);
+    return () => {
+      transferGeneration.current += 1;
+      busyRef.current = null;
+    };
+  }, [root]);
   const [, setTitleVer] = useState(0); // 会话自定义名变化(本面板或终端 Tab 改同一会话)→ 自增触发重渲染
   useEffect(() => onSessionTitlesChange(() => setTitleVer((v) => v + 1)), []);
   const [editing, setEditing] = useState<string | null>(null); // 正在重命名的会话键 "agentKind:id"
@@ -106,6 +147,8 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
     () => selectedTagIds.filter((id) => vocab.some((t) => t.id === id)),
     [selectedTagIds, vocab],
   );
+  const effectiveTagIdsRef = useRef(effectiveTagIds);
+  effectiveTagIdsRef.current = effectiveTagIds;
 
   const load = useCallback((kind: SessionAgentKind, silent = false) => {
     const seq = ++loadSeq.current;
@@ -156,6 +199,88 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
     const name = getSessionTitle(agentKind, s.id) || s.label;
     openTerminalCmd(workspaceId, { command, agentKind, title: `↺ ${name.slice(0, 18)}`, sessionId: s.id });
   };
+  const setTransferBusy = (next: "import" | "export" | null) => {
+    busyRef.current = next;
+    setBusy(next);
+  };
+  const exportOne = async (s: SessionRef, kind: SessionAgentKind) => {
+    if (busyRef.current) return;
+    const operationRoot = root;
+    const generation = ++transferGeneration.current;
+    const isCurrent = () =>
+      generation === transferGeneration.current && currentRoot.current === operationRoot;
+    setAgentOpen(false);
+    setTransferBusy("export");
+    try {
+      const title = getSessionTitle(kind, s.id) || s.label;
+      const destination = await save({
+        title: "导出会话",
+        defaultPath: sessionArchiveName(title, kind, s.id),
+        filters: [{ name: "HtyBox Session", extensions: ["htybox-session"] }],
+      });
+      if (!isCurrent() || destination === null) return;
+      setNotice(null);
+      const result = await exportSessionArchive(kind, s.id, operationRoot, s.path || null, destination);
+      if (!isCurrent()) return;
+      setNotice({
+        tone: "success",
+        message: `已导出 ${sessionAgentLabel(result.agent)} 会话`,
+        details: [result.path, ...result.warnings],
+      });
+    } catch (error) {
+      if (isCurrent()) {
+        setNotice({ tone: "error", message: `导出会话失败：${String(error)}` });
+      }
+    } finally {
+      if (isCurrent()) setTransferBusy(null);
+    }
+  };
+  const importOne = async () => {
+    if (busyRef.current) return;
+    const operationRoot = root;
+    const generation = ++transferGeneration.current;
+    const isCurrent = () =>
+      generation === transferGeneration.current && currentRoot.current === operationRoot;
+    setAgentOpen(false);
+    setTransferBusy("import");
+    try {
+      const archivePath = await open({
+        title: "导入会话",
+        multiple: false,
+        directory: false,
+        filters: [{ name: "HtyBox Session", extensions: ["htybox-session"] }],
+      });
+      if (!isCurrent() || archivePath === null) return;
+      setNotice(null);
+      const result = await importSessionArchive(archivePath, operationRoot, operationRoot);
+      if (!isCurrent()) return;
+
+      setQ("");
+      const filterWarning =
+        effectiveTagIdsRef.current.length > 0
+          ? ["当前标签筛选仍开启，导入的会话可能被隐藏。"]
+          : [];
+      setNotice({
+        tone: "success",
+        message:
+          result.status === "alreadyPresent"
+            ? `${sessionAgentLabel(result.agent)} 会话已存在且内容相同`
+            : `已导入 ${sessionAgentLabel(result.agent)} 会话`,
+        details: [`会话 ID：${result.id}`, ...filterWarning, ...result.warnings],
+      });
+      if (result.agent === agentKind) {
+        load(result.agent, true);
+      } else {
+        setAgentKind(result.agent);
+      }
+    } catch (error) {
+      if (isCurrent()) {
+        setNotice({ tone: "error", message: `导入会话失败：${String(error)}` });
+      }
+    } finally {
+      if (isCurrent()) setTransferBusy(null);
+    }
+  };
   const del = async (s: SessionRef) => {
     try {
       if (agentKind === "claude") await deleteClaudeSession(s.id);
@@ -199,6 +324,12 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   };
   const favList = filtered.filter(isFav);
   const restList = filtered.filter((s) => !isFav(s));
+  const visibleNotice: TransferNoticeValue | null = busy
+    ? {
+        tone: "busy",
+        message: busy === "import" ? "正在导入会话…" : "正在导出会话…",
+      }
+    : notice;
   const card = (s: SessionRef) => {
     const editingThis = editing === favKey(s);
     return (
@@ -206,9 +337,10 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
         key={s.id}
         onContextMenu={(e) => {
           e.preventDefault();
+          if (busyRef.current) return;
           setMenu({ x: e.clientX, y: e.clientY, s });
         }}
-        title="右键更多操作（复原 / 重命名 / 收藏 / 删除）"
+        title="右键更多操作（复原 / 导出 / 重命名 / 收藏 / 删除）"
         className="group flex items-start gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--elevated)] px-2.5 py-1.5 transition-colors hover:border-[var(--accent-border)] hover:bg-[var(--surface-soft)]"
       >
         {editingThis ? (
@@ -275,7 +407,8 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
         <div className="relative min-w-0 flex-1">
           <button
             onClick={() => setAgentOpen((v) => !v)}
-            className="flex w-full items-center gap-2 rounded-lg bg-[var(--surface-hover)] px-3 py-1.5 text-xs font-semibold text-[var(--text)] hover:bg-[var(--border-soft)]"
+            disabled={busy !== null}
+            className="flex w-full items-center gap-2 rounded-lg bg-[var(--surface-hover)] px-3 py-1.5 text-xs font-semibold text-[var(--text)] hover:bg-[var(--border-soft)] disabled:cursor-not-allowed disabled:opacity-60"
           >
             <img src={cur.icon} alt="" className={(cur.k === "codex" ? "codex-glyph " : cur.k === "cursor" ? "cursor-glyph " : "") + "h-4 w-4"} draggable={false} />
             <span className="min-w-0 flex-1 truncate text-left">{cur.label}</span>
@@ -313,13 +446,30 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
           )}
         </div>
         <button
+          onClick={() => void importOne()}
+          disabled={busy !== null}
+          title="导入会话包"
+          className="shrink-0 rounded-md px-2 py-1.5 text-[11px] font-semibold text-[var(--text-2)] hover:bg-[var(--elevated)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          导入
+        </button>
+        <button
           onClick={() => load(agentKind)}
+          disabled={busy !== null}
           title="刷新"
-          className="shrink-0 rounded-md px-2 py-1.5 text-[12px] text-[var(--text-2)] hover:bg-[var(--elevated)] hover:text-[var(--text)]"
+          className="shrink-0 rounded-md px-2 py-1.5 text-[12px] text-[var(--text-2)] hover:bg-[var(--elevated)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-50"
         >
           ⟳
         </button>
       </div>
+      {visibleNotice && (
+        <div className="pt-2">
+          <TransferNotice
+            value={visibleNotice}
+            onClose={busy ? undefined : () => setNotice(null)}
+          />
+        </div>
+      )}
       <div className="px-2.5 pt-2 pb-1.5">
         <SearchBox value={q} onChange={setQ} placeholder={`搜索 ${agentKind} 会话…`} />
         {vocab.length > 0 && (
@@ -460,6 +610,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
           y={menu.y}
           items={[
             { id: "resume", label: "复原到终端" },
+            { id: "export", label: "导出会话…" },
             { id: "rename", label: "重命名" },
             { id: "tags", label: "标签…" },
             { id: "fav", label: isFav(menu.s) ? "取消收藏" : "收藏" },
@@ -468,6 +619,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
           ]}
           onAction={(id) => {
             if (id === "resume") resume(menu.s);
+            else if (id === "export") void exportOne(menu.s, agentKind);
             else if (id === "rename") startRename(menu.s);
             else if (id === "tags") setTagEditor({ x: menu.x, y: menu.y, s: menu.s });
             else if (id === "fav") toggleFav(menu.s);

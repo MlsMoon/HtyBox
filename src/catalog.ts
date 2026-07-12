@@ -71,16 +71,69 @@ export interface MemoryNode {
   description: string;
   children: MemoryNode[];
 }
-export const listMemoryTree = (slug: string) =>
-  invoke<MemoryNode[]>("list_memory_tree", { slug });
+export const listMemoryTree = (projectDir: string) =>
+  invoke<MemoryNode[]>("list_memory_tree", { projectDir });
 
 // ---- M9：claude/codex/cursor 会话记录 ----
+export type SessionAgent = "claude" | "codex" | "cursor";
+
 export interface SessionRef {
   id: string;
   label: string;
   ts: number; // 毫秒
   path: string;
 }
+
+export interface SessionTransferResult {
+  agent: SessionAgent;
+  id: string;
+  label: string | null;
+  path: string;
+  bytes: number;
+  warnings: string[];
+}
+
+export interface ImportedSession {
+  agent: SessionAgent;
+  id: string;
+  label: string | null;
+  status: "imported" | "alreadyPresent";
+  warnings: string[];
+}
+
+export interface MemoryExportResult {
+  path: string;
+  bytes: number;
+  fileCount: number;
+  directoryCount: number;
+  warnings: string[];
+}
+
+export interface MemoryImportPreview {
+  sourceWorkspace: string;
+  sourceSlug: string;
+  sourceAgentVersion: string;
+  sourceSchemaVersion: string;
+  exportedAtMs: number;
+  fileCount: number;
+  directoryCount: number;
+  totalBytes: number;
+  targetNonEmpty: boolean;
+  targetPath: string;
+  archiveSha256: string;
+  targetRevision: string;
+}
+
+export interface MemoryImportResult {
+  status: "imported";
+  targetPath: string;
+  fileCount: number;
+  directoryCount: number;
+  totalBytes: number;
+  warnings: string[];
+  retainedBackupPath?: string;
+}
+
 export const listClaudeSessions = (cwd: string) =>
   invoke<SessionRef[]>("list_claude_sessions", { cwd });
 export const listCodexSessions = (cwd: string) =>
@@ -93,6 +146,46 @@ export const deleteCodexSession = (path: string) =>
   invoke<void>("delete_codex_session", { path });
 export const deleteCursorSession = (path: string) =>
   invoke<void>("delete_cursor_session", { path });
+export const exportSessionArchive = (
+  agent: SessionAgent,
+  id: string,
+  cwd: string,
+  sourcePath: string | null,
+  destination: string,
+) =>
+  invoke<SessionTransferResult>("export_session_archive", {
+    agent,
+    id,
+    cwd,
+    sourcePath,
+    destination,
+  });
+export const importSessionArchive = (
+  archivePath: string,
+  targetCwd: string,
+  targetProjectDir: string,
+) =>
+  invoke<ImportedSession>("import_session_archive", {
+    archivePath,
+    targetCwd,
+    targetProjectDir,
+  });
+export const exportMemoryArchive = (projectDir: string, destination: string) =>
+  invoke<MemoryExportResult>("export_memory_archive", { projectDir, destination });
+export const inspectMemoryArchive = (projectDir: string, archivePath: string) =>
+  invoke<MemoryImportPreview>("inspect_memory_archive", { projectDir, archivePath });
+export const importMemoryArchive = (
+  projectDir: string,
+  archivePath: string,
+  expectedArchiveSha256: string,
+  expectedTargetRevision: string,
+) =>
+  invoke<MemoryImportResult>("import_memory_archive", {
+    projectDir,
+    archivePath,
+    expectedArchiveSha256,
+    expectedTargetRevision,
+  });
 /** 运行后捕获 agent(claude/codex/cursor) 在 cwd 下、启动时刻(sinceMs)之后新生成的会话 id（按时间升序）。 */
 export const captureSessionIds = (agent: string, cwd: string, sinceMs: number) =>
   invoke<string[]>("capture_session_ids", { agent, cwd, sinceMs });
