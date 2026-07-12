@@ -8,6 +8,18 @@ import ConnectionSettings from "./ConnectionSettings";
 import { getVersion } from "@tauri-apps/api/app";
 import { checkForUpdateDetailed, type Update } from "../updater";
 import { useMaskDismiss } from "./ui/maskDismiss";
+import {
+  DEFAULT_SKILL_ROOT,
+  DEFAULT_SKILL_ROOTS,
+  normalizeSkillsRel,
+  validateSkillsRel,
+  loadSkillRootEntries,
+  saveSkillRootEntries,
+  enabledPathsFromEntries,
+  metaForPath,
+  resolveActiveSkillRoot,
+  type SkillRootEntry,
+} from "../skillRoots";
 
 function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -207,12 +219,13 @@ const CLICK_MODES: { key: FileClickMode; label: string; desc: string }[] = [
 
 /* ===== 分类导航（Cursor 式左导航；上次停留分类全局记忆——设置是全局概念，不按工作区） ===== */
 
-type SectionKey = "general" | "appearance" | "terminal" | "files" | "connection";
+type SectionKey = "general" | "appearance" | "terminal" | "files" | "skill" | "connection";
 const SECTIONS: { key: SectionKey; label: string }[] = [
   { key: "general", label: "通用" },
   { key: "appearance", label: "外观" },
   { key: "terminal", label: "终端" },
   { key: "files", label: "文件与搜索" },
+  { key: "skill", label: "Skill" },
   { key: "connection", label: "连接" },
 ];
 const SECTION_KEY = "htybox.settingsSection.v1";
@@ -281,6 +294,81 @@ export default function SettingsModal({
       setEditMbDraft(String(s.maxEditMB)); // 非法输入回退到当前值
     }
   };
+
+  // Skill 候选：统一有序列表（预设+自定义）拖拽排序 = 优先级；勾选=参与 fallback
+  const [entries, setEntries] = useState<SkillRootEntry[]>(() => loadSkillRootEntries(root));
+  const [customDraft, setCustomDraft] = useState("");
+  const [customErr, setCustomErr] = useState<string | null>(null);
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [overIdx, setOverIdx] = useState<number | null>(null);
+  const [armed, setArmed] = useState<number | null>(null);
+  const [activeRoot, setActiveRoot] = useState<string | null>(null);
+  const [activeFound, setActiveFound] = useState(false);
+  useEffect(() => {
+    setEntries(loadSkillRootEntries(root));
+  }, [root]);
+  useEffect(() => {
+    if (!root) {
+      setActiveRoot(null);
+      setActiveFound(false);
+      return;
+    }
+    let alive = true;
+    const cands = enabledPathsFromEntries(entries);
+    resolveActiveSkillRoot(root, cands)
+      .then((r) => {
+        if (!alive) return;
+        setActiveRoot(r.active);
+        setActiveFound(r.found);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setActiveRoot(cands[0] ?? DEFAULT_SKILL_ROOT);
+        setActiveFound(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [root, entries]);
+  const persistEntries = (next: SkillRootEntry[]) => {
+    setEntries(saveSkillRootEntries(root, next));
+  };
+  const toggleEntry = (path: string) => {
+    const cur = entries.find((e) => e.path === path);
+    if (!cur) return;
+    if (cur.enabled && entries.filter((e) => e.enabled).length <= 1) return;
+    persistEntries(entries.map((e) => (e.path === path ? { ...e, enabled: !e.enabled } : e)));
+  };
+  const reorder = (from: number, to: number) => {
+    if (from === to || from < 0 || to < 0 || from >= entries.length || to >= entries.length) return;
+    const next = [...entries];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    persistEntries(next);
+  };
+  const addCustom = () => {
+    const n = normalizeSkillsRel(customDraft);
+    const err = validateSkillsRel(n);
+    if (err) {
+      setCustomErr(err);
+      return;
+    }
+    if (entries.some((e) => e.path === n)) {
+      setCustomErr("已在列表中");
+      return;
+    }
+    setCustomErr(null);
+    setCustomDraft("");
+    persistEntries([...entries, { path: n, enabled: true }]);
+  };
+  const removeCustom = (path: string) => {
+    const meta = metaForPath(path);
+    if (meta.preset) return;
+    const next = entries.filter((e) => e.path !== path);
+    if (!next.some((e) => e.enabled)) return;
+    persistEntries(next);
+  };
+  const enabledOrder = enabledPathsFromEntries(entries);
 
   // 版本与更新：当前版本号 + 手动三态检查（发现新版本 → onUpdateFound 上抛弹 UpdateModal）
   const [appVer, setAppVer] = useState("");
@@ -475,6 +563,167 @@ export default function SettingsModal({
                   commit={commitEditMb}
                   hint="MB · 对新打开的文件生效"
                 />
+              </div>
+            )}
+            {section === "skill" && (
+              <div className="space-y-1">
+                <div className="rounded-lg px-3 py-2.5">
+                  <div className="text-sm font-medium text-[var(--text)]">Skill 候选根</div>
+                  <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">
+                    {root
+                      ? "按当前工作区独立保存。拖拽 ⠿ 调整优先级；勾选参与 fallback。列表不合并，只激活第一个已存在的目录。"
+                      : "未打开工作区时写入全局默认。打开工作区后可单独排序/勾选，并显示真实激活根。"}
+                  </div>
+                  <div className="space-y-1.5">
+                    {entries.map((e, i) => {
+                      const meta = metaForPath(e.path);
+                      const isActive = !!root && activeRoot === e.path;
+                      return (
+                        <div
+                          key={e.path}
+                          draggable={armed === i}
+                          onDragStart={(ev) => {
+                            setDragIdx(i);
+                            ev.dataTransfer.effectAllowed = "move";
+                          }}
+                          onDragOver={(ev) => {
+                            ev.preventDefault();
+                            if (dragIdx !== null && overIdx !== i) setOverIdx(i);
+                          }}
+                          onDragLeave={() => {
+                            if (overIdx === i) setOverIdx(null);
+                          }}
+                          onDrop={(ev) => {
+                            ev.preventDefault();
+                            if (dragIdx !== null) reorder(dragIdx, i);
+                            setDragIdx(null);
+                            setOverIdx(null);
+                            setArmed(null);
+                          }}
+                          onDragEnd={() => {
+                            setDragIdx(null);
+                            setOverIdx(null);
+                            setArmed(null);
+                          }}
+                          className={
+                            "relative flex items-start gap-2 rounded-lg border px-2 py-2 transition-colors " +
+                            (dragIdx === i ? "opacity-40 " : "") +
+                            (overIdx === i && dragIdx !== null && dragIdx !== i
+                              ? "border-[var(--accent)] border-dashed "
+                              : "") +
+                            (isActive
+                              ? "border-[var(--accent)] bg-[var(--accent-soft)] shadow-[inset_0_0_0_1px_var(--accent)] "
+                              : e.enabled
+                                ? "border-[var(--border)] bg-[var(--elevated)] hover:bg-[var(--surface-soft)] "
+                                : "border-[var(--border)] opacity-55 hover:opacity-80 ")
+                          }
+                        >
+                          {isActive && (
+                            <span className="absolute -top-1.5 right-2 rounded-full bg-[var(--accent)] px-1.5 py-px text-[9px] font-semibold tracking-wide text-white shadow-sm">
+                              {activeFound ? "当前激活" : "回退激活"}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            title="拖拽排序"
+                            onMouseDown={() => setArmed(i)}
+                            onMouseUp={() => setArmed(null)}
+                            onMouseLeave={() => {
+                              if (dragIdx === null) setArmed(null);
+                            }}
+                            className="mt-0.5 cursor-grab touch-none select-none px-0.5 font-mono text-[12px] leading-none text-[var(--text-3)] active:cursor-grabbing"
+                          >
+                            ⠿
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => toggleEntry(e.path)}
+                            className={
+                              "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border text-[10px] " +
+                              (e.enabled
+                                ? "border-[var(--accent)] bg-[var(--accent)] text-white"
+                                : "border-[var(--border)] text-transparent")
+                            }
+                            title={e.enabled ? "取消候选" : "加入候选"}
+                          >
+                            ✓
+                          </button>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-baseline gap-1.5 text-[13px] text-[var(--text)]">
+                              <span className="font-medium">{meta.label}</span>
+                              <code className="truncate font-mono text-[10px] text-[var(--text-faint)]">
+                                {e.path}
+                              </code>
+                            </div>
+                            <div className="mt-0.5 text-[10px] text-[var(--text-faint)]">{meta.desc}</div>
+                          </div>
+                          {!meta.preset && (
+                            <button
+                              type="button"
+                              onClick={() => removeCustom(e.path)}
+                              className="mt-0.5 shrink-0 text-[10px] text-[var(--text-3)] hover:text-[var(--danger)]"
+                            >
+                              移除
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div className="rounded-lg px-3 py-2.5">
+                  <div className="text-sm font-medium text-[var(--text)]">添加自定义候选</div>
+                  <div className="mb-2 text-[11px] text-[var(--text-faint)]">
+                    相对工作区，须以 <code className="text-[var(--text-2)]">skills</code> 结尾；添加后可用拖拽调优先级
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      value={customDraft}
+                      onChange={(e) => {
+                        setCustomDraft(e.target.value);
+                        setCustomErr(null);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") addCustom();
+                      }}
+                      placeholder=".myagent/skills"
+                      className={
+                        "min-w-0 flex-1 rounded-lg border bg-[var(--elevated)] px-2.5 py-1.5 font-mono text-sm text-[var(--text)] outline-none focus:border-[var(--accent)] " +
+                        (customErr ? "border-[var(--danger)]" : "border-[var(--border)]")
+                      }
+                    />
+                    <button
+                      type="button"
+                      onClick={addCustom}
+                      className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--elevated)] px-3 py-1.5 text-[12px] font-medium text-[var(--text)] hover:border-[var(--accent)] hover:text-[var(--accent-text)]"
+                    >
+                      添加
+                    </button>
+                  </div>
+                  {customErr && (
+                    <div className="mt-1.5 text-[11px] text-[var(--danger)]">{customErr}</div>
+                  )}
+                </div>
+                <div className="rounded-lg px-3 py-2.5 text-[11px] leading-relaxed text-[var(--text-faint)]">
+                  启用顺序：
+                  <code className="text-[var(--text-2)]">
+                    {(enabledOrder.length ? enabledOrder : DEFAULT_SKILL_ROOTS).join(" → ")}
+                  </code>
+                  {root && activeRoot && (
+                    <>
+                      <br />
+                      本工作区激活：
+                      <code className="text-[var(--accent-text)]">{activeRoot}</code>
+                      {activeFound ? "" : "（目录均未发现，已回退首项）"}
+                    </>
+                  )}
+                  {!root && (
+                    <>
+                      <br />
+                      打开工作区后可在此看到真实激活标注。
+                    </>
+                  )}
+                </div>
               </div>
             )}
             {section === "connection" && <ConnectionSettings />}

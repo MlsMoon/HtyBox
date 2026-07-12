@@ -175,9 +175,69 @@ pub fn scan_project_skills(project_dir: &str) -> Vec<Skill> {
 }
 
 // ---------------- M8：Skill 上架/下架管理（工作区级） ----------------
-// 上架 = 文件夹在 <pd>/.claude/skills/<dir>；下架 = 移到 <pd>/.claude/downtime/skills/<dir>。
+// 活动根可配置（默认 `.claude/skills`）：上架 = <pd>/<skills_rel>/<dir>；
+// 下架 = 同 agent 根下 <pd>/<agentRoot>/downtime/skills/<dir>（镜像规则）。
 // 标识统一用文件夹名 `dir`（稳定），不用可能与文件夹名不一致的 frontmatter name。
 
+/// 默认 skill 根（相对工作区）；与前端默认候选首项对齐。
+pub const DEFAULT_SKILLS_REL: &str = ".claude/skills";
+
+/// 在候选列表中按顺序解析出唯一激活根（不合并扫描）。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveSkillRoot {
+    /// 当前唯一激活的 skills 相对路径
+    pub active: String,
+    /// 是否在某个候选上「发现」了目录（skills 或 downtime 存在）
+    pub found: bool,
+    /// 归一化后的候选顺序（去重）
+    pub candidates: Vec<String>,
+}
+
+/// 某相对根是否已在工作区出现（上架或下架目录任一存在即算发现）。
+pub fn skill_root_present(project_dir: &str, skills_rel: &str) -> Result<bool, String> {
+    let (skills, down) = resolve_skills_pair(project_dir, skills_rel)?;
+    Ok(skills.is_dir() || down.is_dir())
+}
+
+/// 按候选顺序选唯一激活根：第一个「发现」的胜出；若皆未发现则回退到候选首项（便于空仓库新建）。
+/// 非法候选项跳过（不因单项坏路径让整次解析失败）。
+pub fn resolve_active_skill_root(
+    project_dir: &str,
+    candidates: &[String],
+) -> Result<ActiveSkillRoot, String> {
+    let mut normalized: Vec<String> = Vec::new();
+    for c in candidates {
+        match normalize_skills_rel(c) {
+            Ok(n) if !normalized.iter().any(|x| x == &n) => normalized.push(n),
+            _ => {}
+        }
+    }
+    if normalized.is_empty() {
+        normalized.push(DEFAULT_SKILLS_REL.to_string());
+    }
+    if project_dir.is_empty() {
+        return Ok(ActiveSkillRoot {
+            active: normalized[0].clone(),
+            found: false,
+            candidates: normalized,
+        });
+    }
+    for rel in &normalized {
+        if skill_root_present(project_dir, rel)? {
+            return Ok(ActiveSkillRoot {
+                active: rel.clone(),
+                found: true,
+                candidates: normalized,
+            });
+        }
+    }
+    Ok(ActiveSkillRoot {
+        active: normalized[0].clone(),
+        found: false,
+        candidates: normalized,
+    })
+}
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedSkill {
@@ -189,8 +249,60 @@ pub struct ManagedSkill {
     pub invoke: String,
     /// SKILL.md 绝对路径（上架后拖拽注入用）
     pub path: String,
-    /// true=在 .claude/skills；false=在 .claude/downtime/skills
+    /// true=在活动 skills 根；false=在对应 downtime/skills
     pub enabled: bool,
+}
+
+/// 归一化并校验工作区相对的 skills 根路径。
+/// 须相对、无 `..`、无空段、不以盘符/UNC/绝对 `/` 开头，且末段为 `skills`。
+pub fn normalize_skills_rel(skills_rel: &str) -> Result<String, String> {
+    let s = skills_rel.trim().replace('\\', "/");
+    let s = s.trim_matches('/').to_string();
+    if s.is_empty() {
+        return Err("skill 根路径不能为空".into());
+    }
+    // 绝对路径：Unix 根、Windows 盘符（C:）、UNC（//server）
+    if s.starts_with('/') {
+        return Err(format!(
+            "skill 根须为工作区相对路径，不能是绝对路径：{skills_rel}"
+        ));
+    }
+    if s.len() >= 2 && s.as_bytes()[1] == b':' {
+        return Err(format!(
+            "skill 根须为工作区相对路径，不能是绝对路径：{skills_rel}"
+        ));
+    }
+    for seg in s.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err(format!("skill 根路径非法（含空段或 ..）：{skills_rel}"));
+        }
+    }
+    if !s.ends_with("/skills") && s != "skills" {
+        return Err(format!(
+            "skill 根路径须以 skills 结尾（例如 .claude/skills），当前：{s}"
+        ));
+    }
+    Ok(s)
+}
+
+/// 由工作区 + skills 相对根推导 (skills 绝对路径, downtime/skills 绝对路径)。
+pub fn resolve_skills_pair(
+    project_dir: &str,
+    skills_rel: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    if project_dir.is_empty() {
+        return Err("工作区路径为空".into());
+    }
+    let rel = normalize_skills_rel(skills_rel)?;
+    let mut skills = PathBuf::from(project_dir);
+    for seg in rel.split('/') {
+        skills.push(seg);
+    }
+    let mut downtime = skills.clone();
+    downtime.pop(); // 去掉末段 skills → agent 根（如 .claude）
+    downtime.push("downtime");
+    downtime.push("skills");
+    Ok((skills, downtime))
 }
 
 /// 解析一个 skill 文件夹为 ManagedSkill；无 SKILL.md 则返回 None。
@@ -252,16 +364,26 @@ fn skill_dir_names(root: &Path) -> Vec<String> {
     out
 }
 
-/// 扫工作区级 上架(.claude/skills) + 下架(.claude/downtime/skills) 的全部 skill。
-pub fn scan_managed_skills(project_dir: &str) -> Vec<ManagedSkill> {
+/// 扫工作区级 上架(skills_rel) + 下架(镜像 downtime/skills) 的全部 skill。
+/// `skills_rel` 为空时回退 [`DEFAULT_SKILLS_REL`]。
+pub fn scan_managed_skills(
+    project_dir: &str,
+    skills_rel: &str,
+) -> Result<Vec<ManagedSkill>, String> {
     let mut out = Vec::new();
-    if !project_dir.is_empty() {
-        let base = Path::new(project_dir).join(".claude");
-        scan_managed_dir(&base.join("skills"), true, &mut out);
-        scan_managed_dir(&base.join("downtime").join("skills"), false, &mut out);
+    if project_dir.is_empty() {
+        return Ok(out);
     }
+    let rel = if skills_rel.trim().is_empty() {
+        DEFAULT_SKILLS_REL
+    } else {
+        skills_rel
+    };
+    let (active, down) = resolve_skills_pair(project_dir, rel)?;
+    scan_managed_dir(&active, true, &mut out);
+    scan_managed_dir(&down, false, &mut out);
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    out
+    Ok(out)
 }
 
 /// 校验文件夹名安全（防路径越界）。
@@ -272,12 +394,22 @@ fn sanitize_dir(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 上架/下架一个 skill 文件夹（同卷原子 rename）。
-pub fn set_skill_enabled(project_dir: &str, dir: &str, enabled: bool) -> Result<(), String> {
+/// 上架/下架一个 skill 文件夹（同卷原子 rename）。`skills_rel` 为空回退默认根。
+pub fn set_skill_enabled(
+    project_dir: &str,
+    dir: &str,
+    enabled: bool,
+    skills_rel: &str,
+) -> Result<(), String> {
     sanitize_dir(dir)?;
-    let base = Path::new(project_dir).join(".claude");
-    let active = base.join("skills").join(dir);
-    let down = base.join("downtime").join("skills").join(dir);
+    let rel = if skills_rel.trim().is_empty() {
+        DEFAULT_SKILLS_REL
+    } else {
+        skills_rel
+    };
+    let (active_root, down_root) = resolve_skills_pair(project_dir, rel)?;
+    let active = active_root.join(dir);
+    let down = down_root.join(dir);
     let (from, to) = if enabled {
         (&down, &active)
     } else {
@@ -296,7 +428,12 @@ pub fn set_skill_enabled(project_dir: &str, dir: &str, enabled: bool) -> Result<
 }
 
 /// 应用模板：目标 dirs 全上架、其余全下架。单项失败不中断，收集为 warnings 返回。
-pub fn apply_skill_template(project_dir: &str, dirs: &[String]) -> Vec<String> {
+/// 路径非法时以单条 warning 返回（不 Err），便于前端展示。
+pub fn apply_skill_template(
+    project_dir: &str,
+    dirs: &[String],
+    skills_rel: &str,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     let mut target: std::collections::HashSet<String> = std::collections::HashSet::new();
     for d in dirs {
@@ -307,20 +444,29 @@ pub fn apply_skill_template(project_dir: &str, dirs: &[String]) -> Vec<String> {
             Err(e) => warnings.push(e),
         }
     }
-    let base = Path::new(project_dir).join(".claude");
-    let current = skill_dir_names(&base.join("skills"));
-    // 下架：当前已上架但不在目标
+    let rel = if skills_rel.trim().is_empty() {
+        DEFAULT_SKILLS_REL
+    } else {
+        skills_rel
+    };
+    let (active_root, _) = match resolve_skills_pair(project_dir, rel) {
+        Ok(p) => p,
+        Err(e) => {
+            warnings.push(e);
+            return warnings;
+        }
+    };
+    let current = skill_dir_names(&active_root);
     for d in &current {
         if !target.contains(d) {
-            if let Err(e) = set_skill_enabled(project_dir, d, false) {
+            if let Err(e) = set_skill_enabled(project_dir, d, false, rel) {
                 warnings.push(format!("下架 {d} 失败：{e}"));
             }
         }
     }
-    // 上架：目标里但当前未上架
     for d in &target {
         if !current.contains(d) {
-            if let Err(e) = set_skill_enabled(project_dir, d, true) {
+            if let Err(e) = set_skill_enabled(project_dir, d, true, rel) {
                 warnings.push(format!("上架 {d} 失败：{e}"));
             }
         }
@@ -712,6 +858,78 @@ pub fn scan_memory_tree(project_dir: &str) -> Result<Vec<MemoryNode>, String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn normalize_skills_rel_accepts_presets() {
+        assert_eq!(
+            normalize_skills_rel(".claude/skills").unwrap(),
+            ".claude/skills"
+        );
+        assert_eq!(
+            normalize_skills_rel(".cursor\\skills").unwrap(),
+            ".cursor/skills"
+        );
+        assert_eq!(
+            normalize_skills_rel(".agents/skills").unwrap(),
+            ".agents/skills"
+        );
+        assert_eq!(normalize_skills_rel("skills").unwrap(), "skills");
+    }
+
+    #[test]
+    fn normalize_skills_rel_rejects_absolute_and_dotdot() {
+        assert!(normalize_skills_rel("C:\\foo\\skills").is_err());
+        assert!(normalize_skills_rel("/abs/skills").is_err());
+        assert!(normalize_skills_rel("../outside/skills").is_err());
+        assert!(normalize_skills_rel(".claude").is_err()); // 不以 skills 结尾
+        assert!(normalize_skills_rel("").is_err());
+    }
+
+    #[test]
+    fn resolve_skills_pair_mirrors_downtime() {
+        let (skills, down) = resolve_skills_pair(r"G:\proj", ".claude/skills").unwrap();
+        assert_eq!(
+            skills,
+            PathBuf::from(r"G:\proj").join(".claude").join("skills")
+        );
+        assert_eq!(
+            down,
+            PathBuf::from(r"G:\proj")
+                .join(".claude")
+                .join("downtime")
+                .join("skills")
+        );
+    }
+
+    #[test]
+    fn resolve_active_picks_first_present() {
+        let tmp = TempDir::new().unwrap();
+        let pd = tmp.path();
+        std::fs::create_dir_all(pd.join(".cursor").join("skills")).unwrap();
+        let r = resolve_active_skill_root(
+            pd.to_str().unwrap(),
+            &[
+                ".claude/skills".into(),
+                ".cursor/skills".into(),
+                ".agents/skills".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(r.active, ".cursor/skills");
+        assert!(r.found);
+    }
+
+    #[test]
+    fn resolve_active_falls_back_to_first_when_none() {
+        let tmp = TempDir::new().unwrap();
+        let r = resolve_active_skill_root(
+            tmp.path().to_str().unwrap(),
+            &[".cursor/skills".into(), ".agents/skills".into()],
+        )
+        .unwrap();
+        assert_eq!(r.active, ".cursor/skills");
+        assert!(!r.found);
+    }
 
     struct ResolverFixture {
         _temp: TempDir,

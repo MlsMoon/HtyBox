@@ -18,6 +18,12 @@ import SkillTemplateModal from "./SkillTemplateModal";
 import TemplatePicker from "./TemplatePicker";
 import { useSettings } from "../settings";
 import { searchMatch } from "../search";
+import {
+  DEFAULT_SKILL_ROOT,
+  downtimeRelFromSkillsRel,
+  loadSkillRoots,
+  resolveActiveSkillRoot,
+} from "../skillRoots";
 
 // 收藏按 skill 文件夹名(dir，稳定)持久化：{ [projectDir]: dir[] }
 const FAV_KEY = "htybox.favSkills.v1";
@@ -50,29 +56,63 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
   const [activeId, setActiveId] = useState<string | null>(() => loadActiveTemplate(projectDir));
   const [showTpl, setShowTpl] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
-  const { hoverPreview } = useSettings();
+  const { hoverPreview, skillRoots: globalRoots } = useSettings();
+  const [root, setRoot] = useState(DEFAULT_SKILL_ROOT);
+  const [rootFound, setRootFound] = useState(false);
+  const [candidates, setCandidates] = useState<string[]>([]);
+  let downRel = ".claude/downtime/skills";
+  try {
+    downRel = downtimeRelFromSkillsRel(root);
+  } catch {
+    /* 非法配置时仍用默认提示 */
+  }
 
-  const reload = () =>
-    listManagedSkills(projectDir).then(setSkills).catch((e) => setErr(String(e)));
+  const reload = (activeRoot: string) =>
+    listManagedSkills(projectDir, activeRoot)
+      .then(setSkills)
+      .catch((e) => setErr(String(e)));
+
+  const resolveAndLoad = () => {
+    const cands = loadSkillRoots(projectDir);
+    setCandidates(cands);
+    setErr(null);
+    resolveActiveSkillRoot(projectDir, cands)
+      .then((r) => {
+        setRoot(r.active);
+        setRootFound(r.found);
+        return reload(r.active);
+      })
+      .catch((e) => setErr(String(e)));
+  };
 
   useEffect(() => {
     let un: (() => void) | undefined;
     let disposed = false;
-    setErr(null);
-    reload();
+    resolveAndLoad();
     setFavs(loadFavs(projectDir));
     setTemplates(loadTemplates(projectDir));
     setActiveId(loadActiveTemplate(projectDir));
-    listen("skills-changed", reload).then((u) => {
+    listen("skills-changed", () => {
+      resolveActiveSkillRoot(projectDir, loadSkillRoots(projectDir))
+        .then((r) => {
+          setRoot(r.active);
+          setRootFound(r.found);
+          return reload(r.active);
+        })
+        .catch((e) => setErr(String(e)));
+    }).then((u) => {
       if (disposed) u();
       else un = u;
     });
+    const onRoots = () => resolveAndLoad();
+    window.addEventListener("htybox:skill-roots", onRoots);
     return () => {
       disposed = true;
       un?.();
+      window.removeEventListener("htybox:skill-roots", onRoots);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectDir]);
+  }, [projectDir, globalRoots]);
 
   const toggleFav = (dir: string) =>
     setFavs((prev) => {
@@ -84,10 +124,10 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
   // 单个上架/下架 → 操作后重载；集合已偏离模板 → 清空 active 标记（自定义态）
   const toggleEnabled = async (s: ManagedSkill) => {
     try {
-      await setSkillEnabled(projectDir, s.dir, !s.enabled);
+      await setSkillEnabled(projectDir, s.dir, !s.enabled, root);
       setActiveId(null);
       saveActiveTemplate(projectDir, null);
-      reload();
+      reload(root);
     } catch (e) {
       setNote(String(e));
     }
@@ -97,10 +137,10 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
   const applyTpl = async (t: SkillTemplate) => {
     setNote(null);
     try {
-      const warnings = await applySkillTemplate(projectDir, t.skillDirs);
+      const warnings = await applySkillTemplate(projectDir, t.skillDirs, root);
       setActiveId(t.id);
       saveActiveTemplate(projectDir, t.id);
-      reload();
+      reload(root);
       if (warnings.length)
         setNote(`已应用「${t.name}」，但 ${warnings.length} 项未处理：${warnings.join("；")}`);
     } catch (e) {
@@ -125,7 +165,7 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
         toggleEnabled(s);
       }}
       onMouseDown={(e) => e.stopPropagation()}
-      title={s.enabled ? "下架（移出 .claude/skills）" : "上架（移回 .claude/skills）"}
+      title={s.enabled ? `下架（移至 ${downRel}）` : `上架（移回 ${root}）`}
       className={
         "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold " +
         (s.enabled
@@ -222,6 +262,14 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
       </div>
       <div className="px-2.5 pb-2">
         <SearchBox value={q} onChange={setQ} placeholder="搜索本工作区 skill…" />
+        <div className="mt-1 px-0.5 text-[10px] leading-relaxed text-[var(--text-3)]">
+          激活根{" "}
+          <code className="text-[var(--text-2)]">{root}</code>
+          {rootFound ? "" : "（候选目录均未发现，已回退首项）"}
+          {candidates.length > 1 && (
+            <span className="text-[var(--text-3)]"> · 候选 {candidates.length}</span>
+          )}
+        </div>
       </div>
       {note && (
         <div className="mx-2.5 mb-1.5 flex items-start gap-2 rounded-md border border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-2 py-1.5">
@@ -241,7 +289,7 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
             本工作区没有 skill
             <br />
             <span className="text-[10px]">
-              （放到 <code className="text-[var(--text-2)]">.claude/skills/</code> 下）
+              （放到 <code className="text-[var(--text-2)]">{root}/</code> 下；可在设置 → Skill 更换根目录）
             </span>
           </div>
         )}

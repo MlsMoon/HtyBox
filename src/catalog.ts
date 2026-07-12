@@ -25,7 +25,7 @@ export interface ProjectRef {
 export const listSkills = (projectDir?: string) =>
   invoke<Skill[]>("list_skills", { projectDir });
 
-/** 只取某工作区文件夹自己的 skill（<dir>/.claude/skills）。 */
+/** 只取某工作区文件夹自己的 skill（历史 API，固定 `.claude/skills`；面板请用 listManagedSkills）。 */
 export const listProjectSkills = (projectDir: string) =>
   invoke<Skill[]>("list_project_skills", { projectDir });
 
@@ -199,20 +199,42 @@ export interface ManagedSkill {
   dir: string; // 文件夹名 = 稳定标识（移动/模板都用它）
   invoke: string;
   path: string;
-  enabled: boolean; // true=已上架(.claude/skills)；false=已下架(.claude/downtime/skills)
+  /** true=在活动 skills 根；false=在镜像 downtime/skills */
+  enabled: boolean;
 }
 
-/** 列工作区级 上架+下架 的全部 skill（带 enabled）。 */
-export const listManagedSkills = (projectDir: string) =>
-  invoke<ManagedSkill[]>("list_managed_skills", { projectDir });
+/** 列工作区级 上架+下架 的全部 skill（带 enabled）。`skillsRel` 缺省 = `.claude/skills`。 */
+export const listManagedSkills = (projectDir: string, skillsRel?: string) =>
+  invoke<ManagedSkill[]>("list_managed_skills", {
+    projectDir,
+    skillsRel: skillsRel || null,
+  });
 
 /** 上架/下架单个 skill（移动文件夹）。 */
-export const setSkillEnabled = (projectDir: string, dir: string, enabled: boolean) =>
-  invoke<void>("set_skill_enabled", { projectDir, dir, enabled });
+export const setSkillEnabled = (
+  projectDir: string,
+  dir: string,
+  enabled: boolean,
+  skillsRel?: string,
+) =>
+  invoke<void>("set_skill_enabled", {
+    projectDir,
+    dir,
+    enabled,
+    skillsRel: skillsRel || null,
+  });
 
 /** 应用模板：dirs 全上架、其余全下架；返回单项失败的 warnings。 */
-export const applySkillTemplate = (projectDir: string, dirs: string[]) =>
-  invoke<string[]>("apply_skill_template", { projectDir, dirs });
+export const applySkillTemplate = (
+  projectDir: string,
+  dirs: string[],
+  skillsRel?: string,
+) =>
+  invoke<string[]>("apply_skill_template", {
+    projectDir,
+    dirs,
+    skillsRel: skillsRel || null,
+  });
 
 // ---- M8：工作区文件树（懒加载，一层） ----
 export interface DirEntry {

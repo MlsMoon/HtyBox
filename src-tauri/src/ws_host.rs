@@ -393,6 +393,9 @@ impl Conn {
                 self.send_json(&RpcResponse::new(types::HOST_WORKSPACES_LIST_RESP, req_id, result));
             }
             // L5-4P-2：只读 catalog（镜像桌面左侧 Content），复用桌面既有扫描逻辑。
+            // 2026-07-12：桌面 Skill 面板已支持可配置根（settings.skillRoot）；本 RPC 仍走
+            // scan_skills（固定 .claude + user/plugin），iOS 侧暂不跟随——见计划
+            // configurable-skill-roots Step 5「桌面优先」。后续若双端对齐，需 Host 发布 skillRoot。
             types::CATALOG_SKILLS_LIST_REQ => {
                 let dir = v.get("projectDir").and_then(Value::as_str).unwrap_or("");
                 let skills = crate::catalog::scan_skills(if dir.is_empty() { None } else { Some(dir) });

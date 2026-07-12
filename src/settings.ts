@@ -29,16 +29,90 @@ export interface Settings {
   middleClickScroll: boolean;
   /** 左栏 File/Skill/Memory/Session/Flow 分段切换条：开=仅图标(更紧凑) / 关=图标+文字(现状,默认) */
   sidebarTabIconOnly: boolean;
+  /**
+   * 全局默认 Skill 候选条目（有序，含启用开关）。工作区可在 wsState 覆盖；
+   * 运行时仅对 enabled 项按序选第一个「目录已存在」的作为唯一激活根。
+   */
+  skillRootEntries: { path: string; enabled: boolean }[];
+  /** 启用中的路径（由 skillRootEntries 派生同步，兼容旧逻辑） */
+  skillRoots: string[];
+  /** @deprecated 升格为 skillRoots / skillRootEntries */
+  skillRoot?: string;
 }
 
 const KEY = "htybox.settings.v1";
-const DEFAULTS: Settings = { hoverPreview: true, autoRelay: false, fontFamily: "harmony", maxFiles: 100000, theme: "light", fileClickMode: "open", openFileFromSearch: false, maxEditMB: 10, showWorkflowPanel: true, middleClickScroll: true, sidebarTabIconOnly: false };
+const DEFAULT_ENTRIES = [
+  { path: ".claude/skills", enabled: true },
+  { path: ".cursor/skills", enabled: true },
+  { path: ".agents/skills", enabled: true },
+];
+const DEFAULTS: Settings = {
+  hoverPreview: true,
+  autoRelay: false,
+  fontFamily: "harmony",
+  maxFiles: 100000,
+  theme: "light",
+  fileClickMode: "open",
+  openFileFromSearch: false,
+  maxEditMB: 10,
+  showWorkflowPanel: true,
+  middleClickScroll: true,
+  sidebarTabIconOnly: false,
+  skillRootEntries: DEFAULT_ENTRIES.map((e) => ({ ...e })),
+  skillRoots: DEFAULT_ENTRIES.filter((e) => e.enabled).map((e) => e.path),
+};
 
 function load(): Settings {
   try {
-    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(KEY) || "{}") };
+    const raw = JSON.parse(localStorage.getItem(KEY) || "{}") as Partial<Settings> & {
+      skillRoot?: string;
+    };
+    const {
+      skillRoot: legacyRoot,
+      skillRoots: rawRoots,
+      skillRootEntries: rawEntries,
+      ...rest
+    } = raw;
+    const merged: Settings = {
+      ...DEFAULTS,
+      ...rest,
+      skillRootEntries: DEFAULT_ENTRIES.map((e) => ({ ...e })),
+      skillRoots: [...DEFAULTS.skillRoots],
+    };
+    if (Array.isArray(rawEntries) && rawEntries.length) {
+      merged.skillRootEntries = rawEntries.map((e) => ({
+        path: String(e.path),
+        enabled: !!e.enabled,
+      }));
+      merged.skillRoots = merged.skillRootEntries.filter((e) => e.enabled).map((e) => e.path);
+      if (!merged.skillRoots.length) merged.skillRoots = [...DEFAULTS.skillRoots];
+    } else if (Array.isArray(rawRoots) && rawRoots.length) {
+      merged.skillRoots = rawRoots;
+      const en = new Set(rawRoots);
+      merged.skillRootEntries = [
+        ...rawRoots.map((path) => ({ path, enabled: true })),
+        ...DEFAULT_ENTRIES.filter((e) => !en.has(e.path)).map((e) => ({
+          path: e.path,
+          enabled: false,
+        })),
+      ];
+    } else if (typeof legacyRoot === "string" && legacyRoot.trim()) {
+      merged.skillRoots = [legacyRoot];
+      merged.skillRootEntries = [
+        { path: legacyRoot, enabled: true },
+        ...DEFAULT_ENTRIES.filter((e) => e.path !== legacyRoot).map((e) => ({
+          path: e.path,
+          enabled: false,
+        })),
+      ];
+    }
+    return merged;
   } catch {
-    return { ...DEFAULTS };
+    return {
+      ...DEFAULTS,
+      skillRootEntries: DEFAULT_ENTRIES.map((e) => ({ ...e })),
+      skillRoots: [...DEFAULTS.skillRoots],
+    };
   }
 }
 

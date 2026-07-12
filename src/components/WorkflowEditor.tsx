@@ -12,6 +12,12 @@ import { listManagedSkills, type ManagedSkill } from "../catalog";
 import SearchBox from "./ui/SearchBox";
 import { useMaskDismiss } from "./ui/maskDismiss";
 import { searchScore } from "../search";
+import { useSettings } from "../settings";
+import {
+  DEFAULT_SKILL_ROOT,
+  loadSkillRoots,
+  resolveActiveSkillRoot,
+} from "../skillRoots";
 
 // 工作流编辑弹窗（新建/编辑共用，仿 TeamEditor 的居中自定义弹窗）：名称/描述 + 阶段列表
 // （增删/上移下移/类型切换/注入文本或人工指引/自动回车）+「从 Skill 插入」（当前工作区已上架
@@ -137,20 +143,23 @@ export default function WorkflowEditor({
   const [overIdx, setOverIdx] = useState<number | null>(null);
   const [armed, setArmed] = useState<number | null>(null);
   const mask = useMaskDismiss(onClose);
+  const { skillRoots: globalRoots } = useSettings();
 
   useEffect(() => {
     let alive = true;
-    listManagedSkills(projectDir)
+    const cands = loadSkillRoots(projectDir);
+    resolveActiveSkillRoot(projectDir, cands)
+      .then((r) => listManagedSkills(projectDir, r.active || DEFAULT_SKILL_ROOT))
       .then((list) => {
         if (alive) setSkills(list.filter((s) => s.enabled));
       })
       .catch(() => {
-        /* 无 .claude/skills 目录等 → 插入功能自然为空 */
+        /* 无 skills 目录等 → 插入功能自然为空 */
       });
     return () => {
       alive = false;
     };
-  }, [projectDir]);
+  }, [projectDir, globalRoots]);
 
   const patchStage = (id: string, patch: Partial<WorkflowStage>) =>
     setWf((w) => ({ ...w, stages: w.stages.map((s) => (s.id === id ? { ...s, ...patch } : s)) }));

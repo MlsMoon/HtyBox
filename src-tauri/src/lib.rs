@@ -359,21 +359,52 @@ fn list_projects() -> Vec<catalog::ProjectRef> {
 }
 
 /// M8：列工作区级 上架+下架 的全部 skill（带 enabled 标记）。
+/// `skills_rel` 可选；空/缺省 = `.claude/skills`。
 #[tauri::command]
-fn list_managed_skills(project_dir: String) -> Vec<catalog::ManagedSkill> {
-    catalog::scan_managed_skills(&project_dir)
+fn list_managed_skills(
+    project_dir: String,
+    skills_rel: Option<String>,
+) -> Result<Vec<catalog::ManagedSkill>, String> {
+    let rel = skills_rel
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| catalog::DEFAULT_SKILLS_REL.to_string());
+    catalog::scan_managed_skills(&project_dir, &rel)
 }
 
-/// M8：上架/下架单个 skill（在 .claude/skills ↔ .claude/downtime/skills 间移动文件夹）。
+/// 按候选顺序解析唯一激活 skill 根（目录存在则命中，否则回退首项）。
 #[tauri::command]
-fn set_skill_enabled(project_dir: String, dir: String, enabled: bool) -> Result<(), String> {
-    catalog::set_skill_enabled(&project_dir, &dir, enabled)
+fn resolve_active_skill_root(
+    project_dir: String,
+    candidates: Vec<String>,
+) -> Result<catalog::ActiveSkillRoot, String> {
+    catalog::resolve_active_skill_root(&project_dir, &candidates)
+}
+
+/// M8：上架/下架单个 skill（在活动 skills 根 ↔ 镜像 downtime/skills 间移动文件夹）。
+#[tauri::command]
+fn set_skill_enabled(
+    project_dir: String,
+    dir: String,
+    enabled: bool,
+    skills_rel: Option<String>,
+) -> Result<(), String> {
+    let rel = skills_rel
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| catalog::DEFAULT_SKILLS_REL.to_string());
+    catalog::set_skill_enabled(&project_dir, &dir, enabled, &rel)
 }
 
 /// M8：应用模板（dirs 全上架、其余全下架）；返回单项失败的 warnings（整体不报错）。
 #[tauri::command]
-fn apply_skill_template(project_dir: String, dirs: Vec<String>) -> Result<Vec<String>, String> {
-    Ok(catalog::apply_skill_template(&project_dir, &dirs))
+fn apply_skill_template(
+    project_dir: String,
+    dirs: Vec<String>,
+    skills_rel: Option<String>,
+) -> Result<Vec<String>, String> {
+    let rel = skills_rel
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| catalog::DEFAULT_SKILLS_REL.to_string());
+    Ok(catalog::apply_skill_template(&project_dir, &dirs, &rel))
 }
 
 /// M8：列某目录的直接子项（文件树懒加载，一层）。
@@ -793,6 +824,7 @@ pub fn run() {
             import_memory_archive,
             list_projects,
             list_managed_skills,
+            resolve_active_skill_root,
             set_skill_enabled,
             apply_skill_template,
             list_dir,
