@@ -73,6 +73,9 @@ export interface MemoryNode {
 }
 export const listMemoryTree = (projectDir: string) =>
   invoke<MemoryNode[]>("list_memory_tree", { projectDir });
+/** plan-5:canonical 权威记忆树(.htyworkflows/memory,「策展记忆」tab)。 */
+export const listCanonicalMemoryTree = (projectDir: string) =>
+  invoke<MemoryNode[]>("list_canonical_memory_tree", { projectDir });
 
 // ---- M9：claude/codex/cursor 会话记录 ----
 export type SessionAgent = "claude" | "codex" | "cursor";

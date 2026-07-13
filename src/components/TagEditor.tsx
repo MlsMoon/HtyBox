@@ -18,6 +18,26 @@ import {
 import ContextMenu, { MENU_SEP } from "./ui/ContextMenu";
 import ConfirmModal from "./ui/ConfirmModal";
 
+/** 注入式标签编辑模型：Session / Skill 各绑自己的 store，UI 共用。 */
+export interface TagEditorModel {
+  tags: Tag[];
+  vocab: Tag[];
+  subjectName?: string;
+  /** 区块标题，如「该会话标签」/「该 skill 标签」 */
+  entityLabel: string;
+  /** 新建区右侧 hint，如「回车即打到当前会话」 */
+  applyHint: string;
+  /** 删除确认里的单位，如「个会话」/「个 skill」 */
+  removeUnit: string;
+  createTag: (name: string, color?: TagColorKey) => Tag;
+  addTag: (tagId: string) => void;
+  removeTag: (tagId: string) => void;
+  toggleTag: (tagId: string) => void;
+  updateTag: (tagId: string, patch: { name?: string; color?: TagColorKey }) => boolean;
+  deleteTag: (tagId: string) => void;
+  countWithTag: (tagId: string) => number;
+}
+
 /** 6 色点选择行（新建区与原位编辑行共用；带选中环 + ✓）。 */
 function ColorDots({ value, onPick }: { value: TagColorKey; onPick: (c: TagColorKey) => void }) {
   return (
@@ -41,48 +61,36 @@ function ColorDots({ value, onPick }: { value: TagColorKey; onPick: (c: TagColor
   );
 }
 
-// 标签编辑器 popover：给某会话增删 tag / 新建 tag。SessionPanel 右键 与 终端 Tab 右键【共用】。
-// 锚定右键坐标、portal 到 body、边界回弹、外部点击 / Esc 关闭（与 ui/ContextMenu 同款交互）。
-// 数据走 sessionTags 全局 store（useSessionTags/useVocab 自动重渲染），故两处入口、两处显示天然联动。
-export default function TagEditor({
+/** 通用标签编辑 popover（portal；数据由 model 注入）。 */
+export function TagEditor({
   x,
   y,
-  agentKind,
-  sessionId,
-  sessionName,
   onClose,
+  model,
 }: {
   x: number;
   y: number;
-  agentKind: Exclude<AgentKind, "shell">;
-  sessionId: string;
-  sessionName?: string;
   onClose: () => void;
+  model: TagEditorModel;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ left: x, top: y });
-  const [draft, setDraft] = useState(""); // 新建输入
-  const [newColor, setNewColor] = useState<TagColorKey>("blue"); // 新建色（默认蓝，可点改）
-  const [menu, setMenu] = useState<{ x: number; y: number; tag: Tag } | null>(null); // chip 右键菜单
-  const [confirmDel, setConfirmDel] = useState<Tag | null>(null); // 删除词表 tag 的确认框
-  // 原位编辑态（改名/改色）：clash = 提交被拒（空名/撞名）红边提示
+  const [draft, setDraft] = useState("");
+  const [newColor, setNewColor] = useState<TagColorKey>("blue");
+  const [menu, setMenu] = useState<{ x: number; y: number; tag: Tag } | null>(null);
+  const [confirmDel, setConfirmDel] = useState<Tag | null>(null);
   const [editing, setEditing] = useState<{ id: string; name: string; color: TagColorKey; clash: boolean } | null>(null);
-  const editRowRef = useRef<HTMLDivElement>(null); // 编辑行容器：popover 内点击行外 = 视同回车提交
+  const editRowRef = useRef<HTMLDivElement>(null);
   const commitEdit = () => {
     if (!editing) return;
-    if (updateTag(editing.id, { name: editing.name })) setEditing(null);
+    if (model.updateTag(editing.id, { name: editing.name })) setEditing(null);
     else setEditing({ ...editing, clash: true });
   };
-  // 子层（右键菜单/确认框，均 portal 到 body、DOM 不在 ref 内）打开期间豁免外点/Esc 关闭，
-  // 防点击子层被误判为"点在 popover 外"而误关本 popover；用 ref 读实时值、不重挂监听。
   const guardRef = useRef(false);
   guardRef.current = !!(menu || confirmDel);
-  const key = sessionKey(agentKind, sessionId);
-  const tags = useSessionTags(agentKind, sessionId); // 该会话已有 tag（join 词表）
-  const vocab = useVocab(); // 全部 tag 词表
+  const { tags, vocab } = model;
   const has = (id: string) => tags.some((t) => t.id === id);
 
-  // 定位边界回弹（参考 ContextMenu.tsx:29-36）：弹出后量自身尺寸，超出视口则回拉。
   useLayoutEffect(() => {
     const r = ref.current?.getBoundingClientRect();
     if (!r) return;
@@ -92,7 +100,6 @@ export default function TagEditor({
     });
   }, [x, y]);
 
-  // 外部点击 / Esc 关闭（capture 阶段，避免被内部 stopPropagation 漏掉）。
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
       if (guardRef.current) return;
@@ -109,12 +116,11 @@ export default function TagEditor({
     };
   }, [onClose]);
 
-  // 新建 tag（回车）：去重创建（同名复用）+ 打到当前会话 + 清空输入。
   const submitNew = () => {
     const n = draft.trim();
     if (!n) return;
-    const tag = createTag(n, newColor);
-    addTag(key, tag.id);
+    const tag = model.createTag(n, newColor);
+    model.addTag(tag.id);
     setDraft("");
   };
 
@@ -124,15 +130,13 @@ export default function TagEditor({
       style={{ position: "fixed", left: pos.left, top: pos.top, zIndex: 120 }}
       className="w-[300px] overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--elevated)] shadow-xl"
       onMouseDown={(e) => {
-        // 编辑态下点击编辑行以外的任意位置 = 提交（与回车一致，防"看似卡住"）；失败（撞名/空名）保持红边
         if (editing && !editRowRef.current?.contains(e.target as Node)) commitEdit();
       }}
     >
-      {/* 头部：标题 + 会话名 + ✕ */}
       <div className="flex items-center gap-2 border-b border-[var(--border-soft)] px-3.5 py-2.5">
         <span className="text-[14px] font-bold text-[var(--text)]">标签</span>
-        {sessionName && (
-          <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-3)]">· {sessionName}</span>
+        {model.subjectName && (
+          <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-3)]">· {model.subjectName}</span>
         )}
         <button
           onClick={onClose}
@@ -141,10 +145,9 @@ export default function TagEditor({
           ✕
         </button>
       </div>
-      {/* ① 该会话标签（点 × 移除） */}
       {tags.length > 0 && (
         <div className="border-b border-[var(--border-soft)] px-3.5 py-2.5">
-          <div className="mb-1.5 text-[10px] font-bold tracking-wide text-[var(--text-2)]">该会话标签</div>
+          <div className="mb-1.5 text-[10px] font-bold tracking-wide text-[var(--text-2)]">{model.entityLabel}</div>
           <div className="flex flex-wrap gap-1.5">
             {tags.map((t) => (
               <span
@@ -154,7 +157,7 @@ export default function TagEditor({
               >
                 <span className="h-2 w-2 rounded-full" style={{ backgroundColor: tagDot(t.color) }} />
                 {t.name}
-                <button onClick={() => removeTag(key, t.id)} title="移除" className="ml-0.5 leading-none hover:opacity-60">
+                <button onClick={() => model.removeTag(t.id)} title="移除" className="ml-0.5 leading-none hover:opacity-60">
                   ×
                 </button>
               </span>
@@ -163,7 +166,6 @@ export default function TagEditor({
         </div>
       )}
 
-      {/* ② 全部标签（点选增删；已选高亮 + ✓） */}
       <div className="border-b border-[var(--border-soft)] px-3.5 py-2.5">
         <div className="mb-1.5 text-[10px] font-bold tracking-wide text-[var(--text-2)]">全部标签 · 点选增删</div>
         {vocab.length === 0 ? (
@@ -171,7 +173,6 @@ export default function TagEditor({
         ) : (
           <div className="flex flex-wrap gap-1.5">
             {vocab.map((t) => {
-              // 原位编辑行：input（Enter 提交 / Esc 取消）+ 色点即时改色；撞名/空名红边不关闭
               if (editing?.id === t.id) {
                 return (
                   <div key={t.id} ref={editRowRef} className="flex w-full flex-wrap items-center gap-2 rounded-md border border-[var(--accent-border)] bg-[var(--surface)] px-2 py-1.5">
@@ -192,7 +193,7 @@ export default function TagEditor({
                     <ColorDots
                       value={editing.color}
                       onPick={(c) => {
-                        if (updateTag(editing.id, { color: c })) setEditing({ ...editing, color: c });
+                        if (model.updateTag(editing.id, { color: c })) setEditing({ ...editing, color: c });
                       }}
                     />
                     {editing.clash && (
@@ -205,7 +206,7 @@ export default function TagEditor({
               return (
                 <button
                   key={t.id}
-                  onClick={() => toggleTag(key, t.id)}
+                  onClick={() => model.toggleTag(t.id)}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     setMenu({ x: e.clientX, y: e.clientY, tag: t });
@@ -231,7 +232,6 @@ export default function TagEditor({
         )}
       </div>
 
-      {/* ③ 新建标签 + 颜色点 */}
       <div className="px-3.5 py-2.5">
         <div className="mb-1.5 text-[10px] font-bold tracking-wide text-[var(--text-2)]">新建标签</div>
         <input
@@ -249,10 +249,9 @@ export default function TagEditor({
         <div className="mt-2 flex items-center gap-2">
           <span className="text-[10px] font-bold tracking-wide text-[var(--text-2)]">颜色</span>
           <ColorDots value={newColor} onPick={setNewColor} />
-          <span className="ml-auto text-[9.5px] text-[var(--text-3)]">回车即打到当前会话</span>
+          <span className="ml-auto text-[9.5px] text-[var(--text-3)]">{model.applyHint}</span>
         </div>
       </div>
-      {/* chip 右键菜单（危险操作走右键 + 确认兜底；portal 到 body，同 z 后挂载故显示在上） */}
       {menu && (
         <ContextMenu
           x={menu.x}
@@ -265,14 +264,13 @@ export default function TagEditor({
           onClose={() => setMenu(null)}
         />
       )}
-      {/* 删除词表 tag 确认（zIndex 130 盖过本 popover 的 120） */}
       {confirmDel && (
         <ConfirmModal
           title={`删除标签“${confirmDel.name}”？`}
-          message={`将同时从 ${countSessionsWithTag(confirmDel.id)} 个会话移除，不可恢复。`}
+          message={`将同时从 ${model.countWithTag(confirmDel.id)} ${model.removeUnit}移除，不可恢复。`}
           zIndex={130}
           onConfirm={() => {
-            deleteTag(confirmDel.id);
+            model.deleteTag(confirmDel.id);
             if (editing?.id === confirmDel.id) setEditing(null);
           }}
           onClose={() => setConfirmDel(null)}
@@ -281,4 +279,41 @@ export default function TagEditor({
     </div>,
     document.body,
   );
+}
+
+/** Session 入口：原 props 形态，内部绑 sessionTags。SessionPanel / TerminalDock 共用。 */
+export default function SessionTagEditor({
+  x,
+  y,
+  agentKind,
+  sessionId,
+  sessionName,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  agentKind: Exclude<AgentKind, "shell">;
+  sessionId: string;
+  sessionName?: string;
+  onClose: () => void;
+}) {
+  const key = sessionKey(agentKind, sessionId);
+  const tags = useSessionTags(agentKind, sessionId);
+  const vocab = useVocab();
+  const model: TagEditorModel = {
+    tags,
+    vocab,
+    subjectName: sessionName,
+    entityLabel: "该会话标签",
+    applyHint: "回车即打到当前会话",
+    removeUnit: "个会话",
+    createTag,
+    addTag: (tagId) => addTag(key, tagId),
+    removeTag: (tagId) => removeTag(key, tagId),
+    toggleTag: (tagId) => toggleTag(key, tagId),
+    updateTag,
+    deleteTag,
+    countWithTag: countSessionsWithTag,
+  };
+  return <TagEditor x={x} y={y} onClose={onClose} model={model} />;
 }

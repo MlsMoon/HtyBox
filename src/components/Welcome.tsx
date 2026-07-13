@@ -1,6 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import WindowControls from "./WindowControls";
 import HtyBoxLogo from "./ui/HtyBoxLogo";
+import ModeSwitch from "./htyenv/ModeSwitch";
 
 export interface RecentFolder {
   name: string;
@@ -11,10 +12,12 @@ export default function Welcome({
   recents,
   onOpen,
   onOpenSettings,
+  onSwitchDashboard,
 }: {
   recents: RecentFolder[];
   onOpen: (path: string) => void;
   onOpenSettings: () => void;
+  onSwitchDashboard: () => void;
 }) {
   const pickFolder = async () => {
     const sel = await open({
@@ -55,6 +58,11 @@ export default function Welcome({
         <div className="mb-10 flex items-center justify-center gap-5">
           <HtyBoxLogo size={144} initial="closed" introOnMount openOnHover />
           <span className="text-7xl font-bold tracking-tight" style={{ fontFamily: '"Baloo 2", sans-serif' }}>HtyBox</span>
+        </div>
+
+        {/* 模式切换:正常工作模式 ↔ hty环境仪表盘(决策 1A) */}
+        <div className="mb-7">
+          <ModeSwitch mode="normal" onNormal={() => {}} onDashboard={onSwitchDashboard} />
         </div>
 
         {/* 打开文件夹 */}

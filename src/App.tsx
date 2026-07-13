@@ -21,6 +21,20 @@ import { checkForUpdate, getSkippedVersion, setSkippedVersion, type Update } fro
 import { getWsState, setWsState } from "./wsState";
 import { onAgentStatusChange, workspaceStatus, setActiveWorkspace, clearWorkspace, type WsStatus } from "./agentStatus";
 import { useMaskDismiss } from "./components/ui/maskDismiss";
+import DashboardShell from "./components/htyenv/DashboardShell";
+import { setSetting, useSettings } from "./settings";
+
+// hty环境仪表盘入口图标(布局面板风格)
+function DashboardIcon() {
+  return (
+    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="7" height="9" rx="1.5" />
+      <rect x="14" y="3" width="7" height="5" rx="1.5" />
+      <rect x="14" y="12" width="7" height="9" rx="1.5" />
+      <rect x="3" y="16" width="7" height="5" rx="1.5" />
+    </svg>
+  );
+}
 
 function GearIcon() {
   return (
@@ -177,6 +191,7 @@ export default function App() {
   const [appVersion, setAppVersion] = useState(""); // 应用真实版本号（来自打包进二进制的 tauri.conf.json）
   const [wsMenu, setWsMenu] = useState<{ x: number; y: number; id: string } | null>(null);
   const [, forceStatusTick] = useReducer((x: number) => x + 1, 0); // agentStatus 变化 → 重渲染顶栏
+  const dashMode = useSettings().envDashboardMode; // hty环境仪表盘模式(持久化,重启恢复)
 
   useEffect(() => {
     try {
@@ -443,6 +458,13 @@ export default function App() {
           <div className="ml-auto flex items-center gap-2 pr-1">
             <BookmarkBar scope={active.id} />
             <button
+              onClick={() => setSetting("envDashboardMode", true)}
+              title="hty环境仪表盘(终端保持后台运行)"
+              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-2)] transition-colors hover:bg-[var(--elevated)] hover:text-[var(--text)]"
+            >
+              <DashboardIcon />
+            </button>
+            <button
               onClick={() => setShowSettings(true)}
               title="设置"
               className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-2)] transition-colors hover:bg-[var(--elevated)] hover:text-[var(--text)]"
@@ -516,12 +538,26 @@ export default function App() {
         </div>
       )}
 
-      {/* 欢迎页：覆盖层（Cursor 式初始界面）。盖在终端区之上，终端在底下保活。 */}
-      {!active && (
+      {/* 欢迎页：覆盖层（Cursor 式初始界面）。盖在终端区之上，终端在底下保活。仪表盘态由 DashboardShell 接管欢迎职责 */}
+      {!dashMode && !active && (
         <div className="absolute inset-0 z-50">
           <Welcome
             recents={recents}
             onOpen={openFolder}
+            onOpenSettings={() => setShowSettings(true)}
+            onSwitchDashboard={() => setSetting("envDashboardMode", true)}
+          />
+        </div>
+      )}
+
+      {/* hty环境仪表盘模式：顶层覆盖层（决策 2A），终端/PTY 在底下保活不卸载 */}
+      {dashMode && (
+        <div className="absolute inset-0 z-50">
+          <DashboardShell
+            recents={recents}
+            openWs={openWs.map((w) => ({ name: w.name, path: w.path }))}
+            initialPath={active?.path ?? null}
+            onExit={() => setSetting("envDashboardMode", false)}
             onOpenSettings={() => setShowSettings(true)}
           />
         </div>

@@ -372,3 +372,17 @@ export function disposeByPrefix(prefix: string): void {
     if (id.startsWith(prefix)) disposeEngine(id);
   }
 }
+
+/** 列某前缀（= 某 workspace）下已建 PTY 的活跃终端(hty环境仪表盘「注入终端裁决」的候选)。 */
+export function listEngines(prefix: string): { termId: string; agentKind?: string }[] {
+  return [...engines.entries()]
+    .filter(([id, e]) => id.startsWith(prefix) && e.created)
+    .map(([termId, e]) => ({ termId, agentKind: e.agentKind }));
+}
+
+/** 向指定终端注入多行文本(按 agent 粘贴语义包裹,claude/codex 折叠成 Pasted text)。失败抛给调用侧呈现。 */
+export function injectIntoTerminal(termId: string, text: string): Promise<void> {
+  const e = engines.get(termId);
+  if (!e || !e.created) return Promise.reject(new Error("终端不存在或尚未就绪"));
+  return invoke("write_terminal", { id: termId, data: pasteData(e.agentKind, text) });
+}

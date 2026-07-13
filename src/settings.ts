@@ -38,6 +38,12 @@ export interface Settings {
   skillRoots: string[];
   /** @deprecated 升格为 skillRoots / skillRootEntries */
   skillRoot?: string;
+  /** hty环境:全局权威库目录(空 = 引擎默认 config_dir/HtyBox/global-env;库属用户资产,位置可自管) */
+  htyenvLibraryDir: string;
+  /** hty环境仪表盘模式:true=仪表盘覆盖层(终端后台保活) / false=正常工作模式。重启恢复上次模式 */
+  envDashboardMode: boolean;
+  /** canonical 工作区 MemoryPanel 默认记忆源(plan-5 决策 3A):curated=策展记忆(权威,对三 agent 注入都有效) / cache=Claude 产品缓存(旧习惯退路) */
+  htyenvDefaultMemorySource: "curated" | "cache";
 }
 
 const KEY = "htybox.settings.v1";
@@ -60,6 +66,9 @@ const DEFAULTS: Settings = {
   sidebarTabIconOnly: false,
   skillRootEntries: DEFAULT_ENTRIES.map((e) => ({ ...e })),
   skillRoots: DEFAULT_ENTRIES.filter((e) => e.enabled).map((e) => e.path),
+  htyenvLibraryDir: "",
+  envDashboardMode: false,
+  htyenvDefaultMemorySource: "curated",
 };
 
 function load(): Settings {

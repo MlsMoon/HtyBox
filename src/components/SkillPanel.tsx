@@ -24,9 +24,36 @@ import {
   loadSkillRoots,
   resolveActiveSkillRoot,
 } from "../skillRoots";
+import {
+  useSkillTagStore,
+  useSkillTags,
+  useSkillVocab,
+  getSkillTags,
+  getSkillTagIds,
+  createSkillTag,
+  addSkillTag,
+  removeSkillTag,
+  toggleSkillTag,
+  updateSkillTag,
+  deleteSkillTag,
+  countSkillsWithTag,
+} from "../skillTags";
+import { tagDot } from "../tagColors";
+import { getWsState, setWsState } from "../wsState";
+import { TagEditor, type TagEditorModel } from "./TagEditor";
+import ContextMenu from "./ui/ContextMenu";
+import { useMaskDismiss } from "./ui/maskDismiss";
+import {
+  htyenvApplyEnabledSet,
+  htyenvSetSkillEnabled,
+  htyenvStatus,
+  htyenvWorkspaceSkills,
+} from "../htyenv";
 
 // 收藏按 skill 文件夹名(dir，稳定)持久化：{ [projectDir]: dir[] }
 const FAV_KEY = "htybox.favSkills.v1";
+const FILTER_KEY = "htybox.skillTagFilter.v1";
+
 function loadFavs(projectDir: string): string[] {
   try {
     const all = JSON.parse(localStorage.getItem(FAV_KEY) || "{}");
@@ -45,12 +72,47 @@ function saveFavs(projectDir: string, dirs: string[]): void {
   }
 }
 
-/** Skill 面板：上架/下架管理 + 集合模板（工作区级）。卡片只显名+动作，详情走悬浮浮层。 */
+function SkillTagEditorHost({
+  projectDir,
+  dir,
+  name,
+  x,
+  y,
+  onClose,
+}: {
+  projectDir: string;
+  dir: string;
+  name: string;
+  x: number;
+  y: number;
+  onClose: () => void;
+}) {
+  const tags = useSkillTags(projectDir, dir);
+  const vocab = useSkillVocab(projectDir);
+  const model: TagEditorModel = {
+    tags,
+    vocab,
+    subjectName: name,
+    entityLabel: "该 skill 标签",
+    applyHint: "回车即打到当前 skill",
+    removeUnit: "个 skill",
+    createTag: (n, c) => createSkillTag(projectDir, n, c),
+    addTag: (id) => addSkillTag(projectDir, dir, id),
+    removeTag: (id) => removeSkillTag(projectDir, dir, id),
+    toggleTag: (id) => toggleSkillTag(projectDir, dir, id),
+    updateTag: (id, patch) => updateSkillTag(projectDir, id, patch),
+    deleteTag: (id) => deleteSkillTag(projectDir, id),
+    countWithTag: (id) => countSkillsWithTag(projectDir, id),
+  };
+  return <TagEditor x={x} y={y} onClose={onClose} model={model} />;
+}
+
+/** Skill 面板：上架/下架管理 + 集合模板 + 独立标签/筛选（工作区级）。 */
 export default function SkillPanel({ projectDir }: { projectDir: string }) {
   const [skills, setSkills] = useState<ManagedSkill[]>([]);
   const [q, setQ] = useState("");
   const [err, setErr] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null); // 应用模板的 warnings 提示
+  const [note, setNote] = useState<string | null>(null);
   const [favs, setFavs] = useState<string[]>(() => loadFavs(projectDir));
   const [templates, setTemplates] = useState<SkillTemplate[]>(() => loadTemplates(projectDir));
   const [activeId, setActiveId] = useState<string | null>(() => loadActiveTemplate(projectDir));
@@ -60,6 +122,29 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
   const [root, setRoot] = useState(DEFAULT_SKILL_ROOT);
   const [rootFound, setRootFound] = useState(false);
   const [candidates, setCandidates] = useState<string[]>([]);
+  // canonical 模式(plan-5):工作区含 .htyworkflows → 数据源/启停/模板走 htyenv 命令,绝不 rename 生成物
+  const [canonical, setCanonical] = useState(false);
+  const tagStore = useSkillTagStore(projectDir);
+  const vocab = tagStore.vocab;
+  const [menu, setMenu] = useState<{ x: number; y: number; s: ManagedSkill } | null>(null);
+  const [tagEditor, setTagEditor] = useState<{ x: number; y: number; s: ManagedSkill } | null>(null);
+  const [filterOpen, setFilterOpen] = useState(false);
+  const filterMask = useMaskDismiss(() => setFilterOpen(false));
+  const [selectedTagIds, setSelectedTagIds] = useState<string[]>(() =>
+    getWsState<string[]>(FILTER_KEY, projectDir, []),
+  );
+  useEffect(() => setSelectedTagIds(getWsState<string[]>(FILTER_KEY, projectDir, [])), [projectDir]);
+  const setFilter = (ids: string[]) => {
+    setSelectedTagIds(ids);
+    setWsState(FILTER_KEY, projectDir, ids);
+  };
+  const toggleFilter = (id: string) =>
+    setFilter(selectedTagIds.includes(id) ? selectedTagIds.filter((x) => x !== id) : [...selectedTagIds, id]);
+  const effectiveTagIds = useMemo(
+    () => selectedTagIds.filter((id) => vocab.some((t) => t.id === id)),
+    [selectedTagIds, vocab],
+  );
+
   let downRel = ".claude/downtime/skills";
   try {
     downRel = downtimeRelFromSkillsRel(root);
@@ -72,15 +157,37 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
       .then(setSkills)
       .catch((e) => setErr(String(e)));
 
+  // canonical 列表 → ManagedSkill 形状(dir=id 稳定标识,收藏/标签/模板全兼容)
+  const reloadCanonical = () =>
+    htyenvWorkspaceSkills(projectDir)
+      .then((list) =>
+        setSkills(
+          list.map((s) => ({
+            name: s.name,
+            description: s.description ?? "",
+            dir: s.id,
+            invoke: "/" + s.name,
+            path: s.path,
+            enabled: s.enabled,
+          })),
+        ),
+      )
+      .catch((e) => setErr(String(e)));
+
   const resolveAndLoad = () => {
-    const cands = loadSkillRoots(projectDir);
-    setCandidates(cands);
     setErr(null);
-    resolveActiveSkillRoot(projectDir, cands)
-      .then((r) => {
-        setRoot(r.active);
-        setRootFound(r.found);
-        return reload(r.active);
+    htyenvStatus(projectDir)
+      .then((st) => {
+        const isCanonical = st.present && st.manifestPresent && !st.manifestError;
+        setCanonical(isCanonical);
+        if (isCanonical) return reloadCanonical();
+        const cands = loadSkillRoots(projectDir);
+        setCandidates(cands);
+        return resolveActiveSkillRoot(projectDir, cands).then((r) => {
+          setRoot(r.active);
+          setRootFound(r.found);
+          return reload(r.active);
+        });
       })
       .catch((e) => setErr(String(e)));
   };
@@ -93,13 +200,7 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
     setTemplates(loadTemplates(projectDir));
     setActiveId(loadActiveTemplate(projectDir));
     listen("skills-changed", () => {
-      resolveActiveSkillRoot(projectDir, loadSkillRoots(projectDir))
-        .then((r) => {
-          setRoot(r.active);
-          setRootFound(r.found);
-          return reload(r.active);
-        })
-        .catch((e) => setErr(String(e)));
+      resolveAndLoad();
     }).then((u) => {
       if (disposed) u();
       else un = u;
@@ -121,26 +222,29 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
       return next;
     });
 
-  // 单个上架/下架 → 操作后重载；集合已偏离模板 → 清空 active 标记（自定义态）
   const toggleEnabled = async (s: ManagedSkill) => {
     try {
-      await setSkillEnabled(projectDir, s.dir, !s.enabled, root);
+      if (canonical) await htyenvSetSkillEnabled(projectDir, s.dir, !s.enabled);
+      else await setSkillEnabled(projectDir, s.dir, !s.enabled, root);
       setActiveId(null);
       saveActiveTemplate(projectDir, null);
-      reload(root);
+      if (canonical) reloadCanonical();
+      else reload(root);
     } catch (e) {
       setNote(String(e));
     }
   };
 
-  // 应用模板：模板内全上架、其余全下架
   const applyTpl = async (t: SkillTemplate) => {
     setNote(null);
     try {
-      const warnings = await applySkillTemplate(projectDir, t.skillDirs, root);
+      const warnings = canonical
+        ? (await htyenvApplyEnabledSet(projectDir, t.skillDirs))[1]
+        : await applySkillTemplate(projectDir, t.skillDirs, root);
       setActiveId(t.id);
       saveActiveTemplate(projectDir, t.id);
-      reload(root);
+      if (canonical) reloadCanonical();
+      else reload(root);
       if (warnings.length)
         setNote(`已应用「${t.name}」，但 ${warnings.length} 项未处理：${warnings.join("；")}`);
     } catch (e) {
@@ -149,10 +253,17 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
   };
 
   const favSet = useMemo(() => new Set(favs), [favs]);
+  // 搜索：仅名/描述（不含标签名）；标签走下方筛选器（OR）
   const filtered = useMemo(() => {
-    if (!q.trim()) return skills;
-    return skills.filter((s) => searchMatch(q, s.name, s.description));
-  }, [skills, q]);
+    return skills.filter((s) => {
+      if (q.trim() && !searchMatch(q, s.name, s.description)) return false;
+      if (effectiveTagIds.length > 0) {
+        const ids = getSkillTagIds(projectDir, s.dir);
+        if (!effectiveTagIds.some((tid) => ids.includes(tid))) return false;
+      }
+      return true;
+    });
+  }, [skills, q, effectiveTagIds, projectDir, tagStore]);
   const enabled = filtered.filter((s) => s.enabled);
   const disabled = filtered.filter((s) => !s.enabled);
   const favEnabled = enabled.filter((s) => favSet.has(s.dir));
@@ -165,7 +276,15 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
         toggleEnabled(s);
       }}
       onMouseDown={(e) => e.stopPropagation()}
-      title={s.enabled ? `下架（移至 ${downRel}）` : `上架（移回 ${root}）`}
+      title={
+        canonical
+          ? s.enabled
+            ? "下架（登记 enabled=false,删各端薄壳;canonical 不动）"
+            : "上架（登记 enabled=true,重生成各端薄壳）"
+          : s.enabled
+            ? `下架（移至 ${downRel}）`
+            : `上架（移回 ${root}）`
+      }
       className={
         "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold " +
         (s.enabled
@@ -185,7 +304,33 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
       </div>
     </>
   );
-  // 单张已上架卡片（收藏区 / 已上架区共用，避免重复）
+  const skillChips = (s: ManagedSkill) => {
+    const cardTags = getSkillTags(projectDir, s.dir);
+    if (cardTags.length === 0) return undefined;
+    return (
+      <div className="mt-1 flex flex-wrap gap-1">
+        {cardTags.map((t) => (
+          <span
+            key={t.id}
+            className="inline-flex items-center gap-1 rounded-[4px] border px-1 py-px text-[10px] font-semibold"
+            style={{
+              color: tagDot(t.color),
+              borderColor: tagDot(t.color) + "66",
+              backgroundColor: tagDot(t.color) + "22",
+            }}
+          >
+            <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: tagDot(t.color) }} />
+            {t.name}
+          </span>
+        ))}
+      </div>
+    );
+  };
+  const openCtx = (s: ManagedSkill) => (e: React.MouseEvent) => {
+    e.preventDefault();
+    setMenu({ x: e.clientX, y: e.clientY, s });
+  };
+
   const enabledCard = (s: ManagedSkill) => (
     <InfoCard
       key={s.path}
@@ -193,6 +338,8 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
       hoverEnabled={hoverPreview}
       favorite={{ active: favSet.has(s.dir), onToggle: () => toggleFav(s.dir) }}
       trailing={enableBtn(s)}
+      chips={skillChips(s)}
+      onContextMenu={openCtx(s)}
       onDragStart={(e) => {
         e.dataTransfer.setData(
           "application/x-htybox-item",
@@ -208,40 +355,39 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
 
   return (
     <div className="flex h-full flex-col bg-[var(--surface)]">
-      {/* 模板栏：当前模板 → 下拉切换；⚙ 管理 */}
       <div className="flex items-center gap-1 px-2.5 pt-1.5 pb-1">
         <div className="relative min-w-0 flex-1">
-        <button
-          onClick={() => setShowPicker((v) => !v)}
-          title="切换模板"
-          className="flex w-full items-center gap-1.5 rounded-full bg-[var(--surface-hover)] px-3 py-1 text-[11px] font-semibold text-[var(--text-deep)] hover:bg-[var(--border-soft)]"
-        >
-          <svg
-            className="h-3 w-3 shrink-0 text-[var(--accent)]"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
+          <button
+            onClick={() => setShowPicker((v) => !v)}
+            title="切换模板"
+            className="flex w-full items-center gap-1.5 rounded-full bg-[var(--surface-hover)] px-3 py-1 text-[11px] font-semibold text-[var(--text-deep)] hover:bg-[var(--border-soft)]"
           >
-            <path d="M4 6h16M4 12h16M4 18h10" />
-          </svg>
-          <span className="min-w-0 flex-1 truncate text-left">
-            {activeTpl ? activeTpl.name || "（未命名）" : "未选择模板"}
-          </span>
-          <svg
-            className="h-3 w-3 shrink-0 text-[var(--text-3)]"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <path d="m6 9 6 6 6-6" />
-          </svg>
-        </button>
+            <svg
+              className="h-3 w-3 shrink-0 text-[var(--accent)]"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M4 6h16M4 12h16M4 18h10" />
+            </svg>
+            <span className="min-w-0 flex-1 truncate text-left">
+              {activeTpl ? activeTpl.name || "（未命名）" : "未选择模板"}
+            </span>
+            <svg
+              className="h-3 w-3 shrink-0 text-[var(--text-3)]"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </button>
           {showPicker && (
             <TemplatePicker
               templates={templates}
@@ -262,12 +408,161 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
       </div>
       <div className="px-2.5 pb-2">
         <SearchBox value={q} onChange={setQ} placeholder="搜索本工作区 skill…" />
+        {vocab.length > 0 && (
+          <div className="relative mt-1.5">
+            <button
+              onClick={() => setFilterOpen((v) => !v)}
+              className={
+                "flex w-full items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11.5px] transition-colors " +
+                (effectiveTagIds.length > 0
+                  ? "border-[var(--accent-border)] bg-[var(--accent)]/10 text-[var(--text)]"
+                  : "border-[var(--border)] bg-[var(--elevated)] text-[var(--text-2)] hover:bg-[var(--surface-soft)]")
+              }
+            >
+              <svg
+                className="h-3.5 w-3.5 shrink-0 text-[var(--text-2)]"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M3 5h18l-7 8v6l-4-2v-4z" />
+              </svg>
+              {effectiveTagIds.length === 0 ? (
+                <>
+                  <span>标签筛选</span>
+                  <span className="ml-auto text-[10px] text-[var(--text-3)]">点击多选</span>
+                </>
+              ) : (
+                <>
+                  {(() => {
+                    const sel = vocab.filter((t) => selectedTagIds.includes(t.id));
+                    const shown = sel.slice(0, 3);
+                    const rest = sel.length - shown.length;
+                    return (
+                      <span className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
+                        {shown.map((t) => (
+                          <span key={t.id} className="inline-flex shrink-0 items-center gap-1">
+                            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: tagDot(t.color) }} />
+                            {t.name}
+                          </span>
+                        ))}
+                        {rest > 0 && (
+                          <span className="shrink-0 text-[10px] font-semibold text-[var(--text-3)]">…+{rest}</span>
+                        )}
+                      </span>
+                    );
+                  })()}
+                  <span
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setFilter([]);
+                    }}
+                    title="清除筛选"
+                    className="shrink-0 px-0.5 leading-none text-[var(--text-3)] hover:text-[var(--text)]"
+                  >
+                    ✕
+                  </span>
+                </>
+              )}
+              <svg
+                className={
+                  "h-3 w-3 shrink-0 text-[var(--text-3)] transition-transform " + (filterOpen ? "rotate-180" : "")
+                }
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </button>
+            {filterOpen && (
+              <>
+                <div className="fixed inset-0 z-[60]" {...filterMask} />
+                <div className="absolute top-full right-0 left-0 z-[61] mt-1 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--elevated)] py-1 shadow-xl">
+                  <div className="flex items-center justify-between px-3 py-1">
+                    <span className="text-[10px] font-bold tracking-wide text-[var(--text-2)]">按标签筛选</span>
+                    <span className="text-[10px] text-[var(--text-3)]">任一匹配 · OR</span>
+                  </div>
+                  <div className="my-1 border-t border-[var(--border-soft)]" />
+                  {vocab.map((t) => {
+                    const on = selectedTagIds.includes(t.id);
+                    const count = skills.filter((s) => getSkillTagIds(projectDir, s.dir).includes(t.id)).length;
+                    return (
+                      <button
+                        key={t.id}
+                        onClick={() => toggleFilter(t.id)}
+                        className={
+                          "flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11.5px] " +
+                          (on ? "bg-[var(--accent)]/5" : "hover:bg-[var(--surface)]")
+                        }
+                      >
+                        <span
+                          className={
+                            "flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border " +
+                            (on
+                              ? "border-[var(--accent)] bg-[var(--accent)]"
+                              : "border-[var(--border)] bg-[var(--elevated)]")
+                          }
+                        >
+                          {on && (
+                            <svg
+                              className="h-2.5 w-2.5 text-white"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="3.5"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            >
+                              <path d="M20 6 9 17l-5-5" />
+                            </svg>
+                          )}
+                        </span>
+                        <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: tagDot(t.color) }} />
+                        <span className="min-w-0 flex-1 truncate text-[var(--text-deep)]">{t.name}</span>
+                        <span className="shrink-0 text-[10px] text-[var(--text-3)]">{count}</span>
+                      </button>
+                    );
+                  })}
+                  <div className="my-1 border-t border-[var(--border-soft)]" />
+                  <div className="flex items-center justify-between px-3 py-0.5">
+                    <button
+                      onClick={() => setFilter([])}
+                      className="text-[10.5px] text-[var(--accent-text)] hover:underline"
+                    >
+                      清除全部
+                    </button>
+                    <span className="text-[10px] text-[var(--text-3)]">已选 {effectiveTagIds.length}</span>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
         <div className="mt-1 px-0.5 text-[10px] leading-relaxed text-[var(--text-3)]">
-          激活根{" "}
-          <code className="text-[var(--text-2)]">{root}</code>
-          {rootFound ? "" : "（候选目录均未发现，已回退首项）"}
-          {candidates.length > 1 && (
-            <span className="text-[var(--text-3)]"> · 候选 {candidates.length}</span>
+          {canonical ? (
+            <>
+              <span className="mr-1 rounded border border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-1 py-px font-semibold text-[var(--accent-text)]">
+                canonical
+              </span>
+              真源 <code className="text-[var(--text-2)]">.htyworkflows/skills</code>
+              （上下架=登记元数据+薄壳增删）
+            </>
+          ) : (
+            <>
+              激活根{" "}
+              <code className="text-[var(--text-2)]">{root}</code>
+              {rootFound ? "" : "（候选目录均未发现，已回退首项）"}
+              {candidates.length > 1 && (
+                <span className="text-[var(--text-3)]"> · 候选 {candidates.length}</span>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -293,7 +588,9 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
             </span>
           </div>
         )}
-        {/* 收藏（已上架中被收藏的，单独成区，带 ❤ 标题 + 分隔线） */}
+        {!err && skills.length > 0 && filtered.length === 0 && (
+          <div className="px-1 pt-6 text-center text-[11px] text-[var(--text-3)]">无匹配 skill</div>
+        )}
         {favEnabled.length > 0 && (
           <div className="mb-2">
             <div className="flex items-center gap-1.5 px-1 pt-1 pb-1.5 text-[10px] font-semibold tracking-wider text-[var(--text-3)] uppercase">
@@ -325,6 +622,8 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
                   hoverEnabled={hoverPreview}
                   dimmed
                   trailing={enableBtn(s)}
+                  chips={skillChips(s)}
+                  onContextMenu={openCtx(s)}
                   preview={preview(s)}
                 />
               ))}
@@ -339,6 +638,27 @@ export default function SkillPanel({ projectDir }: { projectDir: string }) {
           templates={templates}
           onClose={() => setShowTpl(false)}
           onChange={(list) => setTemplates(list)}
+        />
+      )}
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          items={[{ id: "tags", label: "标签…" }]}
+          onAction={(id) => {
+            if (id === "tags") setTagEditor({ x: menu.x, y: menu.y, s: menu.s });
+          }}
+          onClose={() => setMenu(null)}
+        />
+      )}
+      {tagEditor && (
+        <SkillTagEditorHost
+          projectDir={projectDir}
+          dir={tagEditor.s.dir}
+          name={tagEditor.s.name}
+          x={tagEditor.x}
+          y={tagEditor.y}
+          onClose={() => setTagEditor(null)}
         />
       )}
     </div>

@@ -5,10 +5,12 @@ import {
   exportMemoryArchive,
   importMemoryArchive,
   inspectMemoryArchive,
+  listCanonicalMemoryTree,
   listMemoryTree,
   type MemoryImportPreview,
   type MemoryNode,
 } from "../catalog";
+import { htyenvStatus } from "../htyenv";
 import SearchBox from "./ui/SearchBox";
 import InfoCard from "./ui/InfoCard";
 import ConfirmModal from "./ui/ConfirmModal";
@@ -82,6 +84,12 @@ export default function MemoryPanel({
 }) {
   const [tree, setTree] = useState<MemoryNode[]>([]);
   const [q, setQ] = useState("");
+  // canonical 双源(plan-5 决策 2A/3A):curated=策展记忆(权威,默认可设) / cache=Claude 产品缓存(只读参考)
+  const [canonical, setCanonical] = useState(false);
+  const defaultSource = useSettings().htyenvDefaultMemorySource;
+  const [source, setSource] = useState<"curated" | "cache">(defaultSource);
+  // 展开态按 tab 分桶(策展 tab 独立 scope,产品缓存沿用旧 scope 兼容既有持久化)
+  const expScope = source === "curated" ? slug + "::curated" : slug;
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(getWsState<string[]>(MEXP_KEY, slug, [])));
   const loadSeq = useRef(0);
   const transferGeneration = useRef(0);
@@ -103,7 +111,15 @@ export default function MemoryPanel({
       return seq === loadSeq.current ? "ok" : "stale";
     }
     try {
-      const next = await listMemoryTree(workspacePath);
+      // canonical 检测随每次加载(工作区可能被外部初始化);失败按非 canonical 走旧链路
+      const st = await htyenvStatus(workspacePath).catch(() => null);
+      if (seq !== loadSeq.current) return "stale";
+      const isCanonical = !!st && st.present && st.manifestPresent && !st.manifestError;
+      setCanonical(isCanonical);
+      const useCurated = isCanonical && source === "curated";
+      const next = useCurated
+        ? await listCanonicalMemoryTree(workspacePath)
+        : await listMemoryTree(workspacePath);
       if (seq !== loadSeq.current) return "stale";
       setTree(next);
       return "ok";
@@ -113,13 +129,13 @@ export default function MemoryPanel({
       if (reportError) {
         setNotice({
           tone: "error",
-          message: `加载 Claude Memory 失败：${String(error)}`,
-          details: ["请检查当前工作区、Claude projects 目录权限后重试。"],
+          message: `加载${source === "curated" ? "策展记忆" : " Claude Memory "}失败：${String(error)}`,
+          details: ["请检查当前工作区、目录权限后重试。"],
         });
       }
       return "failed";
     }
-  }, [workspacePath]);
+  }, [workspacePath, source]);
 
   useLayoutEffect(() => {
     currentWorkspacePath.current = workspacePath;
@@ -130,17 +146,23 @@ export default function MemoryPanel({
     setBusy(null);
     setNotice(null);
     setPendingImport(null);
+    setSource(defaultSource); // 切工作区回默认源(决策 3A 设置项)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     return () => {
       transferGeneration.current += 1;
       busyRef.current = null;
     };
   }, [workspacePath]);
 
+  // 展开态按 tab 分桶复原(策展/缓存各自记各的)
+  useEffect(() => {
+    setExpanded(new Set(getWsState<string[]>(MEXP_KEY, expScope, [])));
+  }, [expScope]);
+
   useEffect(() => {
     let un: (() => void) | undefined;
     let disposed = false;
     void reload(false);
-    setExpanded(new Set(getWsState<string[]>(MEXP_KEY, slug, []))); // 切工作区复原展开层级
     void listen("memory-changed", () => {
       if (!disposed) void reload(true);
     })
@@ -283,7 +305,7 @@ export default function MemoryPanel({
       const n = new Set(prev);
       if (n.has(path)) n.delete(path);
       else n.add(path);
-      setWsState(MEXP_KEY, slug, [...n]); // 持久化展开态（完整复原）
+      setWsState(MEXP_KEY, expScope, [...n]); // 持久化展开态（按 tab 分桶,完整复原）
       return n;
     });
 
@@ -363,30 +385,70 @@ export default function MemoryPanel({
     <div className="flex h-full flex-col bg-[var(--surface)]">
       <div className="flex items-center gap-2 px-2.5 pt-1 pb-1.5">
         <div className="min-w-0 flex-1">
-          <div className="truncate text-[11.5px] font-semibold text-[var(--text)]">Claude Memory</div>
-          <div className="truncate text-[9px] text-[var(--text-3)]">暂不支持 Codex / Cursor</div>
+          {canonical ? (
+            <div className="flex items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--elevated)] p-0.5">
+              {(
+                [
+                  { key: "curated", label: "策展记忆" },
+                  { key: "cache", label: "产品缓存" },
+                ] as const
+              ).map((t) => (
+                <button
+                  key={t.key}
+                  onClick={() => setSource(t.key)}
+                  title={
+                    t.key === "curated"
+                      ? "权威真源 .htyworkflows/memory(注入路径对 claude/codex/cursor 都有效)"
+                      : "Claude 产品记忆缓存(只读参考;注入路径仅 claude 认权威)"
+                  }
+                  className={
+                    "flex-1 rounded-md px-2 py-0.5 text-[10.5px] font-semibold transition-colors " +
+                    (source === t.key
+                      ? "border border-[var(--accent-border-soft)] bg-[var(--accent-soft)] text-[var(--accent-text)]"
+                      : "text-[var(--text-3)] hover:text-[var(--text)]")
+                  }
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <>
+              <div className="truncate text-[11.5px] font-semibold text-[var(--text)]">Claude Memory</div>
+              <div className="truncate text-[9px] text-[var(--text-3)]">暂不支持 Codex / Cursor</div>
+            </>
+          )}
         </div>
-        <div className="flex shrink-0 items-center gap-0.5">
-          <button
-            type="button"
-            onClick={() => void chooseImport()}
-            disabled={busy !== null}
-            title="导入 Claude Memory 完整快照"
-            className="rounded-md px-1.5 py-1 text-[10.5px] font-semibold text-[var(--text-2)] hover:bg-[var(--elevated)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            导入
-          </button>
-          <button
-            type="button"
-            onClick={() => void exportAll()}
-            disabled={busy !== null}
-            title="导出 Claude Memory 完整快照"
-            className="rounded-md px-1.5 py-1 text-[10.5px] font-semibold text-[var(--text-2)] hover:bg-[var(--elevated)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            导出
-          </button>
-        </div>
+        {(!canonical || source === "cache") && (
+          <div className="flex shrink-0 items-center gap-0.5">
+            <button
+              type="button"
+              onClick={() => void chooseImport()}
+              disabled={busy !== null}
+              title="导入 Claude Memory 完整快照"
+              className="rounded-md px-1.5 py-1 text-[10.5px] font-semibold text-[var(--text-2)] hover:bg-[var(--elevated)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              导入
+            </button>
+            <button
+              type="button"
+              onClick={() => void exportAll()}
+              disabled={busy !== null}
+              title="导出 Claude Memory 完整快照"
+              className="rounded-md px-1.5 py-1 text-[10.5px] font-semibold text-[var(--text-2)] hover:bg-[var(--elevated)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              导出
+            </button>
+          </div>
+        )}
       </div>
+      {canonical && (
+        <div className="px-2.5 pb-1 text-[9px] text-[var(--text-3)]">
+          {source === "curated"
+            ? "权威真源 · 拖拽注入对 claude / codex / cursor 均有效"
+            : "Claude 产品缓存 · 只读参考(收编/裁决走仪表盘 agent记忆同步)"}
+        </div>
+      )}
       {visibleNotice && (
         <TransferNotice
           value={visibleNotice}

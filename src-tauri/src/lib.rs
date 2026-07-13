@@ -2,6 +2,7 @@ mod broker;
 mod catalog;
 mod fs_tree;
 mod host_identity;
+pub mod htyenv; // hty环境引擎:pub 供独立测试 harness/后续命令层消费(阶段构建期亦免 dead_code 噪声)
 mod memory_transfer;
 mod portable_archive;
 mod pty;
@@ -266,6 +267,353 @@ async fn list_memory_tree(project_dir: String) -> Result<Vec<catalog::MemoryNode
     tauri::async_runtime::spawn_blocking(move || catalog::scan_memory_tree(&project_dir))
         .await
         .map_err(|error| format!("Memory 树读取任务失败：{error}"))?
+}
+
+/// plan-5:列工作区 canonical 权威记忆树(.htyworkflows/memory,「策展记忆」tab 数据源)。
+#[tauri::command]
+async fn list_canonical_memory_tree(
+    project_dir: String,
+) -> Result<Vec<catalog::MemoryNode>, String> {
+    tauri::async_runtime::spawn_blocking(move || catalog::scan_canonical_memory_tree(&project_dir))
+        .await
+        .map_err(|error| format!("策展记忆树读取任务失败：{error}"))?
+}
+
+/// hty环境:识别工作区 .htyworkflows 状态(存在性/治理文件/名册三方对账),供仪表盘与就绪徽标。
+#[tauri::command]
+async fn htyenv_status(workspace: String) -> Result<htyenv::EnvStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || htyenv::detect(std::path::Path::new(&workspace)))
+        .await
+        .map_err(|error| format!("hty环境识别任务失败：{error}"))?
+}
+
+/// hty环境:只读对账(名册/skill 登记/薄壳三态/记忆四态/verify),全程零写入。
+#[tauri::command]
+async fn htyenv_check(workspace: String) -> Result<htyenv::report::SyncReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache = catalog::resolve_claude_project(&workspace)?.memory_dir;
+        htyenv::report::run(std::path::Path::new(&workspace), &cache, false)
+    })
+    .await
+    .map_err(|error| format!("hty环境对账任务失败：{error}"))?
+}
+
+/// hty环境:机械同步(manifest 跟随刷新 + 薄壳全量重生成 + 记忆补齐),并落盘 last-sync-report.md。
+#[tauri::command]
+async fn htyenv_sync(workspace: String) -> Result<htyenv::report::SyncReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache = catalog::resolve_claude_project(&workspace)?.memory_dir;
+        let ws = std::path::Path::new(&workspace);
+        let report = htyenv::report::run(ws, &cache, true)?;
+        htyenv::report::write_last_report(ws, &report)?;
+        Ok(report)
+    })
+    .await
+    .map_err(|error| format!("hty环境同步任务失败：{error}"))?
+}
+
+/// hty环境:综合校验(verify 九组 + 孤儿薄壳 + path-audit)。
+#[tauri::command]
+async fn htyenv_verify(workspace: String) -> Result<htyenv::verify::VerifyReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache = catalog::resolve_claude_project(&workspace)?.memory_dir;
+        let ws = std::path::Path::new(&workspace);
+        let manifest = htyenv::manifest::load(ws)?;
+        htyenv::verify::verify(ws, &manifest, Some(&cache))
+    })
+    .await
+    .map_err(|error| format!("hty环境校验任务失败：{error}"))?
+}
+
+/// hty环境:全局权威库状态(libraryDir 空 = 默认 config_dir/HtyBox/global-env,决策 1A 设置可配)。
+#[tauri::command]
+async fn htyenv_library_status(
+    library_dir: Option<String>,
+) -> Result<htyenv::library::LibraryStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        Ok(htyenv::library::library_status(&dir))
+    })
+    .await
+    .map_err(|error| format!("hty环境库状态任务失败：{error}"))?
+}
+
+/// hty环境:收编工程 canonical skill 进全局权威库(无冲突基线操作)。
+#[tauri::command]
+async fn htyenv_collect_skill(
+    workspace: String,
+    skill_id: String,
+    library_dir: Option<String>,
+) -> Result<htyenv::library::CollectOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::library::collect_skill(std::path::Path::new(&workspace), &dir, &skill_id)
+    })
+    .await
+    .map_err(|error| format!("hty环境收编任务失败：{error}"))?
+}
+
+/// hty环境:从全局权威库取件到工程(登记 + librarySha + 该 skill 薄壳)。
+#[tauri::command]
+async fn htyenv_fetch_skill(
+    workspace: String,
+    skill_id: String,
+    library_dir: Option<String>,
+) -> Result<htyenv::library::FetchOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::library::fetch_skill(&dir, std::path::Path::new(&workspace), &skill_id)
+    })
+    .await
+    .map_err(|error| format!("hty环境取件任务失败：{error}"))?
+}
+
+/// hty环境:初始化 dry-run(零写入,三分类清单)。
+#[tauri::command]
+async fn htyenv_init_preview(
+    workspace: String,
+    library_dir: Option<String>,
+) -> Result<htyenv::init::InitPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::init::init_preview(std::path::Path::new(&workspace), &dir)
+    })
+    .await
+    .map_err(|error| format!("hty环境初始化预览任务失败：{error}"))?
+}
+
+/// hty环境:执行初始化(幂等只增不覆;native 薄引导入保护基线)。
+#[tauri::command]
+async fn htyenv_init_execute(
+    workspace: String,
+    library_dir: Option<String>,
+) -> Result<htyenv::init::InitOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::init::init_execute(std::path::Path::new(&workspace), &dir)
+    })
+    .await
+    .map_err(|error| format!("hty环境初始化任务失败：{error}"))?
+}
+
+/// hty环境:工作区 ↔ 全局权威库谱系五态对比(零写入;库漂移仅报告)。
+#[tauri::command]
+async fn htyenv_compare(
+    workspace: String,
+    library_dir: Option<String>,
+) -> Result<htyenv::lineage::LineageReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::lineage::compare(std::path::Path::new(&workspace), &dir)
+    })
+    .await
+    .map_err(|error| format!("hty环境谱系对比任务失败：{error}"))?
+}
+
+/// hty环境:从库更新(fast-forward/基线对齐;adjudicated=裁决后以库为准)。逐项独立,一项失败不连坐。
+#[tauri::command]
+async fn htyenv_update_from_library(
+    workspace: String,
+    skill_ids: Vec<String>,
+    adjudicated: bool,
+    library_dir: Option<String>,
+) -> Result<Vec<htyenv::lineage::SyncOpResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::lineage::update_from_library(
+            std::path::Path::new(&workspace),
+            &dir,
+            &skill_ids,
+            adjudicated,
+        )
+    })
+    .await
+    .map_err(|error| format!("hty环境更新任务失败：{error}"))?
+}
+
+/// hty环境:回流到库(版本链追加/基线对齐;adjudicated=裁决后以工程为准)。逐项独立,一项失败不连坐。
+#[tauri::command]
+async fn htyenv_backflow_to_library(
+    workspace: String,
+    skill_ids: Vec<String>,
+    adjudicated: bool,
+    library_dir: Option<String>,
+) -> Result<Vec<htyenv::lineage::SyncOpResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::lineage::backflow_to_library(
+            std::path::Path::new(&workspace),
+            &dir,
+            &skill_ids,
+            adjudicated,
+        )
+    })
+    .await
+    .map_err(|error| format!("hty环境回流任务失败：{error}"))?
+}
+
+/// hty环境:生成冲突裁决指令文本(注入所选 agent 终端,plan-4 接线)。
+#[tauri::command]
+async fn htyenv_conflict_brief(
+    workspace: String,
+    skill_id: String,
+    library_dir: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::lineage::conflict_brief(std::path::Path::new(&workspace), &dir, &skill_id)
+    })
+    .await
+    .map_err(|error| format!("hty环境裁决文本任务失败：{error}"))?
+}
+
+/// hty环境仪表盘:概览聚合(plans/bugs/技术债/memory 摘要 + 最近机械同步结果)。
+#[tauri::command]
+async fn htyenv_dashboard_data(
+    workspace: String,
+    recent: Option<usize>,
+) -> Result<htyenv::dashboard::DashboardData, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        htyenv::dashboard::dashboard_data(std::path::Path::new(&workspace), recent.unwrap_or(5))
+    })
+    .await
+    .map_err(|error| format!("hty环境概览聚合任务失败：{error}"))?
+}
+
+/// hty环境仪表盘:Plans 分类页分页查询(名称/状态过滤)。
+#[tauri::command]
+async fn htyenv_list_plans(
+    workspace: String,
+    offset: usize,
+    limit: usize,
+    query: Option<String>,
+    status: Option<String>,
+) -> Result<htyenv::dashboard::DocPage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        htyenv::dashboard::list_docs(
+            std::path::Path::new(&workspace),
+            htyenv::dashboard::PLANS_DIR,
+            true,
+            offset,
+            limit,
+            query.as_deref(),
+            status.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("hty环境 Plans 查询任务失败：{error}"))?
+}
+
+/// hty环境仪表盘:Bugs 分类页分页查询。
+#[tauri::command]
+async fn htyenv_list_bugs(
+    workspace: String,
+    offset: usize,
+    limit: usize,
+    query: Option<String>,
+) -> Result<htyenv::dashboard::DocPage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        htyenv::dashboard::list_docs(
+            std::path::Path::new(&workspace),
+            htyenv::dashboard::BUGS_DIR,
+            false,
+            offset,
+            limit,
+            query.as_deref(),
+            None,
+        )
+    })
+    .await
+    .map_err(|error| format!("hty环境 Bugs 查询任务失败：{error}"))?
+}
+
+/// hty环境仪表盘:技术债分类页分页查询。
+#[tauri::command]
+async fn htyenv_list_debts(
+    workspace: String,
+    offset: usize,
+    limit: usize,
+    query: Option<String>,
+) -> Result<htyenv::dashboard::DocPage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        htyenv::dashboard::list_docs(
+            std::path::Path::new(&workspace),
+            htyenv::dashboard::DEBTS_DIR,
+            false,
+            offset,
+            limit,
+            query.as_deref(),
+            None,
+        )
+    })
+    .await
+    .map_err(|error| format!("hty环境技术债查询任务失败：{error}"))?
+}
+
+/// hty环境仪表盘:Skills 常态清单(以 canonical 真版为扫描权威)。
+#[tauri::command]
+async fn htyenv_workspace_skills(
+    workspace: String,
+) -> Result<Vec<htyenv::dashboard::WorkspaceSkillInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        htyenv::dashboard::workspace_skills(std::path::Path::new(&workspace))
+    })
+    .await
+    .map_err(|error| format!("hty环境 Skills 清单任务失败：{error}"))?
+}
+
+/// hty环境:canonical skill 上下架(plan-5 决策 1A:manifest enabled + 薄壳增删)。
+#[tauri::command]
+async fn htyenv_set_skill_enabled(
+    workspace: String,
+    skill_id: String,
+    enabled: bool,
+) -> Result<htyenv::adapters::SyncOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        htyenv::adapters::set_skill_enabled(std::path::Path::new(&workspace), &skill_id, enabled)
+    })
+    .await
+    .map_err(|error| format!("hty环境启停任务失败：{error}"))?
+}
+
+/// hty环境:canonical 模板应用(清单内启用、其余登记项停用)。返回 [outcome, warnings]。
+#[tauri::command]
+async fn htyenv_apply_enabled_set(
+    workspace: String,
+    enabled_ids: Vec<String>,
+) -> Result<(htyenv::adapters::SyncOutcome, Vec<String>), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        htyenv::adapters::apply_enabled_set(std::path::Path::new(&workspace), &enabled_ids)
+    })
+    .await
+    .map_err(|error| format!("hty环境模板应用任务失败：{error}"))?
+}
+
+/// hty环境:库 skill 清单(全局库管理视图)。
+#[tauri::command]
+async fn htyenv_library_skills(
+    library_dir: Option<String>,
+) -> Result<Vec<htyenv::library::LibrarySkillInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::library::list_library_skills(&dir)
+    })
+    .await
+    .map_err(|error| format!("hty环境库清单任务失败：{error}"))?
+}
+
+/// hty环境:从库删除 skill(登记+实体;确认交互在前端)。
+#[tauri::command]
+async fn htyenv_library_delete_skill(
+    skill_id: String,
+    library_dir: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::library::delete_library_skill(&dir, &skill_id)
+    })
+    .await
+    .map_err(|error| format!("hty环境库删除任务失败：{error}"))?
 }
 
 #[tauri::command]
@@ -817,6 +1165,29 @@ pub fn run() {
             list_project_skills,
             list_memories,
             list_memory_tree,
+            list_canonical_memory_tree,
+            htyenv_status,
+            htyenv_check,
+            htyenv_sync,
+            htyenv_verify,
+            htyenv_library_status,
+            htyenv_collect_skill,
+            htyenv_fetch_skill,
+            htyenv_init_preview,
+            htyenv_init_execute,
+            htyenv_compare,
+            htyenv_update_from_library,
+            htyenv_backflow_to_library,
+            htyenv_conflict_brief,
+            htyenv_dashboard_data,
+            htyenv_list_plans,
+            htyenv_list_bugs,
+            htyenv_list_debts,
+            htyenv_workspace_skills,
+            htyenv_set_skill_enabled,
+            htyenv_apply_enabled_set,
+            htyenv_library_skills,
+            htyenv_library_delete_skill,
             export_session_archive,
             import_session_archive,
             export_memory_archive,

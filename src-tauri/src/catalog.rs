@@ -854,6 +854,19 @@ pub fn scan_memory_tree(project_dir: &str) -> Result<Vec<MemoryNode>, String> {
     Ok(build_memory_nodes(&resolved.memory_dir))
 }
 
+/// 扫工作区 canonical 权威记忆为树(.htyworkflows/memory;plan-5 决策 2A「策展记忆」tab)。
+/// 复用同一隐藏规则(MEMORY.md/index_*);imports/ 为契约段 include 机制目录,同属脚手架不呈现。
+pub fn scan_canonical_memory_tree(project_dir: &str) -> Result<Vec<MemoryNode>, String> {
+    let dir = Path::new(project_dir).join(".htyworkflows").join("memory");
+    if !dir.is_dir() {
+        return Err(format!("canonical 记忆目录不存在: {}", dir.display()));
+    }
+    Ok(build_memory_nodes(&dir)
+        .into_iter()
+        .filter(|n| !(n.is_dir && n.name == "imports"))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

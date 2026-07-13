@@ -219,13 +219,21 @@ const CLICK_MODES: { key: FileClickMode; label: string; desc: string }[] = [
 
 /* ===== 分类导航（Cursor 式左导航；上次停留分类全局记忆——设置是全局概念，不按工作区） ===== */
 
-type SectionKey = "general" | "appearance" | "terminal" | "files" | "skill" | "connection";
+type SectionKey =
+  | "general"
+  | "appearance"
+  | "terminal"
+  | "files"
+  | "skill"
+  | "htyenv"
+  | "connection";
 const SECTIONS: { key: SectionKey; label: string }[] = [
   { key: "general", label: "通用" },
   { key: "appearance", label: "外观" },
   { key: "terminal", label: "终端" },
   { key: "files", label: "文件与搜索" },
   { key: "skill", label: "Skill" },
+  { key: "htyenv", label: "hty环境" },
   { key: "connection", label: "连接" },
 ];
 const SECTION_KEY = "htybox.settingsSection.v1";
@@ -723,6 +731,53 @@ export default function SettingsModal({
                       打开工作区后可在此看到真实激活标注。
                     </>
                   )}
+                </div>
+              </div>
+            )}
+            {section === "htyenv" && (
+              <div className="space-y-1">
+                <div className="rounded-lg px-3 py-2.5">
+                  <div className="text-sm font-medium text-[var(--text)]">全局权威库目录</div>
+                  <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">
+                    hty环境的通用件资产库(收编/取件/初始化均作用于此)。留空使用默认位置;
+                    可改为自管目录(如纳入 git 的路径)——迁移时请先自行搬移目录再修改此项,库身份以
+                    library-manifest.json 的 libraryId 识别。
+                  </div>
+                  <input
+                    type="text"
+                    value={s.htyenvLibraryDir}
+                    onChange={(e) => setSetting("htyenvLibraryDir", e.target.value)}
+                    placeholder={"留空 = 默认 %APPDATA%\\HtyBox\\global-env"}
+                    className="w-full rounded-md border border-[var(--border)] bg-[var(--surface-soft)] px-2.5 py-1.5 font-mono text-xs text-[var(--text)] outline-none focus:border-[var(--accent-border)]"
+                  />
+                </div>
+                <div className="rounded-lg px-3 py-2.5">
+                  <div className="text-sm font-medium text-[var(--text)]">canonical 工作区默认记忆源</div>
+                  <div className="mb-2.5 text-[11px] text-[var(--text-faint)]">
+                    含 .htyworkflows 的工作区,Memory 面板默认打开哪个 tab。策展记忆是权威真源,
+                    拖拽注入的路径对 claude / codex / cursor 都有效;产品缓存为旧习惯退路(仅 claude 认权威)。
+                  </div>
+                  <div className="flex gap-2">
+                    {(
+                      [
+                        { key: "curated", label: "策展记忆(推荐)" },
+                        { key: "cache", label: "产品缓存" },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.key}
+                        onClick={() => setSetting("htyenvDefaultMemorySource", opt.key)}
+                        className={
+                          "rounded-md border px-3 py-1.5 text-xs transition-colors " +
+                          (s.htyenvDefaultMemorySource === opt.key
+                            ? "border-[var(--accent-border)] bg-[var(--accent-soft)] font-semibold text-[var(--accent-text)]"
+                            : "border-[var(--border)] text-[var(--text-2)] hover:bg-[var(--surface-soft)]")
+                        }
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             )}

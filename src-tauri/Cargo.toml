@@ -1,6 +1,6 @@
 [package]
 name = "htybox-app"
-version = "1.7.3"
+version = "1.8.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -35,6 +35,7 @@ trash = "5"
 zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tempfile = "3.27.0"
 sha2 = "0.10.9"
+time = { version = "0.3.51", features = ["formatting"] } # htyenv: manifest generatedUtc(Rfc3339);锁 Cargo.lock 既有传递版本
 md5 = "0.8.1"
 rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled", "backup"] }
 tauri-plugin-process = "2"
