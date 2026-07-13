@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   DockviewReact,
   type DockviewApi,
@@ -45,8 +46,13 @@ import DockEditor, { disposeEditorBuf, isEditorDirty } from "./DockEditor";
 import RunConfigBar from "./RunConfigBar";
 import DockActionsMenu from "./DockActionsMenu";
 import { registerDockHost } from "../dockBus";
-import { captureSessionIds } from "../catalog";
+import { captureSessionIds, listClaudeSessions, listCodexSessions, listCursorSessions } from "../catalog";
 import { getSessionTitle, setSessionTitle, onSessionTitlesChange, splitStatusPrefix } from "../sessionTitles";
+import {
+  getNativeSessionLabel,
+  setNativeSessionLabels,
+  onNativeSessionLabelsChange,
+} from "../sessionNativeLabels";
 import { pingAgentActivity, clearTerm } from "../agentStatus";
 import ContextMenu from "./ui/ContextMenu";
 import TagEditor from "./TagEditor";
@@ -139,16 +145,66 @@ const saveSI = () => {
 };
 // 已被某终端认领的 session id（含复原沿用的），避免并发新建时多个终端抢同一个捕获结果。
 const CLAIMED_SIDS = new Set<string>(Object.values(SESSION_IDS));
+// 捕获任务按 termId 常驻：勿在 DockTerminal effect 清理时 abort（props.api 变化会重跑 effect，
+// 反复 abort → 永远认领失败 → Tab 停在 OSC 工作区名、重命名只写 CUSTOM_TITLES）。
+// 只在面板真正关闭时 abortSessionCapture。
+const CAPTURE_CTRL: Record<string, AbortController> = {};
+const CAPTURE_SINCE: Record<string, number> = {};
+
+function abortSessionCapture(termId: string): void {
+  CAPTURE_CTRL[termId]?.abort();
+  delete CAPTURE_CTRL[termId];
+  delete CAPTURE_SINCE[termId];
+}
+
+/** 把当前 cwd 下该 agent 的 list label 写入原生名缓存，供 Tab 与 Session 列表同构。 */
+async function refreshNativeLabels(agentKind: AgentKind, cwd: string): Promise<void> {
+  if (!cwd || !isAgentTerminal(agentKind)) return;
+  try {
+    const fetcher =
+      agentKind === "claude"
+        ? listClaudeSessions
+        : agentKind === "codex"
+          ? listCodexSessions
+          : listCursorSessions;
+    const list = await fetcher(cwd);
+    setNativeSessionLabels(
+      agentKind,
+      list.map((s) => ({ id: s.id, label: s.label })),
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
 // 新建 agent 终端后：轮询后端捕获该 cwd 下、启动后新生成的真实 session id，认领未占用者存入 SESSION_IDS。
 // claude/codex 都不便预分配 id（保持新建命令行干净），故新建发裸命令、此处捕获真实 id 供日后精确复原。
+// 认领窗口内【最新】未占用 id（mtime 升序列表取末个），避免绑到同 cwd 刚失败留下的僵尸会话。
 async function captureSessionId(
   termId: string,
   agentKind: AgentKind,
   cwd: string,
+  since: number,
+  signal: AbortSignal,
+  onClaimed?: (sessionId: string) => void,
 ): Promise<void> {
-  const since = Date.now() - 3000; // 略提前以容时钟/落盘时延
-  for (let i = 0; i < 8; i++) {
-    await new Promise((r) => setTimeout(r, 1500));
+  // 约 45s：Codex 冷启动 + 首条消息落盘可能慢于旧的 12s 窗口
+  for (let i = 0; i < 30; i++) {
+    if (signal.aborted) return;
+    await new Promise<void>((r) => {
+      const t = setTimeout(r, 1500);
+      const onAbort = () => {
+        clearTimeout(t);
+        r();
+      };
+      if (signal.aborted) {
+        clearTimeout(t);
+        r();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    if (signal.aborted) return;
     if (SESSION_IDS[termId]) return; // 已被设置则停
     let ids: string[] = [];
     try {
@@ -156,14 +212,57 @@ async function captureSessionId(
     } catch {
       /* ignore */
     }
-    const fresh = ids.find((id) => !CLAIMED_SIDS.has(id));
-    if (fresh) {
-      CLAIMED_SIDS.add(fresh);
-      SESSION_IDS[termId] = fresh;
-      saveSI();
-      return;
+    if (signal.aborted) return;
+    // 升序 → 从尾部找第一个未占用 = 最新
+    let fresh: string | undefined;
+    for (let j = ids.length - 1; j >= 0; j--) {
+      if (!CLAIMED_SIDS.has(ids[j])) {
+        fresh = ids[j];
+        break;
+      }
     }
+    if (!fresh) continue;
+    if (signal.aborted) return;
+    CLAIMED_SIDS.add(fresh);
+    SESSION_IDS[termId] = fresh;
+    saveSI();
+    // 捕获前若用户已用终端级名重命名 → 迁入会话自定义名，与 Session 列表联动
+    const pending = CUSTOM_TITLES[termId];
+    if (pending) {
+      setSessionTitle(agentKind, fresh, pending);
+      delete CUSTOM_TITLES[termId];
+      saveCT();
+    }
+    await refreshNativeLabels(agentKind, cwd);
+    if (signal.aborted) return;
+    onClaimed?.(fresh);
+    return;
   }
+}
+
+/** 同一 termId 只跑一个捕获任务；since 在首次启动时固定，effect 重跑不得重置窗口。 */
+function ensureSessionCapture(
+  termId: string,
+  agentKind: AgentKind,
+  cwd: string,
+  onClaimed?: (sessionId: string) => void,
+): void {
+  if (SESSION_IDS[termId]) return;
+  const existing = CAPTURE_CTRL[termId];
+  if (existing && !existing.signal.aborted) return;
+  const ac = new AbortController();
+  CAPTURE_CTRL[termId] = ac;
+  CAPTURE_SINCE[termId] ??= Date.now() - 3000;
+  void captureSessionId(
+    termId,
+    agentKind,
+    cwd,
+    CAPTURE_SINCE[termId],
+    ac.signal,
+    onClaimed,
+  ).finally(() => {
+    if (CAPTURE_CTRL[termId] === ac) delete CAPTURE_CTRL[termId];
+  });
 }
 // 每个终端最近一次 OSC 原始标题(含状态前缀)，供"会话改名"事件刷新 Tab 时复用前缀。
 // 状态前缀拆分(splitStatusPrefix)统一在 ../sessionTitles，与会话名剥离共用一套字符集（含 ✳、运行中动画 · 点等）。
@@ -187,25 +286,32 @@ const saveAL = () => {
 };
 
 // 计算并设置某终端 Tab 标题：实时状态前缀(✳/点点) + 显示名。
-// 显示名优先级：会话自定义名(与 Session 列表联动) > 终端级自定义(shell/无 session id) > 会话名(OSC 去前缀)。
+// 显示名权威（与 Session 列表同构）：会话自定义名 > 原生 label(index/首句/ai-title) >
+//   终端级自定义(捕获前重命名) >（仅无 session id 时）OSC 去前缀会话名。
 // 有身份(agent)则包成「身份（名）」；claude/codex 保留状态前缀，shell 无前缀。
 function applyTabTitle(
   termId: string,
   agentKind: AgentKind,
   api: { setTitle: (t: string) => void },
+  paramSid?: string,
 ): void {
   const isAgent = isAgentTerminal(agentKind);
   const [prefix, body] = isAgent
     ? splitStatusPrefix(LAST_OSC[termId] ?? "")
     : ["", (LAST_OSC[termId] ?? "").trim()];
-  // 记会话名(去前缀的 body)供回退；滤掉 shell 启动时的 exe 路径标题
+  // 无 sid 时记 OSC 会话名供回退；滤掉 shell 启动时的 exe 路径标题
   if (isAgent && body && !/^[a-zA-Z]:[\\/]/.test(body) && SESSION_NAMES[termId] !== body) {
     SESSION_NAMES[termId] = body;
     saveSN();
   }
-  const sid = SESSION_IDS[termId];
+  const sid = SESSION_IDS[termId] ?? paramSid;
   const custom = isAgent && sid ? getSessionTitle(agentKind, sid) : "";
-  const name = custom || CUSTOM_TITLES[termId] || body || SESSION_NAMES[termId] || "";
+  const native = isAgent && sid ? getNativeSessionLabel(agentKind, sid) : "";
+  // sid 已知后不再用 OSC body 当会话名（Codex OSC 常是工作区目录名，与列表原生名脱节）
+  const name =
+    (isAgent && sid
+      ? custom || native || CUSTOM_TITLES[termId] || ""
+      : CUSTOM_TITLES[termId] || body || SESSION_NAMES[termId] || "") || "";
   if (!name) return; // 尚无任何可显示名字 → 不覆盖默认"终端N"
   const role = AGENT_LABELS[termId];
   const shown = role ? `${role}（${name}）` : name;
@@ -304,11 +410,11 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
   const startRename = () => {
     const p = props.params as TermParams & { editorPath?: string };
     const tid = p.termId;
-    const sid = tid ? SESSION_IDS[tid] : undefined;
+    const sid = (tid ? SESSION_IDS[tid] : undefined) ?? p.sessionId;
     // 编辑"纯会话名"（不含状态前缀/身份装饰）：避免带出 ✳ 后保留导致与实时前缀重复成两份
     const pure =
       (sid && isAgentTerminal(p.agentKind)
-        ? getSessionTitle(p.agentKind, sid)
+        ? getSessionTitle(p.agentKind, sid) || getNativeSessionLabel(p.agentKind, sid)
         : "") ||
       (tid ? CUSTOM_TITLES[tid] : "") ||
       (tid ? SESSION_NAMES[tid] : "") ||
@@ -321,10 +427,17 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
     const t = draft.trim();
     if (t) {
       const p = props.params as TermParams & { editorPath?: string };
-      const sid = p.termId ? SESSION_IDS[p.termId] : undefined;
+      const sid = (p.termId ? SESSION_IDS[p.termId] : undefined) ?? p.sessionId;
       if (p.termId && sid && isAgentTerminal(p.agentKind)) {
+        // 确保 SESSION_IDS 与 params 对齐，避免只写了 updateParameters 时列表/Tab 脱节
+        if (!SESSION_IDS[p.termId]) {
+          SESSION_IDS[p.termId] = sid;
+          CLAIMED_SIDS.add(sid);
+          saveSI();
+        }
         // claude/codex/cursor 终端：写"会话自定义名"，与 Session 列表联动；OSC 状态前缀仍实时跟随（见 applyTabTitle）
         setSessionTitle(p.agentKind, sid, t);
+        applyTabTitle(p.termId, p.agentKind, props.api, sid);
       } else {
         // shell / session id 未捕获 / 编辑器面板：回退到按终端(或文件)的自定义名
         const key = p.termId ?? p.editorPath ?? props.api.id;
@@ -357,11 +470,14 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
 
   // Tab 取会话标识（与 commit() 同款）：agent 终端且 sid 已捕获才能打 tag；shell / sid 未就绪不可。
   const p2 = props.params as TermParams & { editorPath?: string };
-  const sid = p2.termId ? SESSION_IDS[p2.termId] : undefined;
+  const sid = (p2.termId ? SESSION_IDS[p2.termId] : undefined) ?? p2.sessionId;
   const canTag = !!sid && isAgentTerminal(p2.agentKind);
   const tabSessionName =
     sid && isAgentTerminal(p2.agentKind)
-      ? getSessionTitle(p2.agentKind, sid) || splitStatusPrefix(title)[1] || title
+      ? getSessionTitle(p2.agentKind, sid) ||
+        getNativeSessionLabel(p2.agentKind, sid) ||
+        splitStatusPrefix(title)[1] ||
+        title
       : title;
   return (
     <>
@@ -460,6 +576,8 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
 function DockTerminal(props: IDockviewPanelProps<TermParams>) {
   const { termId, shell, agentKind = "shell", cwd, env } = props.params;
   const ref = useRef<HTMLDivElement>(null);
+  const apiRef = useRef(props.api);
+  apiRef.current = props.api;
   // 拖入工作流但已有绑定 → 覆盖确认（覆盖=重置进度，破坏性，走确认弹窗）
   const [confirmWf, setConfirmWf] = useState<Workflow | null>(null);
   useEffect(() => {
@@ -467,8 +585,14 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     if (!c) return;
     // 复原时按 session id 精确复原（claude --resume <uuid>），否则发新建命令
     const restored = RESTORED_IDS.has(termId);
-    // claude 的 session id：复原取持久化的 SESSION_IDS；新建取 params(paramsFor 已生成并存入 SESSION_IDS)
-    const sid = SESSION_IDS[termId] ?? props.params.sessionId;
+    // layout 可能经 updateParameters 带上 sessionId，而 SESSION_IDS 偶发丢失 → 从 params 回填
+    const paramSid = props.params.sessionId;
+    if (paramSid && !SESSION_IDS[termId]) {
+      SESSION_IDS[termId] = paramSid;
+      CLAIMED_SIDS.add(paramSid);
+      saveSI();
+    }
+    const sid = SESSION_IDS[termId] ?? paramSid;
     const launch =
       !restored && props.params.launchCmd
         ? props.params.launchCmd // M9-N8：运行配置命令直接发
@@ -482,31 +606,48 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     ensureEngine(termId, shell, launch, cwd, env, agentKind);
     attachEngine(termId, c);
 
-    // 新建的空 agent 会话(非复原、非 Session 透传 id)：启动后捕获其真实 session id 供日后精确复原
+    // 新建空 agent：捕获真实 session id。任务挂在模块级，effect 重跑不得 abort。
     if (!restored && !sid && cwd && isAgentTerminal(agentKind)) {
-      void captureSessionId(termId, agentKind, cwd);
+      ensureSessionCapture(termId, agentKind, cwd, (claimed) => {
+        apiRef.current.updateParameters({ sessionId: claimed } as TermParams);
+        applyTabTitle(termId, agentKind, apiRef.current, claimed);
+      });
     }
 
     // dockview 自身的尺寸/可见性事件 → 可靠 refit（比 DOM ResizeObserver 更准；
     // 面板被显示/分屏改变时按真实列宽 fit，避免 TUI 花屏）
-    const dimSub = props.api.onDidDimensionsChange(() => refitEngine(termId));
-    const visSub = props.api.onDidVisibilityChange(() => refitEngine(termId));
+    const dimSub = apiRef.current.onDidDimensionsChange(() => refitEngine(termId));
+    const visSub = apiRef.current.onDidVisibilityChange(() => refitEngine(termId));
 
     // 程序设置终端标题(OSC)时：记下原始标题(含状态前缀)并刷新 Tab。
-    // Tab = 实时状态前缀(✳/点点) + 显示名(会话自定义名 > 终端级自定义 > 会话名)——重命名后状态前缀仍跟随。
     setEngineTitleHandler(termId, (t) => {
       const raw = t.trim();
       if (!raw) return;
       const changed = LAST_OSC[termId] !== raw;
       LAST_OSC[termId] = raw;
-      applyTabTitle(termId, agentKind, props.api);
-      // OSC 标题"活动检测"：内容真变 + 是 agent 终端 → 标记该工作区运行中（agentStatus 三态总线）
+      applyTabTitle(termId, agentKind, apiRef.current, SESSION_IDS[termId] ?? paramSid);
       if (changed && isAgentTerminal(agentKind)) pingAgentActivity(termId);
     });
-    // 会话自定义名改变(本终端在 Tab 改、或在 Session 列表改同一会话)→ 实时刷新本 Tab
-    const titleSub = onSessionTitlesChange(() => applyTabTitle(termId, agentKind, props.api));
-    // 挂载/复原时先把 Tab 摆正（用已记的自定义名/会话名；都没有则保持默认"终端N"）
-    applyTabTitle(termId, agentKind, props.api);
+    const refreshTitle = () =>
+      applyTabTitle(termId, agentKind, apiRef.current, SESSION_IDS[termId] ?? props.params.sessionId);
+    const titleSub = onSessionTitlesChange(refreshTitle);
+    const nativeSub = onNativeSessionLabelsChange(refreshTitle);
+    // Codex rollout / session_index 变更 → 重拉原生 label，首句自动命名才能进 Tab
+    let codexUnlisten: (() => void) | undefined;
+    let codexDisposed = false;
+    if (agentKind === "codex" && cwd) {
+      void listen("codex-sessions-changed", () => {
+        if (codexDisposed) return;
+        void refreshNativeLabels("codex", cwd).then(refreshTitle);
+      }).then((u) => {
+        if (codexDisposed) u();
+        else {
+          codexUnlisten = u;
+          void refreshNativeLabels("codex", cwd).then(refreshTitle);
+        }
+      });
+    }
+    applyTabTitle(termId, agentKind, apiRef.current, sid);
 
     const onDragOver = (e: DragEvent) => {
       if (e.dataTransfer?.types.includes(DRAG_MIME)) {
@@ -548,16 +689,22 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     c.addEventListener("drop", onDrop);
 
     return () => {
+      codexDisposed = true;
+      codexUnlisten?.();
       c.removeEventListener("dragover", onDragOver);
       c.removeEventListener("dragleave", onDragLeave);
       c.removeEventListener("drop", onDrop);
       dimSub.dispose();
       visSub.dispose();
       titleSub();
+      nativeSub();
+      // 故意不 abort 捕获：见 ensureSessionCapture 注释
       setEngineTitleHandler(termId, undefined);
       detachEngine(termId);
     };
-  }, [termId, shell, agentKind, cwd, props.api]);
+    // props.api 用 apiRef，不进 deps，避免 dockview 重渲染反复拆装
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [termId, shell, agentKind, cwd, env]);
   // 内边距 + 终端底色：避免 xterm 内容贴边被面板边缘裁切。
   // flex-col：xterm 宿主(flex-1，ref 仍在宿主上、RO 观察它) + 底部工作流面板；
   // 外层 relative 供 WorkflowBar 收起态浮标 absolute 定位。面板显隐引起的宿主高度变化由
@@ -727,6 +874,7 @@ export default function TerminalDock({
         }
         markTerminalClosed(termId); // M7-H：主动关闭 → 其 PTY 退出事件不当崩溃
         clearTerm(termId); // 清运行状态总线（agentStatus 三态）
+        abortSessionCapture(termId);
         // 工作区关闭中：引擎已由 disposeByPrefix 统一结束，且要保留布局/自定义名供复原 → 跳过
         if (CLOSING.has(workspaceId)) return;
         disposeEngine(termId);
@@ -748,6 +896,8 @@ export default function TerminalDock({
           saveSN();
         }
         if (SESSION_IDS[termId]) {
+          // 关闭终端释放认领，避免僵尸 CLAIMED 挡住后续同 cwd 新会话捕获
+          CLAIMED_SIDS.delete(SESSION_IDS[termId]);
           delete SESSION_IDS[termId];
           saveSI();
         }

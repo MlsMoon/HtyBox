@@ -20,6 +20,22 @@ fn is_codex_session_index(path: &Path, codex_root: &Path) -> bool {
     watch_path_key(path) == watch_path_key(&codex_root.join("session_index.jsonl"))
 }
 
+/// Codex 会话落盘 / 首条消息写入 rollout、或 session_index 更新，都应刷新 Session 列表与 Tab 原生名。
+/// `~/.codex/sessions/**/rollout-*.jsonl` 与根目录 `session_index.jsonl`。
+fn is_codex_session_watch_path(path: &Path, codex_root: &Path) -> bool {
+    if is_codex_session_index(path, codex_root) {
+        return true;
+    }
+    let path_key = watch_path_key(path);
+    let sessions_root = watch_path_key(&codex_root.join("sessions"))
+        .trim_end_matches('/')
+        .to_string();
+    if !path_key.starts_with(&format!("{sessions_root}/")) && path_key != sessions_root {
+        return false;
+    }
+    path_key.contains("/rollout-") && path_key.ends_with(".jsonl")
+}
+
 /// `projects/<slug>/memory` 本身或其任意后代才是原生 Memory 变化。
 /// 同级导入 staging/old/conflict 即使内部含 `payload/memory` 也不能暴露。
 fn is_claude_memory_path(path: &Path, projects_root: &Path) -> bool {
@@ -83,7 +99,7 @@ pub fn start(app: AppHandle) {
                 if is_claude_memory_path(&e.path, &projects_for_handler) {
                     memory = true;
                 }
-                if is_codex_session_index(&e.path, &codex_for_handler) {
+                if is_codex_session_watch_path(&e.path, &codex_for_handler) {
                     codex_sessions = true;
                 }
             }
@@ -112,8 +128,9 @@ pub fn start(app: AppHandle) {
     if let Some(memory_watch_root) = claude_memory_watch_root(&claude, &claude_projects) {
         let _ = w.watch(&memory_watch_root, RecursiveMode::Recursive);
     }
-    // Codex 自动命名或 `/rename` 会更新根目录下的索引；监听目录可兼容索引尚未创建的情况。
+    // Codex：索引(自动命名/`/rename`) + sessions 下落盘的 rollout（首条消息改 label 时 index 可能仍空）
     let _ = w.watch(&codex, RecursiveMode::NonRecursive);
+    let _ = w.watch(&codex.join("sessions"), RecursiveMode::Recursive);
 
     // 保活到进程结束：drop 会停止监听
     std::mem::forget(debouncer);
@@ -202,7 +219,10 @@ pub fn unwatch_file(path: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_memory_watch_root, is_claude_memory_path, is_codex_session_index};
+    use super::{
+        claude_memory_watch_root, is_claude_memory_path, is_codex_session_index,
+        is_codex_session_watch_path,
+    };
     use std::path::Path;
 
     #[test]
@@ -222,6 +242,29 @@ mod tests {
         ));
         assert!(!is_codex_session_index(
             Path::new(r"C:\work\.codex\session_index.jsonl"),
+            root
+        ));
+    }
+
+    #[test]
+    fn codex_rollout_and_index_both_trigger_session_refresh() {
+        let root = Path::new(r"C:\Users\tester\.codex");
+        assert!(is_codex_session_watch_path(
+            Path::new(r"C:\Users\tester\.codex\session_index.jsonl"),
+            root
+        ));
+        assert!(is_codex_session_watch_path(
+            Path::new(
+                r"C:\Users\tester\.codex\sessions\2026\07\13\rollout-2026-07-13T01-19-19-019f5a21-4d3b-7a01-b2a5-4162001b1d2e.jsonl"
+            ),
+            root
+        ));
+        assert!(!is_codex_session_watch_path(
+            Path::new(r"C:\Users\tester\.codex\state_5.sqlite"),
+            root
+        ));
+        assert!(!is_codex_session_watch_path(
+            Path::new(r"C:\Users\tester\.codex\sessions\2026\07\13\notes.txt"),
             root
         ));
     }

@@ -20,6 +20,7 @@ import SearchBox from "./ui/SearchBox";
 import ContextMenu, { MENU_SEP } from "./ui/ContextMenu";
 import TransferNotice, { type TransferNoticeValue } from "./ui/TransferNotice";
 import { getSessionTitle, setSessionTitle, onSessionTitlesChange } from "../sessionTitles";
+import { setNativeSessionLabels } from "../sessionNativeLabels";
 import { getWsState, setWsState } from "../wsState";
 import { getSessionTags, getSessionTagIds, useTagStore, clearSession, sessionKey } from "../sessionTags";
 import { tagDot } from "../tagColors";
@@ -161,7 +162,12 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
       kind === "claude" ? listClaudeSessions : kind === "codex" ? listCodexSessions : listCursorSessions;
     fetcher(root)
       .then((next) => {
-        if (seq === loadSeq.current) setList(next);
+        if (seq !== loadSeq.current) return;
+        setNativeSessionLabels(
+          kind,
+          next.map((s) => ({ id: s.id, label: s.label })),
+        );
+        setList(next);
       })
       .catch(() => {
         if (seq === loadSeq.current) {
@@ -360,7 +366,12 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
         ) : (
           <button onClick={() => resume(s)} title="复原此会话到终端" className="min-w-0 flex-1 cursor-pointer text-left">
             <div className="truncate text-[12px] text-[var(--text)]">{displayLabel(s)}</div>
-            <div className="mt-0.5 text-[10px] text-[var(--text-3)]">{new Date(s.ts).toLocaleString()}</div>
+            <div className="mt-0.5 text-[10px] text-[var(--text-3)]">
+              {new Date(s.ts).toLocaleString()}
+              <span className="ml-1.5 font-mono opacity-70" title={s.id}>
+                {s.id.slice(0, 8)}
+              </span>
+            </div>
             {(() => {
               const cardTags = getSessionTags(agentKind, s.id);
               return cardTags.length > 0 ? (

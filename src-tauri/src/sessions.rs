@@ -883,7 +883,12 @@ pub(crate) fn list_codex_sessions_in(home_dir: &Path, cwd: &str) -> Vec<SessionR
             continue;
         }
         let payload = meta.get("payload");
-        if payload.and_then(|p| p.get("cwd")).and_then(|c| c.as_str()) != Some(cwd) {
+        if payload
+            .and_then(|p| p.get("cwd"))
+            .and_then(|c| c.as_str())
+            .map(|c| same_path(c, cwd))
+            != Some(true)
+        {
             continue;
         }
         let id = payload
@@ -1387,6 +1392,7 @@ fn capture_claude_ids(cwd: &str, since_ms: i64) -> Vec<String> {
 }
 
 /// codex：扫 ~/.codex/sessions rollout，取 session_meta.payload.cwd 匹配、文件 mtime>=since 的 id，按 mtime 升序。
+/// 调用方（前端 captureSessionId）应认领返回列表中【最后一个】未占用 id（= 最新），避免绑到窗口内更早的僵尸会话。
 fn capture_codex_ids(cwd: &str, since_ms: i64) -> Vec<String> {
     let Some(h) = home() else {
         return Vec::new();
@@ -1494,9 +1500,9 @@ fn capture_cursor_ids(cwd: &str, since_ms: i64) -> Vec<String> {
 mod tests {
     use super::{
         canonical_existing_under, codex_label, cursor_bucket, cursor_label,
-        first_prompt_from_history, locate_claude_session_in, locate_codex_session_in,
-        locate_cursor_session_in, parse_codex_session_titles, validate_codex_relative_path,
-        validate_session_id, ExistingPathKind,
+        first_prompt_from_history, list_codex_sessions_in, locate_claude_session_in,
+        locate_codex_session_in, locate_cursor_session_in, parse_codex_session_titles,
+        validate_codex_relative_path, validate_session_id, ExistingPathKind,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -1967,6 +1973,22 @@ mod tests {
         assert_eq!(codex_label(Some(&native), "first prompt".into()), native);
         assert_eq!(codex_label(None, "first prompt".into()), "first prompt");
         assert_eq!(codex_label(None, String::new()), "(无标题)");
+    }
+
+    #[test]
+    fn list_codex_sessions_matches_cwd_via_same_path_not_string_eq() {
+        let ctx = test_home();
+        write_codex_rollout(&ctx, ["2026", "07", "13"], &ctx.workspace);
+
+        // 正斜杠写法与 path_text 字符串可能不同，但 canonicalize 后应同一目录
+        let slash_cwd = ctx.workspace.to_string_lossy().replace('\\', "/");
+        let listed = list_codex_sessions_in(&ctx.home, &slash_cwd);
+        assert_eq!(listed.len(), 1, "same_path 应把斜杠变体认作同一工作区");
+        assert_eq!(listed[0].id, TEST_ID);
+        assert_eq!(listed[0].label, "native title");
+
+        let other = list_codex_sessions_in(&ctx.home, &path_text(&ctx.other_workspace));
+        assert!(other.is_empty(), "其它工作区不得列入");
     }
 
     #[test]
