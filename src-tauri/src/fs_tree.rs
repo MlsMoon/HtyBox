@@ -411,28 +411,14 @@ pub fn reveal_in_explorer(path: &str) -> Result<(), String> {
 /// 读取走 PowerShell + WinForms Clipboard API（claude CLI 在 Windows 读剪贴板图片的同款做法）；
 /// 剪贴板无图片时返回 Err。**真存储在工作区内**（用户拍板：可见可管理、随项目走，同 `.htybox/`
 /// 既有数据目录），前端以 `@路径` 引用注入终端（与拖文件注入同一语义）。
-/// 每次调用顺手清理该目录中超过 48h 的旧文件（生命周期可控，不静默膨胀占盘）。
+/// 本函数由 Tauri 命令经 `spawn_blocking` 调用（勿在 UI/IPC 热路径同步跑）。
+/// 无损 PNG（`ImageFormat::Png`）；落盘成功后再清理超过 48h 的旧文件（生命周期可控）。
 pub fn save_clipboard_image(workspace_dir: &str) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let dir = Path::new(workspace_dir).join(".htybox").join("tmp");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // 顺手清理 48h 前的旧图
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        let now = std::time::SystemTime::now();
-        for e in rd.flatten() {
-            if let Ok(modified) = e.metadata().and_then(|m| m.modified()) {
-                let old = now
-                    .duration_since(modified)
-                    .map(|d| d.as_secs() > 48 * 3600)
-                    .unwrap_or(false);
-                if old {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-        }
-    }
 
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -455,6 +441,26 @@ pub fn save_clipboard_image(workspace_dir: &str) -> Result<String, String> {
     if !out.status.success() || !path.exists() {
         return Err("剪贴板中没有图片".into());
     }
+
+    // 先落盘再清理：清理失败不影响成功路径；整段仍在 worker 内，不堵 UI
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let now = std::time::SystemTime::now();
+        for e in rd.flatten() {
+            if e.path() == path {
+                continue;
+            }
+            if let Ok(modified) = e.metadata().and_then(|m| m.modified()) {
+                let old = now
+                    .duration_since(modified)
+                    .map(|d| d.as_secs() > 48 * 3600)
+                    .unwrap_or(false);
+                if old {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+
     Ok(path_str)
 }
 

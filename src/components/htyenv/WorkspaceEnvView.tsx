@@ -1,10 +1,11 @@
-// 工作区环境视图(plan-4 Step 5):左侧分类导航(计数/告警徽标) + 七分类页路由;
+// 工作区环境视图(plan-4 Step 5):左侧分类导航(计数/告警徽标) + 分类页路由;
 // 选中分类按工作区 wsState 持久化;未初始化 → 初始化引导卡(决策 3A,不读旧路径)。
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getWsState, setWsState } from "../../wsState";
 import {
   htyenvCheck,
   htyenvCompare,
+  htyenvCompletePreview,
   htyenvDashboardData,
   htyenvInitExecute,
   htyenvInitPreview,
@@ -28,10 +29,34 @@ import MemorySyncSection from "./sections/MemorySyncSection";
 import SkillsSection from "./sections/SkillsSection";
 import DocListSection from "./sections/DocListSection";
 import MemorySection from "./sections/MemorySection";
+import CompleteEnvSection from "./sections/CompleteEnvSection";
 
-export type SectionKey = "overview" | "memorySync" | "skills" | "plans" | "bugs" | "debts" | "memory";
+export type SectionKey =
+  | "overview"
+  | "envComplete"
+  | "memorySync"
+  | "skills"
+  | "plans"
+  | "bugs"
+  | "debts"
+  | "memory";
 
 const SECTION_KEY = "htybox.envdash.section.v1";
+const VALID_SECTIONS = new Set<SectionKey>([
+  "overview",
+  "envComplete",
+  "memorySync",
+  "skills",
+  "plans",
+  "bugs",
+  "debts",
+  "memory",
+]);
+
+function loadSection(wsPath: string): SectionKey {
+  const raw = getWsState<string>(SECTION_KEY, wsPath, "overview");
+  return VALID_SECTIONS.has(raw as SectionKey) ? (raw as SectionKey) : "overview";
+}
 
 export default function WorkspaceEnvView({
   ws,
@@ -40,9 +65,7 @@ export default function WorkspaceEnvView({
   ws: DashWorkspace;
   libraryDir: string;
 }) {
-  const [section, setSection] = useState<SectionKey>(() =>
-    getWsState<SectionKey>(SECTION_KEY, ws.path, "overview"),
-  );
+  const [section, setSection] = useState<SectionKey>(() => loadSection(ws.path));
   const [skillsCheckMode, setSkillsCheckMode] = useState(false);
   const [status, setStatus] = useState<EnvStatus | null>(null);
   const [check, setCheck] = useState<SyncReport | null>(null);
@@ -51,6 +74,7 @@ export default function WorkspaceEnvView({
   const [skills, setSkills] = useState<WorkspaceSkillInfo[] | null>(null);
   const [errors, setErrors] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  const [completePending, setCompletePending] = useState(0);
 
   const ready = !!status && status.present && status.manifestPresent && !status.manifestError;
 
@@ -59,13 +83,26 @@ export default function WorkspaceEnvView({
     htyenvStatus(ws.path)
       .then((s) => {
         setStatus(s);
-        if (!(s.present && s.manifestPresent && !s.manifestError)) return;
+        if (!(s.present && s.manifestPresent && !s.manifestError)) {
+          setCompletePending(0);
+          return;
+        }
         const grab = <T,>(p: Promise<T>, set: (v: T) => void, label: string) =>
           p.then(set).catch((e) => setErrors((prev) => [...prev, `${label}:${e}`]));
         grab(htyenvCheck(ws.path), setCheck, "对账");
         grab(htyenvCompare(ws.path, libraryDir), setCompare, "谱系对比");
         grab(htyenvDashboardData(ws.path), setDash, "全景聚合");
         grab(htyenvWorkspaceSkills(ws.path), setSkills, "Skill 清单");
+        htyenvCompletePreview(ws.path, libraryDir)
+          .then((p) => {
+            setCompletePending(
+              p.willCreateDirs.length +
+                p.willWriteFiles.length +
+                p.willWriteNative.length +
+                p.willFetchSkills.length,
+            );
+          })
+          .catch(() => setCompletePending(0));
       })
       .catch((e) => setErrors((prev) => [...prev, `环境识别:${e}`]));
   }, [ws.path, libraryDir]);
@@ -77,7 +114,8 @@ export default function WorkspaceEnvView({
     setDash(null);
     setSkills(null);
     setSkillsCheckMode(false);
-    setSection(getWsState<SectionKey>(SECTION_KEY, ws.path, "overview"));
+    setCompletePending(0);
+    setSection(loadSection(ws.path));
     reloadAll();
   }, [ws.path, reloadAll]);
 
@@ -137,8 +175,9 @@ export default function WorkspaceEnvView({
         { key: "bugs" as const, label: "Bugs", count: dash?.bugs.total },
         { key: "debts" as const, label: "技术债", count: dash?.debts.total },
         { key: "memory" as const, label: "Memory", count: dash?.memory.groups, unit: " 组" },
+        { key: "envComplete" as const, label: "环境补全", alert: completePending },
       ] as { key: SectionKey; label: string; count?: number; unit?: string; alert?: number }[],
-    [status, dash, memAlert, skillAlert],
+    [status, dash, memAlert, skillAlert, completePending],
   );
 
   return (
@@ -199,6 +238,13 @@ export default function WorkspaceEnvView({
             onRecheck={recheck}
             goto={pick}
             reportPath={`${ws.path}/.htyworkflows/agentsSynchronizer/last-sync-report.md`}
+          />
+        ) : section === "envComplete" ? (
+          <CompleteEnvSection
+            ws={ws}
+            libraryDir={libraryDir}
+            onDone={reloadAll}
+            onPendingChange={setCompletePending}
           />
         ) : section === "memorySync" ? (
           <MemorySyncSection ws={ws} check={check} busy={busy} onMechSync={mechSync} onRecheck={recheck} />
@@ -302,7 +348,7 @@ function InitGuide({
                 全局库:
                 {preview.library.present
                   ? `已有(${preview.library.skillCount ?? 0} 个 skill),将取件 ${preview.willFetchSkills.length} 个`
-                  : "尚未建立,初始化时自动建库(出厂纯结构)"}
+                  : "尚未建立,初始化时自动建库(含内置种子 skill)"}
               </div>
               {preview.skippedExisting.length > 0 && (
                 <div className="text-[var(--text-3)]">已存在跳过 {preview.skippedExisting.length} 项(接管态不覆盖)</div>

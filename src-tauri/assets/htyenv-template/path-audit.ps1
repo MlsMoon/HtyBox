@@ -1,5 +1,5 @@
 # path-audit.ps1 — 旧 Agent 路径语义审计：扫描 .claude/.agents 业务引用，对照 allowlist 分类
-# 违规定义：活跃能力层（canonical skills/rules/memory 索引）中出现未登记的 .claude/.agents 业务路径
+# 违规定义：活跃能力层（canonical skills/rules/memory 索引；若存在则含工程代码根如 Unity Assets）中出现未登记的 .claude/.agents 业务路径
 # 用法: .\path-audit.ps1  （退出码 0=干净, 1=有违规）
 # 豁免清单（工程特有数据的配置点）：tools/path-audit-skip.json = ["skills/x/SKILL.md", ...]（env 根相对、'/' 分隔）
 $ErrorActionPreference = 'Stop'
@@ -21,16 +21,25 @@ function Test-AllowedLine([string]$line) {
     if ($line -match '旧默认|迁移前的旧') { return $true }
     return $false
 }
-# 工程代码根（如 Unity Assets）可按工程需要在此自行追加扫描项
+# 通用扫描 + 条件追加 Unity Assets（存在才扫；豁免走 path-audit-skip.json，不硬编码工程 skill）
 $scanRoots = @(
     @{ path = "$root\.htyworkflows\skills"; mask = '*.md', '*.ps1', '*.py', '*.yaml' },
     @{ path = "$root\.htyworkflows\rules";  mask = '*.md' },
     @{ path = "$root\.htyworkflows\memory\MEMORY.md"; mask = $null }
 )
+if (Test-Path (Join-Path $root 'Assets')) {
+    $scanRoots += @{ path = "$root\Assets"; mask = '*.cs' }
+}
 $violations = New-Object System.Collections.Generic.List[string]
 foreach ($sr in $scanRoots) {
-    $items = if ($sr.mask) { Get-ChildItem $sr.path -Recurse -File -Include $sr.mask -Force -ErrorAction SilentlyContinue } else { Get-Item $sr.path }
-    foreach ($f in $items) {
+    if (-not (Test-Path $sr.path)) { continue }
+    $items = if ($null -ne $sr.mask) {
+        Get-ChildItem $sr.path -Recurse -File -Include $sr.mask -Force -ErrorAction SilentlyContinue
+    } else {
+        Get-Item $sr.path -ErrorAction SilentlyContinue
+    }
+    foreach ($f in @($items)) {
+        if ($null -eq $f) { continue }
         $rel = $f.FullName.Substring($root.Length + 1)
         if ($rel -in $skipFiles) { continue }
         $hits = Select-String -Path $f.FullName -Pattern '\.claude[/\\]|\.agents[/\\]' -ErrorAction SilentlyContinue

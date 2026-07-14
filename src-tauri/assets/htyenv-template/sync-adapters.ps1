@@ -1,5 +1,5 @@
 # sync-adapters.ps1 — 从 canonical 确定性生成两端薄适配器（.claude/skills、.agents/skills）
-# 格式契约 v1：与 HtyHubApp skillsService.buildAdapterContent 字节一致——
+# 格式契约 v1：与 HtyHubApp skillsService.buildAdapterContent / HtyBox htyenv::adapters 字节一致——
 #   适配器 = canonical SKILL.md 的 frontmatter 原字节块(含可选 BOM 与结尾换行) + "\n" + LF 模板
 # 用法:
 #   .\sync-adapters.ps1            全量生成/刷新两端适配器
@@ -7,6 +7,8 @@
 #   .\sync-adapters.ps1 -SkillId x 只处理单个 skill
 # 边界: 只写 <adapterRoot>/<id>/SKILL.md；不触碰 CLAUDE.md/AGENTS.md/settings/config；
 #       决策 6 改名的旧目录(.claude/skills/skill-creator 等旧正文)不在本工具管辖，留 Step 12 清理。
+# NTFS 注意: Windows 大小写不敏感，对已存在的 skill.md 直接 WriteAllBytes(SKILL.md)
+#           只会覆盖内容、不会改正文件名大小写；写入前必须先删除任意大小写变体。
 param([switch]$Check, [string]$SkillId)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent   # 工程根
@@ -42,6 +44,26 @@ function Build-AdapterBytes([string]$skillId, [byte[]]$canonicalRaw) {
     $tplBytes = [Text.Encoding]::UTF8.GetBytes("`n" + $template)
     if ($null -ne $fm) { return $fm + $tplBytes }
     return [Text.Encoding]::UTF8.GetBytes($template)
+}
+
+# 取目录内 skill 入口文件的真实大小写名；无则返回 $null
+function Get-SkillEntryExactName([string]$dir) {
+    if (-not (Test-Path -LiteralPath $dir)) { return $null }
+    $di = [IO.DirectoryInfo]::new($dir)
+    $f = $di.GetFiles() | Where-Object { $_.Name -match '^(?i)skill\.md$' } | Select-Object -First 1
+    if ($null -eq $f) { return $null }
+    return $f.Name
+}
+
+# 写入适配器入口：先删任意大小写变体，再以精确 SKILL.md 落盘（规避 NTFS 保旧名）
+function Write-AdapterSkillMd([string]$dst, [byte[]]$bytes) {
+    $dir = Split-Path $dst -Parent
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $di = [IO.DirectoryInfo]::new($dir)
+    foreach ($f in @($di.GetFiles() | Where-Object { $_.Name -match '^(?i)skill\.md$' })) {
+        $f.Delete()
+    }
+    [IO.File]::WriteAllBytes((Join-Path $dir 'SKILL.md'), $bytes)
 }
 
 $ids = if ($SkillId) { @($SkillId) } else {
@@ -89,6 +111,11 @@ foreach ($id in $ids) {
         $dst = Join-Path $ar "$id\SKILL.md"
         if ($Check) {
             if (-not (Test-Path $dst)) { $issues.Add("缺失适配器: $dst"); continue }
+            $exactName = Get-SkillEntryExactName (Split-Path $dst -Parent)
+            if ($exactName -cne 'SKILL.md') {
+                $issues.Add("入口文件名大小写错误(需 SKILL.md,实际=[$exactName]): $dst")
+                continue
+            }
             $cur = [IO.File]::ReadAllBytes($dst)
             if ([Convert]::ToBase64String($cur) -ne [Convert]::ToBase64String($expect)) {
                 # 区分：无生成标记 = 手改/旧正文；有标记但内容不符 = 陈旧
@@ -97,8 +124,7 @@ foreach ($id in $ids) {
                 else { $issues.Add("手改/非生成内容: $dst") }
             } else { $ok++ }
         } else {
-            New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
-            [IO.File]::WriteAllBytes($dst, $expect)
+            Write-AdapterSkillMd $dst $expect
             $written++
         }
     }

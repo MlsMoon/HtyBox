@@ -145,7 +145,7 @@ export default function GlobalEnvView({
           <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] px-4 py-3.5">
             <div className="text-[13px] font-bold">出厂结构模板 v{library.templateVersion}</div>
             <div className="mt-2 text-[11px] leading-relaxed text-[var(--text-3)]">
-              出厂纯结构——skills / memory 为空;内容由「收编」从各工程长出,初始化任意工程时随库下发。
+              出厂含结构模板 + 内置种子 skill（如迁移助手）;其余内容由「收编」从各工程长出,初始化任意工程时随库下发。
             </div>
           </div>
         )}

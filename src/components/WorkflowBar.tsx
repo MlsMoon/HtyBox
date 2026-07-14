@@ -16,6 +16,10 @@ import {
   isRunDone,
 } from "../workflowRuns";
 import ConfirmModal from "./ui/ConfirmModal";
+import {
+  beginClipboardPasteBusy,
+  endClipboardPasteBusy,
+} from "../clipboardPasteBusy";
 
 // 终端底部工作流面板：进度 strip（常驻）+ 大输入框（人工阶段自动展开 / ✎ 手动开关）+
 // 收起态右下角浮标。配色用终端暗区固定值（面板随终端底 #1f1e1d，不随奶油/暗主题切换）。
@@ -148,9 +152,11 @@ export default function WorkflowBar({ termId, cwd }: { termId: string; cwd?: str
   const pasteImageProbe = () => {
     if (!cwd) return;
     const fwd = () => {
+      beginClipboardPasteBusy();
       invoke<string>("save_clipboard_image", { workspaceDir: cwd })
         .then((p) => setAttachments((a) => [...a, p]))
-        .catch(() => {}); // 剪贴板无图 → 静默
+        .catch(() => {}) // 剪贴板无图 → 静默
+        .finally(() => endClipboardPasteBusy());
     };
     navigator.clipboard
       ?.readText()

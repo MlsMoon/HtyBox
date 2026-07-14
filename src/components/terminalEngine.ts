@@ -5,6 +5,10 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { pingAgentActivity } from "../agentStatus";
 import { attachMiddleScroll } from "../middleScroll";
 import { isAgentTerminal } from "../profiles";
+import {
+  beginClipboardPasteBusy,
+  endClipboardPasteBusy,
+} from "../clipboardPasteBusy";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -123,11 +127,13 @@ export function ensureEngine(
         if (!isAgentTerminal(agentKind)) return;
         const ws = engines.get(termId)?.cwd;
         if (!ws) return;
+        beginClipboardPasteBusy();
         invoke<string>("save_clipboard_image", { workspaceDir: ws })
           .then((p) =>
             invoke("write_terminal", { id: termId, data: "@" + p + " " }),
           )
-          .catch(() => {}); // 剪贴板无图 → 静默
+          .catch(() => {}) // 剪贴板无图 → 静默
+          .finally(() => endClipboardPasteBusy());
       };
       navigator.clipboard
         ?.readText()

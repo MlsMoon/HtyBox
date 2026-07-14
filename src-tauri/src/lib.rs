@@ -396,6 +396,34 @@ async fn htyenv_init_execute(
     .map_err(|error| format!("hty环境初始化任务失败：{error}"))?
 }
 
+/// hty环境:已初始化工程的「环境补全」dry-run(缺目录/治理文件/库 skill)。
+#[tauri::command]
+async fn htyenv_complete_preview(
+    workspace: String,
+    library_dir: Option<String>,
+) -> Result<htyenv::init::InitPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::init::complete_preview(std::path::Path::new(&workspace), &dir)
+    })
+    .await
+    .map_err(|error| format!("hty环境补全预览任务失败：{error}"))?
+}
+
+/// hty环境:执行环境补全(幂等只增不覆;刷新库种子并取件缺失 skill)。
+#[tauri::command]
+async fn htyenv_complete_execute(
+    workspace: String,
+    library_dir: Option<String>,
+) -> Result<htyenv::init::InitOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
+        htyenv::init::complete_execute(std::path::Path::new(&workspace), &dir)
+    })
+    .await
+    .map_err(|error| format!("hty环境补全任务失败：{error}"))?
+}
+
 /// hty环境:工作区 ↔ 全局权威库谱系五态对比(零写入;库漂移仅报告)。
 #[tauri::command]
 async fn htyenv_compare(
@@ -845,9 +873,12 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
 
 /// 剪贴板图片（截图等位图）存为 `<工作区>/.htybox/tmp/clip-<ts>.png`，返回绝对路径
 /// （终端/工作流输入框粘图用；剪贴板无图返回 Err）。
+/// 重活（PowerShell 读图 + PNG 落盘）走 spawn_blocking，避免同步命令堵死 UI。
 #[tauri::command]
-fn save_clipboard_image(workspace_dir: String) -> Result<String, String> {
-    fs_tree::save_clipboard_image(&workspace_dir)
+async fn save_clipboard_image(workspace_dir: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || fs_tree::save_clipboard_image(&workspace_dir))
+        .await
+        .map_err(|error| format!("剪贴板图片落盘任务失败：{error}"))?
 }
 
 /// M9：编辑器打开文件时开始监听其外部变化（变化后 emit "file-changed"）。
@@ -1175,6 +1206,8 @@ pub fn run() {
             htyenv_fetch_skill,
             htyenv_init_preview,
             htyenv_init_execute,
+            htyenv_complete_preview,
+            htyenv_complete_execute,
             htyenv_compare,
             htyenv_update_from_library,
             htyenv_backflow_to_library,

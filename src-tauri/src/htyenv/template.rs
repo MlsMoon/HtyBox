@@ -1,7 +1,7 @@
-// htyenv/template.rs —— 出厂结构模板(纯结构无内容,主题群决策 2)。
+// htyenv/template.rs —— 出厂结构模板(+ 内置种子 skill 清单)。
 // 本清单是 .htyworkflows 结构定义的**唯一权威**:bootstrap 模板目录集与 verify 第 7 组
 // "活跃写入目标"皆由此对齐(终结 BGE bootstrap/verify 两处清单漂移)。
-// 治理文件/降级脚本/文档模板经 include_str! 内嵌(决策 2A),源文件唯一编辑处为
+// 治理文件/降级脚本/文档模板/种子 skill 经 include_str! 内嵌,源文件唯一编辑处为
 // src-tauri/assets/htyenv-template/。
 use std::collections::BTreeMap;
 
@@ -9,7 +9,7 @@ use serde_json::{json, Map};
 
 use super::manifest::ProviderConfig;
 
-pub const TEMPLATE_VERSION: u32 = 1;
+pub const TEMPLATE_VERSION: u32 = 2;
 
 /// env 根下目录权威清单('/' 分隔,初始化必建;只增不删)。
 pub const TEMPLATE_DIRS: &[&str] = &[
@@ -88,6 +88,10 @@ pub const TEMPLATE_FILES: &[(&str, &str)] = &[
     ("tools/verify.ps1", include_str!("../../assets/htyenv-template/verify.ps1")),
     ("tools/path-audit.ps1", include_str!("../../assets/htyenv-template/path-audit.ps1")),
     (
+        "tools/path-audit-skip.json",
+        include_str!("../../assets/htyenv-template/path-audit-skip.json"),
+    ),
+    (
         "agentsSynchronizer/README.md",
         include_str!("../../assets/htyenv-template/agentsSynchronizer-README.md"),
     ),
@@ -136,6 +140,17 @@ fn provider(adapter_dir: &str, overlay_dir: &str, rules_entry: &str) -> Provider
         extra,
     }
 }
+
+/// 出厂内置种子 skill(随应用分发;ensure_library 装入全局权威库)。
+/// 与「用户收编长内容」并列:种子是产品内置能力,用户库仍可继续收编其它 skill。
+/// 每项 = (skill_id, &[(相对路径, 内容), ...]);入口必须含 `SKILL.md`。
+pub const SEED_SKILLS: &[(&str, &[(&str, &str)])] = &[(
+    "htyenv-native-migrate",
+    &[(
+        "SKILL.md",
+        include_str!("../../assets/htyenv-template/seed-skills/htyenv-native-migrate/SKILL.md"),
+    )],
+)];
 
 /// 出厂 manifest 骨架(skills 为空;protectedNativeConfig 由 init 按实际生成的 native 文件回填)。
 pub fn factory_manifest() -> super::manifest::WorkflowManifest {
@@ -196,5 +211,16 @@ mod tests {
             parsed.providers["claude"].extra["nativeRulesEntry"],
             ".claude/CLAUDE.md"
         );
+    }
+
+    #[test]
+    fn seed_skills_have_skill_md_and_nonempty() {
+        assert!(!SEED_SKILLS.is_empty());
+        for (id, files) in SEED_SKILLS {
+            assert!(!id.is_empty());
+            let entry = files.iter().find(|(rel, _)| *rel == "SKILL.md");
+            assert!(entry.is_some(), "{id} 缺 SKILL.md");
+            assert!(!entry.unwrap().1.is_empty(), "{id} SKILL.md 为空");
+        }
     }
 }

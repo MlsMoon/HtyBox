@@ -181,6 +181,14 @@ export const htyenvInitPreview = (workspace: string, libraryDir?: string) =>
 export const htyenvInitExecute = (workspace: string, libraryDir?: string) =>
   invoke<InitOutcome>("htyenv_init_execute", { workspace, libraryDir: libraryDir || null });
 
+/** 已初始化工程「环境补全」dry-run(缺目录/治理文件/库内新 skill)。 */
+export const htyenvCompletePreview = (workspace: string, libraryDir?: string) =>
+  invoke<InitPreview>("htyenv_complete_preview", { workspace, libraryDir: libraryDir || null });
+
+/** 执行环境补全(刷新库种子 + 只增不覆)。 */
+export const htyenvCompleteExecute = (workspace: string, libraryDir?: string) =>
+  invoke<InitOutcome>("htyenv_complete_execute", { workspace, libraryDir: libraryDir || null });
+
 /* ===== plan-3:工作区 ↔ 全局权威库双向同步 ===== */
 
 /** 谱系五态(untracked=无关联/upToDate/libraryAhead=可更新/workspaceAhead=可回流/diverged=需裁决)。 */

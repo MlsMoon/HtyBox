@@ -54,10 +54,11 @@ if (Test-Path $regPath) {
 Check ($LASTEXITCODE -eq 0) 'path-audit: 活跃层无未登记旧路径'
 
 # 7) 活跃写入目标存在
+$missingActive = 0
 foreach ($d in 'plans','plans_waitChoose','changeLog','changeLogHistory','chatContinue','handoff','docking','svg','testKPI','userTeach','runtime\logs','history\bug-records','history\tech-debt','user-real-design','memory') {
-    if (-not (Test-Path (Join-Path $w $d))) { $issues.Add("活跃写入目标缺失: $d") }
+    if (-not (Test-Path (Join-Path $w $d))) { $missingActive++; $issues.Add("活跃写入目标缺失: $d") }
 }
-Check ($issues.Count -eq $issues.Count) '活跃写入目标目录存在'   # 上循环已记录缺失
+Check ($missingActive -eq 0) '活跃写入目标目录存在' "(缺失 $missingActive)"
 
 # 8) 受保护原生文件哈希 = manifest 基线（决策 2A 铁律）
 $drift = 0

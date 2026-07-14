@@ -259,17 +259,17 @@ fn load_audit_exemptions(workspace: &Path) -> Result<BTreeSet<String>, String> {
     Ok(list.into_iter().map(|s| s.replace('\u{5C}', "/")).collect())
 }
 
-/// 路径语义审计(path-audit.ps1 同语义,扫描根为 canonical 三根;工程代码根扩展不在 V1)。
-/// 返回违规行清单("<env 相对路径>:<行号>: <截断行>")。
+/// 路径语义审计(path-audit.ps1 同语义):canonical 三根 + 若存在则扫工程 `Assets/*.cs`。
+/// 返回违规行清单("<相对路径>:<行号>: <截断行>";canonical 为 env 相对,Assets 为工程根相对)。
 pub fn path_audit(workspace: &Path, exempt_rel: &BTreeSet<String>) -> Result<Vec<String>, String> {
     let root = manifest::env_root(workspace);
-    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+    let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new(); // (path, under_env)
     let skills = root.join(manifest::SKILLS_DIR);
     if skills.is_dir() {
         for item in walkdir::WalkDir::new(&skills) {
             let item = item.map_err(|e| format!("遍历 {} 失败: {e}", skills.display()))?;
             if item.file_type().is_file() && audit_ext(&item.file_name().to_string_lossy()) {
-                targets.push(item.path().to_path_buf());
+                targets.push((item.path().to_path_buf(), true));
             }
         }
     }
@@ -280,19 +280,32 @@ pub fn path_audit(workspace: &Path, exempt_rel: &BTreeSet<String>) -> Result<Vec
             if item.file_type().is_file()
                 && item.file_name().to_string_lossy().to_lowercase().ends_with(".md")
             {
-                targets.push(item.path().to_path_buf());
+                targets.push((item.path().to_path_buf(), true));
             }
         }
     }
     let memory_index = root.join("memory").join("MEMORY.md");
     if memory_index.is_file() {
-        targets.push(memory_index);
+        targets.push((memory_index, true));
+    }
+    // 与 PS 同构:工程存在 Assets/ 时扫 *.cs(Unity 业务代码旧路径审计)
+    let assets = workspace.join("Assets");
+    if assets.is_dir() {
+        for item in walkdir::WalkDir::new(&assets) {
+            let item = item.map_err(|e| format!("遍历 {} 失败: {e}", assets.display()))?;
+            if item.file_type().is_file()
+                && item.file_name().to_string_lossy().to_lowercase().ends_with(".cs")
+            {
+                targets.push((item.path().to_path_buf(), false));
+            }
+        }
     }
 
     let mut violations = Vec::new();
-    for path in targets {
+    for (path, under_env) in targets {
+        let base = if under_env { root.as_path() } else { workspace };
         let rel = path
-            .strip_prefix(&root)
+            .strip_prefix(base)
             .map_err(|e| format!("相对化 {} 失败: {e}", path.display()))?
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())

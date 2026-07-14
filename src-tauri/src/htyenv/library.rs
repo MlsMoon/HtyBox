@@ -1,6 +1,7 @@
-// htyenv/library.rs —— 全局权威环境库(出厂纯结构,用户经"收编"长内容;主题群决策 2)。
+// htyenv/library.rs —— 全局权威环境库(出厂结构 + 内置种子 skill;用户经"收编"继续长内容)。
 // 库即普通目录(可被用户 git 管理),位置由命令层传入(设置可配,决策 1A),默认 config_dir/HtyBox/global-env。
 // 收编/取件是"无冲突基线操作":目标已存在且内容不同一律拒绝并指向 plan-3 的 diff 流程,绝不静默覆盖。
+// 内置种子(SEED_SKILLS)经 ensure_library 装入并标 bundled;用户同名收编版不被种子覆盖。
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::manifest::{self, SkillEntry};
-use super::template::TEMPLATE_VERSION;
+use super::template::{SEED_SKILLS, TEMPLATE_VERSION};
 use super::write_atomic;
 
 pub const LIBRARY_MANIFEST: &str = "library-manifest.json";
@@ -101,26 +102,159 @@ pub fn save_library(library_dir: &Path, manifest: &LibraryManifest) -> Result<()
     write_atomic(&manifest_path(library_dir), text.as_bytes())
 }
 
-/// 首启建库(幂等):目录 + skills/ + 空 library-manifest;已存在则加载返回。
+/// 首启建库(幂等):目录 + skills/ + library-manifest;已存在则加载。
+/// 随后装入/刷新出厂种子 skill(见 `ensure_seed_skills`)。
 pub fn ensure_library(library_dir: &Path) -> Result<LibraryManifest, String> {
-    if manifest_path(library_dir).is_file() {
-        return load_library(library_dir);
-    }
-    fs::create_dir_all(library_dir.join(LIBRARY_SKILLS_DIR))
-        .map_err(|e| format!("创建库目录 {} 失败: {e}", library_dir.display()))?;
-    let manifest = LibraryManifest {
-        schema_version: 1,
-        library_id: new_library_id(library_dir),
-        template_version: TEMPLATE_VERSION,
-        created_utc: manifest::now_utc_rfc3339()?,
-        skills: Vec::new(),
-        extra: Map::new(),
+    let mut manifest = if manifest_path(library_dir).is_file() {
+        load_library(library_dir)?
+    } else {
+        fs::create_dir_all(library_dir.join(LIBRARY_SKILLS_DIR))
+            .map_err(|e| format!("创建库目录 {} 失败: {e}", library_dir.display()))?;
+        let m = LibraryManifest {
+            schema_version: 1,
+            library_id: new_library_id(library_dir),
+            template_version: TEMPLATE_VERSION,
+            created_utc: manifest::now_utc_rfc3339()?,
+            skills: Vec::new(),
+            extra: Map::new(),
+        };
+        save_library(library_dir, &m)?;
+        m
     };
-    save_library(library_dir, &manifest)?;
+    let seeded = ensure_seed_skills(library_dir, &mut manifest)?;
+    if !seeded.is_empty() {
+        save_library(library_dir, &manifest)?;
+    }
     Ok(manifest)
 }
 
-/// 只读状态(不创建)。
+const BUNDLED_KEY: &str = "bundled";
+
+fn is_bundled_entry(entry: &LibrarySkillEntry) -> bool {
+    entry
+        .extra
+        .get(BUNDLED_KEY)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// 将应用内嵌的 SEED_SKILLS 装入全局库(幂等)。
+/// - 库无该 id → 安装并标记 `bundled: true`
+/// - 库有且 `bundled: true` 且 sha 不同 → 刷新为种子版(版本升级随应用下发)
+/// - 库有且非 bundled(用户收编/回流) → 不碰
+/// 返回发生写入的 skill id 列表。
+pub fn ensure_seed_skills(
+    library_dir: &Path,
+    library: &mut LibraryManifest,
+) -> Result<Vec<String>, String> {
+    let mut changed = Vec::new();
+    for (skill_id, files) in SEED_SKILLS {
+        manifest::validate_skill_id(skill_id)?;
+        let entry_bytes = files
+            .iter()
+            .find(|(rel, _)| *rel == manifest::SKILL_ENTRY)
+            .map(|(_, c)| c.as_bytes())
+            .ok_or_else(|| format!("种子 skill {skill_id} 缺 {}", manifest::SKILL_ENTRY))?;
+        let seed_sha = manifest::sha256_hex_upper(entry_bytes);
+        let existing = library.skills.iter().find(|s| s.id == *skill_id);
+        match existing {
+            Some(e) if !is_bundled_entry(e) => continue,
+            Some(e) if e.current_sha256 == seed_sha => continue,
+            _ => {}
+        }
+        let file_count = install_seed_skill_files(library_dir, skill_id, files)?;
+        let now = manifest::now_utc_rfc3339()?;
+        let mut extra = Map::new();
+        extra.insert(BUNDLED_KEY.to_string(), serde_json::json!(true));
+        if let Some(entry) = library.skills.iter_mut().find(|s| s.id == *skill_id) {
+            entry.current_sha256 = seed_sha.clone();
+            entry.file_count = file_count;
+            entry.versions.push(LibraryVersion {
+                sha256: seed_sha,
+                collected_utc: now,
+                source_workspace: None,
+                extra: {
+                    let mut v = Map::new();
+                    v.insert(BUNDLED_KEY.to_string(), serde_json::json!(true));
+                    v
+                },
+            });
+            entry.extra.insert(BUNDLED_KEY.to_string(), serde_json::json!(true));
+        } else {
+            library.skills.push(LibrarySkillEntry {
+                id: (*skill_id).to_string(),
+                current_sha256: seed_sha.clone(),
+                file_count,
+                versions: vec![LibraryVersion {
+                    sha256: seed_sha,
+                    collected_utc: now,
+                    source_workspace: None,
+                    extra: {
+                        let mut v = Map::new();
+                        v.insert(BUNDLED_KEY.to_string(), serde_json::json!(true));
+                        v
+                    },
+                }],
+                extra,
+            });
+            library.skills.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        changed.push((*skill_id).to_string());
+    }
+    Ok(changed)
+}
+
+/// 把种子文件写入库 skills/<id>/(staging 原子替换;可覆盖已有 bundled 目录)。
+fn install_seed_skill_files(
+    library_dir: &Path,
+    skill_id: &str,
+    files: &[(&str, &str)],
+) -> Result<u64, String> {
+    let dst = library_dir.join(LIBRARY_SKILLS_DIR).join(skill_id);
+    let parent = dst
+        .parent()
+        .ok_or_else(|| format!("{} 无父目录", dst.display()))?;
+    fs::create_dir_all(parent).map_err(|e| format!("创建 {} 失败: {e}", parent.display()))?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging = parent.join(format!(".htybox-seed-{nanos}"));
+    let result = (|| {
+        fs::create_dir_all(&staging)
+            .map_err(|e| format!("创建 staging 失败: {e}"))?;
+        let mut count = 0u64;
+        for (rel, content) in files {
+            let target = staging.join(rel);
+            if let Some(dir) = target.parent() {
+                fs::create_dir_all(dir)
+                    .map_err(|e| format!("创建 {} 失败: {e}", dir.display()))?;
+            }
+            fs::write(&target, content.as_bytes())
+                .map_err(|e| format!("写入 {} 失败: {e}", target.display()))?;
+            count += 1;
+        }
+        if dst.exists() {
+            let trash = parent.join(format!(".htybox-seed-trash-{nanos}"));
+            fs::rename(&dst, &trash)
+                .map_err(|e| format!("挪走旧目录失败: {e}"))?;
+            let rename_result = fs::rename(&staging, &dst);
+            let _ = fs::remove_dir_all(&trash);
+            rename_result.map_err(|e| format!("入位 {} 失败: {e}", dst.display()))?;
+        } else {
+            fs::rename(&staging, &dst)
+                .map_err(|e| format!("入位 {} 失败: {e}", dst.display()))?;
+        }
+        Ok(count)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+/// 库状态:已存在时经 ensure_library 刷新种子后再读(保证升级后内置 skill 可见)。
+/// 不存在时不建库(仍是「未就绪」状态;建库由 init/ensure 显式触发)。
 pub fn library_status(library_dir: &Path) -> LibraryStatus {
     let mut status = LibraryStatus {
         path: library_dir.display().to_string(),
@@ -131,7 +265,7 @@ pub fn library_status(library_dir: &Path) -> LibraryStatus {
         manifest_error: None,
     };
     if status.present {
-        match load_library(library_dir) {
+        match ensure_library(library_dir) {
             Ok(m) => {
                 status.library_id = Some(m.library_id);
                 status.template_version = Some(m.template_version);
@@ -421,9 +555,9 @@ pub struct LibraryVersionInfo {
     pub source_workspace: Option<String>,
 }
 
-/// 库 skill 清单(只读;按 id 升序,与 manifest 序一致)。
+/// 库 skill 清单(按 id 升序)。经 ensure_library 刷新种子后再列。
 pub fn list_library_skills(library_dir: &Path) -> Result<Vec<LibrarySkillInfo>, String> {
-    let library = load_library(library_dir)?;
+    let library = ensure_library(library_dir)?;
     let mut out = Vec::with_capacity(library.skills.len());
     for entry in &library.skills {
         manifest::validate_skill_id(&entry.id)?;
@@ -534,10 +668,76 @@ mod tests {
         let first = ensure_library(&lib).unwrap();
         let second = ensure_library(&lib).unwrap();
         assert_eq!(first.library_id, second.library_id, "二次 ensure 不得换库身份");
+        assert!(
+            first.skills.iter().any(|s| s.id == "htyenv-native-migrate"),
+            "出厂须装入迁移种子 skill"
+        );
+        assert!(is_bundled_entry(
+            first.skills.iter().find(|s| s.id == "htyenv-native-migrate").unwrap()
+        ));
         let status = library_status(&lib);
         assert!(status.present);
-        assert_eq!(status.skill_count, Some(0));
+        assert_eq!(status.skill_count, Some(SEED_SKILLS.len()));
         assert_eq!(status.template_version, Some(TEMPLATE_VERSION));
+    }
+
+    #[test]
+    fn seed_skills_skip_user_owned_and_refresh_bundled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("global-env");
+        let mut m = ensure_library(&lib).unwrap();
+        let seed_id = "htyenv-native-migrate";
+        let seed_sha = m
+            .skills
+            .iter()
+            .find(|s| s.id == seed_id)
+            .unwrap()
+            .current_sha256
+            .clone();
+
+        // 用户版(无 bundled):ensure 不得覆盖
+        let user_body = "---\nname: htyenv-native-migrate\n---\nuser edition\n";
+        let user_sha = manifest::sha256_hex_upper(user_body.as_bytes());
+        let dir = lib.join(LIBRARY_SKILLS_DIR).join(seed_id);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), user_body).unwrap();
+        if let Some(e) = m.skills.iter_mut().find(|s| s.id == seed_id) {
+            e.current_sha256 = user_sha.clone();
+            e.file_count = 1;
+            e.extra.clear(); // 去掉 bundled
+            e.versions.push(LibraryVersion {
+                sha256: user_sha.clone(),
+                collected_utc: manifest::now_utc_rfc3339().unwrap(),
+                source_workspace: Some("G:/user-ws".into()),
+                extra: Map::new(),
+            });
+        }
+        save_library(&lib, &m).unwrap();
+        let after = ensure_library(&lib).unwrap();
+        let e = after.skills.iter().find(|s| s.id == seed_id).unwrap();
+        assert_eq!(e.current_sha256, user_sha, "用户收编版不得被种子覆盖");
+        assert!(!is_bundled_entry(e));
+
+        // 恢复为 bundled 旧 sha → 应刷新回种子
+        if let Some(e) = m.skills.iter_mut().find(|s| s.id == seed_id) {
+            e.current_sha256 = "DEADBEEF".repeat(8); // 假旧哈希
+            e.extra.insert(BUNDLED_KEY.into(), serde_json::json!(true));
+        }
+        // 注意:上面 m 已是旧内存态;重载用户版后再标 bundled
+        let mut m2 = load_library(&lib).unwrap();
+        if let Some(e) = m2.skills.iter_mut().find(|s| s.id == seed_id) {
+            e.extra.insert(BUNDLED_KEY.into(), serde_json::json!(true));
+            // 保持 user_sha 与文件一致但 bundled=true → ensure 因 sha==文件? 
+            // seed_sha != user_sha → 应刷新为种子内容
+        }
+        save_library(&lib, &m2).unwrap();
+        let refreshed = ensure_library(&lib).unwrap();
+        let e2 = refreshed.skills.iter().find(|s| s.id == seed_id).unwrap();
+        assert_eq!(e2.current_sha256, seed_sha, "bundled 异版应刷新为种子");
+        assert!(is_bundled_entry(e2));
+        let live = fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        assert!(live.contains("原生 Agent 环境"), "实体须写回种子正文");
     }
 
     #[test]

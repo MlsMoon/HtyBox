@@ -180,6 +180,28 @@ pub fn init_execute(workspace: &Path, library_dir: &Path) -> Result<InitOutcome,
     Ok(outcome)
 }
 
+/// 环境补全 dry-run:仅已初始化工作区可用;清单语义与 init_preview 相同(缺什么补什么)。
+pub fn complete_preview(workspace: &Path, library_dir: &Path) -> Result<InitPreview, String> {
+    let preview = init_preview(workspace, library_dir)?;
+    if !preview.already_initialized {
+        return Err(
+            "工作区尚未初始化 hty 环境——请先在概览使用「初始化」,补全仅用于已就绪工程".into(),
+        );
+    }
+    Ok(preview)
+}
+
+/// 环境补全执行:刷新全局库种子 → 补缺目录/治理文件/库 skill 取件 → 重生薄壳。
+/// 绝不覆盖已有文件或改写 native 入口(与 init_execute 同幂等契约)。
+pub fn complete_execute(workspace: &Path, library_dir: &Path) -> Result<InitOutcome, String> {
+    if !manifest::manifest_path(workspace).is_file() {
+        return Err(
+            "工作区尚未初始化 hty 环境——请先初始化,补全仅用于已就绪工程".into(),
+        );
+    }
+    init_execute(workspace, library_dir)
+}
+
 fn upsert_protected(m: &mut manifest::WorkflowManifest, rel: &str, sha: &str) {
     let list = m.protected_native_config.get_or_insert_with(Vec::new);
     if let Some(existing) = list.iter_mut().find(|p| p.path == rel) {
@@ -237,20 +259,26 @@ mod tests {
         assert!(preview.will_write_files.contains(&manifest::MANIFEST_FILE.to_string()));
         assert_eq!(preview.will_write_native.len(), 2);
         assert!(preview.native_manual.is_empty());
-        assert_eq!(preview.will_fetch_skills, vec!["plan-create".to_string()]);
+        // ensure_library 会装入出厂种子;seed_library 再加 plan-create
+        assert!(preview.will_fetch_skills.contains(&"plan-create".to_string()));
+        assert!(preview.will_fetch_skills.contains(&"htyenv-native-migrate".to_string()));
+        assert_eq!(preview.will_fetch_skills.len(), 2);
 
         let outcome = init_execute(&ws, &lib).unwrap();
         assert_eq!(outcome.created_dirs, TEMPLATE_DIRS.len());
         assert_eq!(outcome.written_native.len(), 2);
-        assert_eq!(outcome.fetched_skills, vec!["plan-create".to_string()]);
-        assert!(outcome.written_adapters >= 2);
+        assert!(outcome.fetched_skills.contains(&"plan-create".to_string()));
+        assert!(outcome.fetched_skills.contains(&"htyenv-native-migrate".to_string()));
+        assert_eq!(outcome.fetched_skills.len(), 2);
+        assert!(outcome.written_adapters >= 4, "两端 × 2 skill");
         assert!(ws.join(".htyworkflows/rules/common.md").is_file());
         assert!(ws.join(".claude/CLAUDE.md").is_file());
         assert!(ws.join("AGENTS.md").is_file());
         assert!(ws.join(".claude/skills/plan-create/SKILL.md").is_file());
+        assert!(ws.join(".claude/skills/htyenv-native-migrate/SKILL.md").is_file());
         let m = manifest::load(&ws).unwrap();
         assert_eq!(m.protected_native_config.as_ref().unwrap().len(), 2);
-        assert_eq!(m.skills.len(), 1);
+        assert_eq!(m.skills.len(), 2);
         let report = super::super::verify::verify(&ws, &m, None).unwrap();
         let failed: Vec<_> = report.checks.iter().filter(|c| !c.passed).collect();
         assert!(report.all_passed, "全新初始化后 verify 应全绿: {failed:?}");
@@ -291,5 +319,51 @@ mod tests {
         let protected = m.protected_native_config.as_ref().unwrap();
         assert_eq!(protected.len(), 1, "仅自生成的 AGENTS.md 入基线");
         assert_eq!(protected[0].path, "AGENTS.md");
+    }
+
+    #[test]
+    fn complete_requires_initialized_then_fetches_missing_seed() {
+        let wtmp = tempfile::tempdir().unwrap();
+        let ltmp = tempfile::tempdir().unwrap();
+        let ws = wtmp.path().to_path_buf();
+        let lib = ltmp.path().join("global-env");
+
+        assert!(
+            complete_preview(&ws, &lib).unwrap_err().contains("尚未初始化"),
+            "未初始化不得走补全"
+        );
+
+        // 先普通初始化(会取走当时库内种子)
+        init_execute(&ws, &lib).unwrap();
+        let before = manifest::load(&ws).unwrap().skills.len();
+
+        // 模拟「升级后库多了用户自定义 skill」:往库塞 beta,工程尚无
+        let beta_dir = lib.join(library::LIBRARY_SKILLS_DIR).join("beta-tool");
+        fs::create_dir_all(&beta_dir).unwrap();
+        let body = "---\nname: beta-tool\n---\nB\n";
+        fs::write(beta_dir.join(manifest::SKILL_ENTRY), body).unwrap();
+        let mut lm = library::load_library(&lib).unwrap();
+        lm.skills.push(library::LibrarySkillEntry {
+            id: "beta-tool".to_string(),
+            current_sha256: manifest::sha256_hex_upper(body.as_bytes()),
+            file_count: 1,
+            versions: vec![library::LibraryVersion {
+                sha256: manifest::sha256_hex_upper(body.as_bytes()),
+                collected_utc: "2026-07-14T00:00:00Z".to_string(),
+                source_workspace: None,
+                extra: Map::new(),
+            }],
+            extra: Map::new(),
+        });
+        library::save_library(&lib, &lm).unwrap();
+
+        let preview = complete_preview(&ws, &lib).unwrap();
+        assert!(preview.already_initialized);
+        assert!(preview.will_fetch_skills.contains(&"beta-tool".to_string()));
+
+        let outcome = complete_execute(&ws, &lib).unwrap();
+        assert!(outcome.fetched_skills.contains(&"beta-tool".to_string()));
+        assert!(ws.join(".htyworkflows/skills/beta-tool/SKILL.md").is_file());
+        assert!(manifest::load(&ws).unwrap().skills.len() > before);
     }
 }
