@@ -178,19 +178,27 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   useEffect(() => {
     load(agentKind);
   }, [agentKind, load]);
-  // Codex 自动命名或 `/rename` 更新 ~/.codex/session_index.jsonl 后，后端 watcher 发事件；
+  // Claude ai-title / Codex index·rollout / Cursor meta.json 落盘后，后端 watcher 发事件；
   // Session 页签静默重拉（不置 loading，避免列表闪烁/滚动位置跳回顶部）。
   useEffect(() => {
-    if (agentKind !== "codex") return;
+    const evt =
+      agentKind === "claude"
+        ? "claude-sessions-changed"
+        : agentKind === "codex"
+          ? "codex-sessions-changed"
+          : agentKind === "cursor"
+            ? "cursor-sessions-changed"
+            : null;
+    if (!evt) return;
     let un: (() => void) | undefined;
     let disposed = false;
-    listen("codex-sessions-changed", () => {
-      if (!disposed) load("codex", true);
+    listen(evt, () => {
+      if (!disposed) load(agentKind, true);
     }).then((u) => {
       if (disposed) u();
       else {
         un = u;
-        load("codex", true); // 注册完成后补拉一次，关闭首次 load 与 listener 就绪间的丢事件窗口
+        load(agentKind, true); // 注册完成后补拉一次，关闭首次 load 与 listener 就绪间的丢事件窗口
       }
     });
     return () => {

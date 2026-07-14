@@ -1,4 +1,4 @@
-//! 监听 skill / memory / Codex 会话名索引，防抖后向前端发刷新事件（M3b）。
+//! 监听 skill / memory / Claude·Codex·Cursor 会话落盘，防抖后向前端发刷新事件（M3b）。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -34,6 +34,44 @@ fn is_codex_session_watch_path(path: &Path, codex_root: &Path) -> bool {
         return false;
     }
     path_key.contains("/rollout-") && path_key.ends_with(".jsonl")
+}
+
+/// Claude：`~/.claude/history.jsonl` 或 `projects/<slug>/<id>.jsonl`（会话转录 / ai-title）。
+/// 不含 `projects/<slug>/memory/**`（那条走 memory-changed）。
+fn is_claude_session_watch_path(path: &Path, claude_root: &Path, projects_root: &Path) -> bool {
+    if watch_path_key(path) == watch_path_key(&claude_root.join("history.jsonl")) {
+        return true;
+    }
+    let path_key = watch_path_key(path);
+    let root = watch_path_key(projects_root)
+        .trim_end_matches('/')
+        .to_string();
+    let Some(relative) = path_key.strip_prefix(&format!("{root}/")) else {
+        return false;
+    };
+    let mut parts = relative.split('/');
+    let Some(slug) = parts.next() else {
+        return false;
+    };
+    let Some(file) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() || slug.is_empty() {
+        return false;
+    }
+    file.ends_with(".jsonl")
+}
+
+/// Cursor：`~/.cursor/chats/<hash>/<chatId>/meta.json`（title / hasConversation）。
+fn is_cursor_session_watch_path(path: &Path, chats_root: &Path) -> bool {
+    let path_key = watch_path_key(path);
+    let root = watch_path_key(chats_root)
+        .trim_end_matches('/')
+        .to_string();
+    if !path_key.starts_with(&format!("{root}/")) {
+        return false;
+    }
+    path_key.ends_with("/meta.json")
 }
 
 /// `projects/<slug>/memory` 本身或其任意后代才是原生 Memory 变化。
@@ -77,9 +115,12 @@ pub fn start(app: AppHandle) {
     };
     let claude = home.join(".claude");
     let claude_projects = claude.join("projects");
+    let claude_for_handler = claude.clone();
+    let projects_for_handler = claude_projects.clone();
     let codex = home.join(".codex");
     let codex_for_handler = codex.clone();
-    let projects_for_handler = claude_projects.clone();
+    let cursor_chats = home.join(".cursor").join("chats");
+    let cursor_chats_for_handler = cursor_chats.clone();
 
     let handler_app = app.clone();
     let debouncer = new_debouncer(
@@ -90,7 +131,9 @@ pub fn start(app: AppHandle) {
             };
             let mut skills = false;
             let mut memory = false;
+            let mut claude_sessions = false;
             let mut codex_sessions = false;
+            let mut cursor_sessions = false;
             for e in &events {
                 let p = e.path.to_string_lossy().replace('\\', "/");
                 if p.contains("/.claude/skills/") || p.contains("/plugins/") {
@@ -99,8 +142,18 @@ pub fn start(app: AppHandle) {
                 if is_claude_memory_path(&e.path, &projects_for_handler) {
                     memory = true;
                 }
+                if is_claude_session_watch_path(
+                    &e.path,
+                    &claude_for_handler,
+                    &projects_for_handler,
+                ) {
+                    claude_sessions = true;
+                }
                 if is_codex_session_watch_path(&e.path, &codex_for_handler) {
                     codex_sessions = true;
+                }
+                if is_cursor_session_watch_path(&e.path, &cursor_chats_for_handler) {
+                    cursor_sessions = true;
                 }
             }
             if skills {
@@ -109,8 +162,14 @@ pub fn start(app: AppHandle) {
             if memory {
                 let _ = handler_app.emit("memory-changed", ());
             }
+            if claude_sessions {
+                let _ = handler_app.emit("claude-sessions-changed", ());
+            }
             if codex_sessions {
                 let _ = handler_app.emit("codex-sessions-changed", ());
+            }
+            if cursor_sessions {
+                let _ = handler_app.emit("cursor-sessions-changed", ());
             }
         },
     );
@@ -128,9 +187,13 @@ pub fn start(app: AppHandle) {
     if let Some(memory_watch_root) = claude_memory_watch_root(&claude, &claude_projects) {
         let _ = w.watch(&memory_watch_root, RecursiveMode::Recursive);
     }
+    // history.jsonl 在 .claude 根下；projects 已由 memory_watch_root 覆盖时仍需非递归听根目录
+    let _ = w.watch(&claude, RecursiveMode::NonRecursive);
     // Codex：索引(自动命名/`/rename`) + sessions 下落盘的 rollout（首条消息改 label 时 index 可能仍空）
     let _ = w.watch(&codex, RecursiveMode::NonRecursive);
     let _ = w.watch(&codex.join("sessions"), RecursiveMode::Recursive);
+    // Cursor：chats/<hash>/<chatId>/meta.json 的 title 更新
+    let _ = w.watch(&cursor_chats, RecursiveMode::Recursive);
 
     // 保活到进程结束：drop 会停止监听
     std::mem::forget(debouncer);
@@ -220,8 +283,8 @@ pub fn unwatch_file(path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        claude_memory_watch_root, is_claude_memory_path, is_codex_session_index,
-        is_codex_session_watch_path,
+        claude_memory_watch_root, is_claude_memory_path, is_claude_session_watch_path,
+        is_codex_session_index, is_codex_session_watch_path, is_cursor_session_watch_path,
     };
     use std::path::Path;
 
@@ -266,6 +329,73 @@ mod tests {
         assert!(!is_codex_session_watch_path(
             Path::new(r"C:\Users\tester\.codex\sessions\2026\07\13\notes.txt"),
             root
+        ));
+    }
+
+    #[test]
+    fn claude_transcript_and_history_trigger_but_memory_does_not() {
+        let claude = Path::new(r"C:\Users\tester\.claude");
+        let projects = Path::new(r"C:\Users\tester\.claude\projects");
+        assert!(is_claude_session_watch_path(
+            Path::new(r"C:\Users\tester\.claude\history.jsonl"),
+            claude,
+            projects
+        ));
+        assert!(is_claude_session_watch_path(
+            Path::new(
+                r"C:\Users\tester\.claude\projects\g--hty-workflows\2eacaf4f-6494-4801-9de5-00b23ef437fd.jsonl"
+            ),
+            claude,
+            projects
+        ));
+        assert!(is_claude_session_watch_path(
+            Path::new(
+                r"c:\users\TESTER\.claude\projects\G--hty-workflows\2eacaf4f-6494-4801-9de5-00b23ef437fd.jsonl"
+            ),
+            claude,
+            projects
+        ));
+        assert!(!is_claude_session_watch_path(
+            Path::new(r"C:\Users\tester\.claude\projects\slug\memory\topic.md"),
+            claude,
+            projects
+        ));
+        assert!(!is_claude_session_watch_path(
+            Path::new(r"C:\Users\tester\.claude\projects\slug\memory\nested.jsonl"),
+            claude,
+            projects
+        ));
+        assert!(!is_claude_session_watch_path(
+            Path::new(r"C:\Users\tester\.claude\projects\slug\notes.txt"),
+            claude,
+            projects
+        ));
+    }
+
+    #[test]
+    fn cursor_meta_under_chats_triggers_session_refresh() {
+        let chats = Path::new(r"C:\Users\tester\.cursor\chats");
+        assert!(is_cursor_session_watch_path(
+            Path::new(
+                r"C:\Users\tester\.cursor\chats\a5be933639be67a913c398fd5904e6b1\87387a73-3bbe-41f2-8fe0-46d2e6280c9b\meta.json"
+            ),
+            chats
+        ));
+        assert!(is_cursor_session_watch_path(
+            Path::new(
+                r"c:\users\TESTER\.cursor\chats\hash\chat-id\META.JSON"
+            ),
+            chats
+        ));
+        assert!(!is_cursor_session_watch_path(
+            Path::new(
+                r"C:\Users\tester\.cursor\chats\hash\chat-id\store.json"
+            ),
+            chats
+        ));
+        assert!(!is_cursor_session_watch_path(
+            Path::new(r"C:\Users\tester\.cursor\cli-config.json"),
+            chats
         ));
     }
 

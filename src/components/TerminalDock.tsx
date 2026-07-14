@@ -632,18 +632,26 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
       applyTabTitle(termId, agentKind, apiRef.current, SESSION_IDS[termId] ?? props.params.sessionId);
     const titleSub = onSessionTitlesChange(refreshTitle);
     const nativeSub = onNativeSessionLabelsChange(refreshTitle);
-    // Codex rollout / session_index 变更 → 重拉原生 label，首句自动命名才能进 Tab
-    let codexUnlisten: (() => void) | undefined;
-    let codexDisposed = false;
-    if (agentKind === "codex" && cwd) {
-      void listen("codex-sessions-changed", () => {
-        if (codexDisposed) return;
-        void refreshNativeLabels("codex", cwd).then(refreshTitle);
+    // Claude ai-title / Codex rollout·index / Cursor meta.json → 重拉原生 label，自动命名进 Tab
+    const sessionsEvt =
+      agentKind === "claude"
+        ? "claude-sessions-changed"
+        : agentKind === "codex"
+          ? "codex-sessions-changed"
+          : agentKind === "cursor"
+            ? "cursor-sessions-changed"
+            : null;
+    let sessionsUnlisten: (() => void) | undefined;
+    let sessionsDisposed = false;
+    if (sessionsEvt && cwd) {
+      void listen(sessionsEvt, () => {
+        if (sessionsDisposed) return;
+        void refreshNativeLabels(agentKind, cwd).then(refreshTitle);
       }).then((u) => {
-        if (codexDisposed) u();
+        if (sessionsDisposed) u();
         else {
-          codexUnlisten = u;
-          void refreshNativeLabels("codex", cwd).then(refreshTitle);
+          sessionsUnlisten = u;
+          void refreshNativeLabels(agentKind, cwd).then(refreshTitle);
         }
       });
     }
@@ -689,8 +697,8 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     c.addEventListener("drop", onDrop);
 
     return () => {
-      codexDisposed = true;
-      codexUnlisten?.();
+      sessionsDisposed = true;
+      sessionsUnlisten?.();
       c.removeEventListener("dragover", onDragOver);
       c.removeEventListener("dragleave", onDragLeave);
       c.removeEventListener("drop", onDrop);
