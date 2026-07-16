@@ -26,6 +26,8 @@ export interface Bookmark {
   id: string;
   title: string; // 可空
   body: string; // 可空
+  /** 工作区 `.htybox/bookmarks/` 下图片绝对路径；缺字段/旧数据视为 [] */
+  images: string[];
   color: BookmarkColorKey;
   important: boolean;
   createdAt: number;
@@ -39,10 +41,28 @@ const LEGACY_KEY = "htybox.bookmarks.v1";
 // 空数组共享常量：getBookmarks 对无书签的 scope 返回它，保证 useSyncExternalStore 快照引用稳定。
 const EMPTY: Bookmark[] = [];
 
+/** 旧数据缺 images 字段 → []；过滤非字符串项。 */
+function normalizeBookmark(raw: Bookmark): Bookmark {
+  const images = Array.isArray(raw.images)
+    ? raw.images.filter((p): p is string => typeof p === "string" && !!p)
+    : [];
+  return { ...raw, images };
+}
+
+function normalizeStore(raw: Record<string, Bookmark[]>): Record<string, Bookmark[]> {
+  const out: Record<string, Bookmark[]> = {};
+  for (const [scope, list] of Object.entries(raw)) {
+    out[scope] = Array.isArray(list) ? list.map(normalizeBookmark) : [];
+  }
+  return out;
+}
+
 function load(): Record<string, Bookmark[]> {
   try {
     const v = JSON.parse(localStorage.getItem(KEY) || "null");
-    if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, Bookmark[]>;
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      return normalizeStore(v as Record<string, Bookmark[]>);
+    }
     // v2 缺失 → 从 v1 一次性迁移：按旧展示序（星标置顶 + updatedAt 降序）固化数组序，升级前后肉眼顺序一致
     const legacy = JSON.parse(localStorage.getItem(LEGACY_KEY) || "null");
     if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
@@ -53,8 +73,9 @@ function load(): Record<string, Bookmark[]> {
           return b.updatedAt - a.updatedAt;
         });
       }
-      localStorage.setItem(KEY, JSON.stringify(migrated));
-      return migrated;
+      const normalized = normalizeStore(migrated);
+      localStorage.setItem(KEY, JSON.stringify(normalized));
+      return normalized;
     }
   } catch {
     /* localStorage 不可用 / 损坏 → 降级空对象 */
@@ -92,6 +113,7 @@ export function getBookmarks(scope: string): Bookmark[] {
 export interface BookmarkInput {
   title: string;
   body: string;
+  images: string[];
   color: BookmarkColorKey;
   important: boolean;
 }
@@ -170,11 +192,19 @@ export function sortedBookmarks(list: Bookmark[]): Bookmark[] {
   return [...list.filter((b) => b.important), ...list.filter((b) => !b.important)];
 }
 
-// —— 显示 / 复制 / 注入 文本规则（标题、内容均可空，见计划决策 7）——
-/** 卡片单行显示：标题优先，无标题则内容。 */
-export const displayText = (b: Bookmark): string => b.title.trim() || b.body.trim();
-/** 复制：内容非空复制内容，内容空复制标题。 */
-export const copyTextOf = (b: Bookmark): string => (b.body.trim() ? b.body : b.title);
-/** 注入：标题、内容中非空者拼接（都在则「标题\n内容」），换行由 injectText 压成单行。 */
-export const injectTextOf = (b: Bookmark): string =>
-  [b.title, b.body].map((s) => s.trim()).filter(Boolean).join("\n");
+// —— 显示 / 复制 / 注入 文本规则（标题、内容均可空；有图可纯图，见计划决策 3/4）——
+/** 卡片单行显示：标题优先，无标题则内容；皆空有图 →「（图片）」。 */
+export const displayText = (b: Bookmark): string =>
+  b.title.trim() || b.body.trim() || (b.images.length > 0 ? "（图片）" : "");
+/** 复制：有文优先 body 否则 title；纯图复制各 `@path` 空格拼接。 */
+export const copyTextOf = (b: Bookmark): string => {
+  if (b.body.trim()) return b.body;
+  if (b.title.trim()) return b.title;
+  return b.images.map((p) => "@" + p).join(" ");
+};
+/** 注入：非空标题/正文拼接 + 各图 `@路径`（与 Flow 附件发送同语义）。 */
+export const injectTextOf = (b: Bookmark): string => {
+  const text = [b.title, b.body].map((s) => s.trim()).filter(Boolean).join("\n");
+  const refs = b.images.map((p) => "@" + p).join(" ");
+  return [text, refs].filter(Boolean).join(text && refs ? "\n" : "");
+};

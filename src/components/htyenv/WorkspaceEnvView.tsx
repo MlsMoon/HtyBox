@@ -99,7 +99,9 @@ export default function WorkspaceEnvView({
               p.willCreateDirs.length +
                 p.willWriteFiles.length +
                 p.willWriteNative.length +
-                p.willFetchSkills.length,
+                p.willFetchSkills.length +
+                p.willUpdateFiles.length +
+                p.divergedFiles.length,
             );
           })
           .catch(() => setCompletePending(0));
@@ -245,6 +247,7 @@ export default function WorkspaceEnvView({
             libraryDir={libraryDir}
             onDone={reloadAll}
             onPendingChange={setCompletePending}
+            onGotoSkills={() => pick("skills")}
           />
         ) : section === "memorySync" ? (
           <MemorySyncSection ws={ws} check={check} busy={busy} onMechSync={mechSync} onRecheck={recheck} />

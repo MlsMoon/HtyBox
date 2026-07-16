@@ -59,6 +59,8 @@ pub struct SkillLineage {
     pub tree_match: Option<bool>,
     /// 双侧内容一致但基线陈旧(执行更新/回流任一即对齐)
     pub baseline_stale: bool,
+    /// 库侧为内置种子(SEED_SKILLS 经 ensure_library 标记):供「环境补全」聚合"官方 skill 有更新"入口筛选
+    pub bundled: bool,
     pub changed_files: Vec<ChangedFile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -343,6 +345,12 @@ pub fn compare(workspace: &Path, library_dir: &Path) -> Result<LineageReport, St
     for id in &ids {
         let f = collect_facts(workspace, &ws_manifest, library_dir, &library_manifest, id)?;
         let (state, baseline_stale, detail) = judge(&f);
+        let bundled = library_manifest
+            .skills
+            .iter()
+            .find(|s| &s.id == id)
+            .map(library::is_bundled_entry)
+            .unwrap_or(false);
         skills.push(SkillLineage {
             id: id.clone(),
             state,
@@ -351,6 +359,7 @@ pub fn compare(workspace: &Path, library_dir: &Path) -> Result<LineageReport, St
             lib_sha: f.lib_sha,
             tree_match: f.tree_match,
             baseline_stale,
+            bundled,
             changed_files: f.changed_files,
             detail,
         });
@@ -771,7 +780,12 @@ mod tests {
         assert!(get("collide").detail.as_deref().unwrap().contains("一致"));
         assert_eq!(get("collide2").state, LineageState::Untracked);
         assert!(get("collide2").detail.as_deref().unwrap().contains("不同"));
-        assert_eq!(report.library_only, vec!["lib-extra".to_string()]);
+        // 库含出厂种子 htyenv-native-migrate（ensure_library 必装且工程无）→ 它也属 library_only，故用 contains 断言意图
+        assert!(
+            report.library_only.contains(&"lib-extra".to_string()),
+            "lib-extra 应属 library_only: {:?}",
+            report.library_only
+        );
     }
 
     #[test]

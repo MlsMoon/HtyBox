@@ -31,6 +31,9 @@ pub struct WorkflowManifest {
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protected_native_config: Option<Vec<ProtectedFile>>,
+    /// 受管官方模板文件的「已安装基线 sha」(环境补全更新检测据此判 cleanOutdated vs diverged)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_template_files: Option<Vec<ManagedFile>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub renames: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,6 +53,16 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtectedFile {
+    pub path: String,
+    pub sha256: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// 受管官方模板文件的「已安装基线 sha」记录(env 根相对路径;大写十六进制 SHA-256)。
+/// 与 ProtectedFile 同构:环境补全更新检测据此区分"过时可安全更新"与"用户本地改动(diverged)"。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedFile {
     pub path: String,
     pub sha256: String,
     #[serde(flatten)]
@@ -84,6 +97,29 @@ impl WorkflowManifest {
             .find(|s| s.id == id)
             .and_then(|s| s.enabled)
             .unwrap_or(true)
+    }
+
+    /// 受管官方文件的已安装基线 sha(缺失=未追踪基线)。
+    pub fn managed_baseline(&self, path: &str) -> Option<&str> {
+        self.managed_template_files
+            .as_ref()?
+            .iter()
+            .find(|m| m.path == path)
+            .map(|m| m.sha256.as_str())
+    }
+
+    /// 写入/更新受管官方文件基线 sha(存在则改，不存在则追加)。
+    pub fn upsert_managed_baseline(&mut self, path: &str, sha: &str) {
+        let list = self.managed_template_files.get_or_insert_with(Vec::new);
+        if let Some(e) = list.iter_mut().find(|m| m.path == path) {
+            e.sha256 = sha.to_string();
+        } else {
+            list.push(ManagedFile {
+                path: path.to_string(),
+                sha256: sha.to_string(),
+                extra: Map::new(),
+            });
+        }
     }
 }
 
@@ -361,5 +397,26 @@ mod tests {
             sha256_hex_upper(b"abc"),
             "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
         );
+    }
+
+    #[test]
+    fn managed_baseline_upsert_lookup_and_round_trip() {
+        let mut m = parse(SAMPLE).unwrap();
+        assert!(m.managed_baseline("tools/verify.ps1").is_none(), "初始无基线");
+        m.upsert_managed_baseline("tools/verify.ps1", "AA");
+        assert_eq!(m.managed_baseline("tools/verify.ps1"), Some("AA"));
+        m.upsert_managed_baseline("tools/verify.ps1", "BB"); // upsert 改现值
+        assert_eq!(m.managed_baseline("tools/verify.ps1"), Some("BB"));
+        assert_eq!(m.managed_template_files.as_ref().unwrap().len(), 1, "同路径不重复");
+        let out = serialize(&m).unwrap();
+        assert!(out.contains("managedTemplateFiles"), "序列化应含 camelCase 字段");
+        assert_eq!(parse(&out).unwrap().managed_baseline("tools/verify.ps1"), Some("BB"));
+    }
+
+    #[test]
+    fn absent_managed_field_stays_none_and_not_serialized() {
+        let m = parse(SAMPLE).unwrap(); // SAMPLE 无 managedTemplateFiles
+        assert!(m.managed_template_files.is_none());
+        assert!(!serialize(&m).unwrap().contains("managedTemplateFiles"), "空字段不落盘");
     }
 }

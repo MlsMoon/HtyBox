@@ -407,26 +407,31 @@ pub fn reveal_in_explorer(path: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// 把系统剪贴板中的图片（截图等位图）存为 `<workspace>/.htybox/tmp/clip-<ts>.png`，返回绝对路径。
-/// 读取走 PowerShell + WinForms Clipboard API（claude CLI 在 Windows 读剪贴板图片的同款做法）；
-/// 剪贴板无图片时返回 Err。**真存储在工作区内**（用户拍板：可见可管理、随项目走，同 `.htybox/`
-/// 既有数据目录），前端以 `@路径` 引用注入终端（与拖文件注入同一语义）。
-/// 本函数由 Tauri 命令经 `spawn_blocking` 调用（勿在 UI/IPC 热路径同步跑）。
-/// 无损 PNG（`ImageFormat::Png`）；落盘成功后再清理超过 48h 的旧文件（生命周期可控）。
-pub fn save_clipboard_image(workspace_dir: &str) -> Result<String, String> {
+/// 把系统剪贴板中的图片（截图等位图）存到工作区 `.htybox/<subdir>/`，返回绝对路径。
+/// - `subdir == "tmp"`（默认）：`clip-<ts>.png`，落盘后清理超过 48h 的旧文件（终端/Flow 临时图）
+/// - `subdir == "bookmarks"`：`bm-<ts>.png`，**不做** 48h 清理（书签长期附件，生命周期跟书签删）
+/// 其它 subdir 拒绝（防任意路径写入）。读取走 PowerShell + WinForms Clipboard API。
+/// 本函数由 Tauri 命令经 `spawn_blocking` 调用（勿在 UI/IPC 热路径同步跑）。无损 PNG。
+pub fn save_clipboard_image(workspace_dir: &str, subdir: &str) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let dir = Path::new(workspace_dir).join(".htybox").join("tmp");
+    let (folder, prefix, cleanup_48h) = match subdir {
+        "" | "tmp" => ("tmp", "clip", true),
+        "bookmarks" => ("bookmarks", "bm", false),
+        _ => return Err(format!("不支持的剪贴板图片子目录: {subdir}")),
+    };
+
+    let dir = Path::new(workspace_dir).join(".htybox").join(folder);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_millis();
-    let path = dir.join(format!("clip-{ts}.png"));
+    let path = dir.join(format!("{prefix}-{ts}.png"));
     let path_str = path.to_string_lossy().into_owned();
-    // temp 路径由系统生成、不含单引号，可安全嵌入 PS 单引号字面量
+    // 路径由系统生成、不含单引号，可安全嵌入 PS 单引号字面量
     let ps = format!(
         "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
          if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) {{ exit 1 }}; \
@@ -442,20 +447,22 @@ pub fn save_clipboard_image(workspace_dir: &str) -> Result<String, String> {
         return Err("剪贴板中没有图片".into());
     }
 
-    // 先落盘再清理：清理失败不影响成功路径；整段仍在 worker 内，不堵 UI
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        let now = std::time::SystemTime::now();
-        for e in rd.flatten() {
-            if e.path() == path {
-                continue;
-            }
-            if let Ok(modified) = e.metadata().and_then(|m| m.modified()) {
-                let old = now
-                    .duration_since(modified)
-                    .map(|d| d.as_secs() > 48 * 3600)
-                    .unwrap_or(false);
-                if old {
-                    let _ = std::fs::remove_file(e.path());
+    // 仅 tmp：先落盘再清理；清理失败不影响成功路径；整段仍在 worker 内，不堵 UI
+    if cleanup_48h {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let now = std::time::SystemTime::now();
+            for e in rd.flatten() {
+                if e.path() == path {
+                    continue;
+                }
+                if let Ok(modified) = e.metadata().and_then(|m| m.modified()) {
+                    let old = now
+                        .duration_since(modified)
+                        .map(|d| d.as_secs() > 48 * 3600)
+                        .unwrap_or(false);
+                    if old {
+                        let _ = std::fs::remove_file(e.path());
+                    }
                 }
             }
         }

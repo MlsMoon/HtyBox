@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
 import { useMaskDismiss } from "./ui/maskDismiss";
 import ContextMenu, { MENU_SEP } from "./ui/ContextMenu";
+import { deleteEntry, readImageDataUrl } from "../catalog";
+import {
+  beginClipboardPasteBusy,
+  endClipboardPasteBusy,
+} from "../clipboardPasteBusy";
 import {
   useBookmarks,
   sortedBookmarks,
@@ -25,6 +31,35 @@ import {
 const DRAG_MIME = "application/x-htybox-item";
 const BODY_MAX = 4000;
 const UNDO_MS = 5000; // 快捷删除的撤销窗口
+
+/** 读盘缩略图：缺文件 / 非图 → 占位块，不炸 UI。 */
+function Thumb({ path, className }: { path: string; className?: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    readImageDataUrl(path)
+      .then((r) => {
+        if (alive) setUrl(r.ok && r.dataUrl ? r.dataUrl : null);
+      })
+      .catch(() => {
+        if (alive) setUrl(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [path]);
+  return (
+    <span className={"relative block overflow-hidden bg-[var(--surface-soft)] " + (className ?? "")}>
+      {url ? (
+        <img src={url} alt="" className="h-full w-full object-cover" draggable={false} />
+      ) : (
+        <span className="flex h-full w-full items-center justify-center text-[9px] text-[var(--text-3)]">
+          {"\u56fe"}
+        </span>
+      )}
+    </span>
+  );
+}
 
 function BookmarkIcon() {
   return (
@@ -85,15 +120,18 @@ function BookmarkCard({
   const timer = useRef<number | undefined>(undefined);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const text = displayText(b);
+  const hasImg = b.images.length > 0;
+  const extra = b.images.length > 1 ? b.images.length - 1 : 0;
 
   const show = () => {
     timer.current = window.setTimeout(() => {
       const r = ref.current?.getBoundingClientRect();
       if (!r) return;
       const W = 300;
+      const floatH = hasImg ? 280 : 160;
       // 默认朝左展开(popover 在右侧)，左侧放不下再朝右回弹
       const left = r.left - W - 10 > 8 ? r.left - W - 10 : Math.max(8, Math.min(r.right + 10, window.innerWidth - W - 8));
-      const top = Math.max(8, Math.min(r.top, window.innerHeight - 160));
+      const top = Math.max(8, Math.min(r.top, window.innerHeight - floatH));
       setPos({ top, left });
     }, 500);
   };
@@ -141,6 +179,16 @@ function BookmarkCard({
         }
       >
         <span className="absolute top-0 bottom-0 left-0 w-1" style={{ background: colorDot(b.color) }} />
+        {hasImg && (
+          <span className="relative shrink-0">
+            <Thumb path={b.images[0]} className="h-8 w-8 rounded-md" />
+            {extra > 0 && (
+              <span className="absolute -right-1 -bottom-1 rounded-full bg-[var(--accent)] px-1 text-[8px] font-bold leading-tight text-white">
+                +{extra}
+              </span>
+            )}
+          </span>
+        )}
         <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-[var(--text)]">
           {text || "（空白）"}
         </span>
@@ -185,6 +233,16 @@ function BookmarkCard({
                 {b.body}
               </div>
             )}
+            {!b.title.trim() && !b.body.trim() && hasImg && (
+              <div className="text-[13px] font-semibold text-[var(--text)]">{"\uFF08\u56FE\u7247\uFF09"}</div>
+            )}
+            {hasImg && (
+              <div className={(b.title.trim() || b.body.trim() ? "mt-2 " : "") + "flex flex-wrap gap-1.5"}>
+                {b.images.slice(0, 4).map((p) => (
+                  <Thumb key={p} path={p} className="h-[72px] w-[88px] rounded-lg border border-[var(--border)]" />
+                ))}
+              </div>
+            )}
           </div>,
           document.body,
         )}
@@ -192,37 +250,78 @@ function BookmarkCard({
   );
 }
 
-/** 新建 / 编辑表单（popover 内联）：标题、内容均可空，但两者皆空时禁用保存。 */
+/** 新建 / 编辑：标题/正文可空；Ctrl+V 粘图进 images；有图或有字即可保存。 */
 function BookmarkEditor({
   initial,
+  workspacePath,
   onSave,
   onCancel,
 }: {
   initial?: Bookmark;
+  workspacePath: string;
   onSave: (input: BookmarkInput) => void;
   onCancel: () => void;
 }) {
   const [title, setTitle] = useState(initial?.title ?? "");
   const [body, setBody] = useState(initial?.body ?? "");
+  const [images, setImages] = useState<string[]>(() => [...(initial?.images ?? [])]);
   const [color, setColor] = useState<BookmarkColorKey>(initial?.color ?? DEFAULT_COLOR);
   const [important, setImportant] = useState(initial?.important ?? false);
-  const canSave = !!(title.trim() || body.trim());
+  const initialImages = useRef(initial?.images ?? []);
+  const canSave = !!(title.trim() || body.trim() || images.length > 0);
+
+  const pasteImageProbe = () => {
+    if (!workspacePath) return;
+    const fwd = () => {
+      beginClipboardPasteBusy();
+      // 书签长期附件：subdir=bookmarks（禁止走 tmp/48h）
+      invoke<string>("save_clipboard_image", { workspaceDir: workspacePath, subdir: "bookmarks" })
+        .then((p) => setImages((a) => [...a, p]))
+        .catch(() => {})
+        .finally(() => endClipboardPasteBusy());
+    };
+    navigator.clipboard
+      ?.readText()
+      .then((raw) => {
+        if (!raw) fwd();
+      })
+      .catch(fwd);
+  };
+
+  const removeImage = (p: string) => {
+    setImages((a) => a.filter((x) => x !== p));
+    deleteEntry(p).catch(() => {});
+  };
+
+  const discardUnsavedFiles = () => {
+    const kept = new Set(initialImages.current);
+    for (const p of images) {
+      if (!kept.has(p)) deleteEntry(p).catch(() => {});
+    }
+  };
+
   const submit = () => {
-    if (canSave) onSave({ title: title.trim(), body: body.trim(), color, important });
+    if (!canSave) return;
+    onSave({ title: title.trim(), body: body.trim(), images: [...images], color, important });
+  };
+
+  const cancel = () => {
+    discardUnsavedFiles();
+    onCancel();
   };
 
   return (
     <div className="p-3">
       <div className="mb-2 flex items-center justify-between">
         <span className="text-[13px] font-semibold text-[var(--text)]">{initial ? "编辑书签" : "新建书签"}</span>
-        <button onClick={onCancel} className="text-[12px] text-[var(--text-3)] hover:text-[var(--text)]">✕</button>
+        <button onClick={cancel} className="text-[12px] text-[var(--text-3)] hover:text-[var(--text)]">✕</button>
       </div>
       <input
         autoFocus
         value={title}
         onChange={(e) => setTitle(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Escape") onCancel();
+          if (e.key === "Escape") cancel();
         }}
         placeholder="标题（可空）"
         className="w-full rounded-md border border-[var(--border)] bg-[var(--elevated)] px-2.5 py-1.5 text-[13px] text-[var(--text)] outline-none focus:border-[var(--accent-border)]"
@@ -232,12 +331,33 @@ function BookmarkEditor({
         maxLength={BODY_MAX}
         onChange={(e) => setBody(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Escape") onCancel();
+          if (e.key === "Escape") cancel();
+          if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
         }}
-        placeholder="内容（可空，标题与内容至少填一个）"
+        placeholder="内容（可空；无图时标题与内容至少填一个）"
         rows={5}
         className="mt-2 w-full resize-none rounded-md border border-[var(--border)] bg-[var(--elevated)] px-2.5 py-1.5 text-[12.5px] leading-relaxed text-[var(--text)] outline-none focus:border-[var(--accent-border)]"
       />
+      {images.length > 0 && (
+        <div className="mt-2">
+          <div className="mb-1 text-[11px] font-semibold text-[var(--text-2)]">图片附件</div>
+          <div className="flex flex-wrap gap-1.5">
+            {images.map((p) => (
+              <span key={p} className="relative" title={p}>
+                <Thumb path={p} className="h-[72px] w-[88px] rounded-lg border border-[var(--border)]" />
+                <button
+                  type="button"
+                  onClick={() => removeImage(p)}
+                  className="absolute -top-1.5 -right-1.5 flex h-5 w-5 items-center justify-center rounded-full border border-[var(--danger)] bg-[var(--elevated)] text-[11px] font-bold text-[var(--danger)]"
+                  title="移除图片"
+                >
+                  ✕
+                </button>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="mt-3 flex items-center gap-2">
         <span className="w-12 shrink-0 text-[11px] font-semibold text-[var(--text-2)]">颜色</span>
         <div className="flex items-center gap-1.5">
@@ -270,7 +390,7 @@ function BookmarkEditor({
         </button>
       </div>
       <div className="mt-3 flex justify-end gap-2">
-        <button onClick={onCancel} className="rounded-md px-3 py-1 text-[12px] text-[var(--text-2)] hover:bg-[var(--surface)]">
+        <button onClick={cancel} className="rounded-md px-3 py-1 text-[12px] text-[var(--text-2)] hover:bg-[var(--surface)]">
           取消
         </button>
         <button
@@ -288,8 +408,8 @@ function BookmarkEditor({
   );
 }
 
-/** 顶栏「书签」入口：按钮 + 下拉 popover（按工作区 scope 读写）。 */
-export default function BookmarkBar({ scope }: { scope: string }) {
+/** 顶栏「书签」入口：按钮 + 下拉 popover（按工作区 scope 读写；粘图需 workspacePath）。 */
+export default function BookmarkBar({ scope, workspacePath }: { scope: string; workspacePath: string }) {
   const [open, setOpen] = useState(false);
   const bookmarks = useBookmarks(scope);
   const sorted = useMemo(() => sortedBookmarks(bookmarks), [bookmarks]);
@@ -316,10 +436,11 @@ export default function BookmarkBar({ scope }: { scope: string }) {
   };
   useEffect(() => () => window.clearTimeout(undoTimer.current), []);
 
-  /** 快捷删除：点击即删、零弹窗；UNDO_MS 内可从 popover 底部撤销条精确复位到原数组位置。 */
+  /** 快捷删除：删 store + 删图文件；UNDO 只恢复元数据（缺图占位）。 */
   const quickDelete = (b: Bookmark) => {
     const index = bookmarks.findIndex((x) => x.id === b.id);
     if (index < 0) return;
+    for (const p of b.images) deleteEntry(p).catch(() => {});
     deleteBookmark(scope, b.id);
     if (undoTimer.current) window.clearTimeout(undoTimer.current);
     setUndo({ scope, b, index }); // 带 scope：撤销复位不受期间工作区切换影响
@@ -402,10 +523,18 @@ export default function BookmarkBar({ scope }: { scope: string }) {
             {editing ? (
               <BookmarkEditor
                 initial={editing === "new" ? undefined : editing}
+                workspacePath={workspacePath}
                 onCancel={() => setEditing(null)}
                 onSave={(input) => {
                   if (editing === "new") addBookmark(scope, input);
-                  else updateBookmark(scope, editing.id, input);
+                  else {
+                    // 编辑保存：移除未再保留的旧图（✕ 时多半已删；此处兜底）
+                    const next = new Set(input.images);
+                    for (const p of editing.images) {
+                      if (!next.has(p)) deleteEntry(p).catch(() => {});
+                    }
+                    updateBookmark(scope, editing.id, input);
+                  }
                   setEditing(null);
                 }}
               />

@@ -9,7 +9,7 @@ use serde_json::{json, Map};
 use super::adapters;
 use super::library;
 use super::manifest::{self, ProtectedFile};
-use super::template::{NATIVE_BOOTSTRAP_FILES, TEMPLATE_DIRS, TEMPLATE_FILES};
+use super::template::{managed_files, NATIVE_BOOTSTRAP_FILES, TEMPLATE_DIRS, TEMPLATE_FILES};
 use super::write_atomic;
 
 #[derive(Debug, Serialize)]
@@ -28,6 +28,12 @@ pub struct InitPreview {
     pub library: library::LibraryStatus,
     /// 库有而工程 canonical 无 → 初始化时取件
     pub will_fetch_skills: Vec<String>,
+    /// 受管官方文件:与已装基线一致但内置已更新 → 可安全一键更新(仅 complete_preview 填充)
+    pub will_update_files: Vec<String>,
+    /// 受管官方文件:本地已改动/首装无基线且内容异 → 需逐项确认覆盖或注入裁决(仅 complete_preview 填充)
+    pub diverged_files: Vec<String>,
+    /// 受管官方文件:已针对当前官方版裁决、保留本地变体(无动作,供回溯;仅 complete_preview 填充)
+    pub reconciled_files: Vec<String>,
 }
 
 /// 只读预览(不建库、零写入)。
@@ -49,13 +55,16 @@ pub fn init_preview(workspace: &Path, library_dir: &Path) -> Result<InitPreview,
         skipped_existing: Vec::new(),
         library: library::library_status(library_dir),
         will_fetch_skills: Vec::new(),
+        will_update_files: Vec::new(),
+        diverged_files: Vec::new(),
+        reconciled_files: Vec::new(),
     };
     for dir in TEMPLATE_DIRS {
         if !root.join(dir).is_dir() {
             preview.will_create_dirs.push((*dir).to_string());
         }
     }
-    for (rel, _) in TEMPLATE_FILES {
+    for (rel, _, _) in TEMPLATE_FILES {
         if root.join(rel).is_file() {
             preview.skipped_existing.push((*rel).to_string());
         } else {
@@ -101,6 +110,8 @@ pub struct InitOutcome {
     pub native_manual: Vec<String>,
     pub fetched_skills: Vec<String>,
     pub written_adapters: usize,
+    /// 受管官方文件本次覆盖到最新的(cleanOutdated + 已确认 diverged)
+    pub updated_files: Vec<String>,
 }
 
 /// 执行初始化(幂等,只做 preview 展示过的事):骨架 + 治理文件 + native 薄引导入基线 +
@@ -116,6 +127,7 @@ pub fn init_execute(workspace: &Path, library_dir: &Path) -> Result<InitOutcome,
         native_manual: Vec::new(),
         fetched_skills: Vec::new(),
         written_adapters: 0,
+        updated_files: Vec::new(),
     };
 
     for dir in TEMPLATE_DIRS {
@@ -125,7 +137,7 @@ pub fn init_execute(workspace: &Path, library_dir: &Path) -> Result<InitOutcome,
             outcome.created_dirs += 1;
         }
     }
-    for (rel, content) in TEMPLATE_FILES {
+    for (rel, content, _) in TEMPLATE_FILES {
         let path = root.join(rel);
         if !path.is_file() {
             write_atomic(&path, content.as_bytes())?;
@@ -182,24 +194,84 @@ pub fn init_execute(workspace: &Path, library_dir: &Path) -> Result<InitOutcome,
 
 /// 环境补全 dry-run:仅已初始化工作区可用;清单语义与 init_preview 相同(缺什么补什么)。
 pub fn complete_preview(workspace: &Path, library_dir: &Path) -> Result<InitPreview, String> {
-    let preview = init_preview(workspace, library_dir)?;
+    let mut preview = init_preview(workspace, library_dir)?;
     if !preview.already_initialized {
         return Err(
             "工作区尚未初始化 hty 环境——请先在概览使用「初始化」,补全仅用于已就绪工程".into(),
         );
     }
+    // 受管官方文件更新检测(仅 complete 路径;init_preview 维持补缺语义):
+    // present Managed 文件按基线三态判 cleanOutdated/diverged,并从 skipped_existing 剔除避免双计。
+    let manifest_data = manifest::load(workspace)?;
+    let scan = super::managed::scan(workspace, &manifest_data)?;
+    let surfaced = scan.surfaced();
+    preview.skipped_existing.retain(|rel| !surfaced.contains(rel));
+    preview.will_update_files = scan.clean_outdated;
+    preview.diverged_files = scan.diverged;
+    preview.reconciled_files = scan.reconciled;
     Ok(preview)
 }
 
-/// 环境补全执行:刷新全局库种子 → 补缺目录/治理文件/库 skill 取件 → 重生薄壳。
-/// 绝不覆盖已有文件或改写 native 入口(与 init_execute 同幂等契约)。
-pub fn complete_execute(workspace: &Path, library_dir: &Path) -> Result<InitOutcome, String> {
+/// 环境补全执行:补缺目录/治理文件/库 skill 取件 + 重生薄壳(init_execute)→ 叠加受管官方文件更新。
+/// 补缺永不覆盖已有;更新分两级:cleanOutdated 安全覆盖,diverged 仅 `confirm_diverged` 列表内才覆盖。native 入口永不动。
+pub fn complete_execute(
+    workspace: &Path,
+    library_dir: &Path,
+    confirm_diverged: &[String],
+) -> Result<InitOutcome, String> {
     if !manifest::manifest_path(workspace).is_file() {
         return Err(
             "工作区尚未初始化 hty 环境——请先初始化,补全仅用于已就绪工程".into(),
         );
     }
-    init_execute(workspace, library_dir)
+    let mut outcome = init_execute(workspace, library_dir)?;
+    apply_managed_updates(workspace, confirm_diverged, &mut outcome)?;
+    Ok(outcome)
+}
+
+/// 受管官方文件更新 pass(complete_execute 专属,init_execute 之后叠加):
+/// cleanOutdated 全部安全覆盖 + `confirm_diverged` 列表内的 diverged 覆盖 + upToDate 无基线回填;凡写过则落基线。
+fn apply_managed_updates(
+    workspace: &Path,
+    confirm_diverged: &[String],
+    outcome: &mut InitOutcome,
+) -> Result<(), String> {
+    let root = manifest::env_root(workspace);
+    let mut m = manifest::load(workspace)?;
+    let scan = super::managed::scan(workspace, &m)?;
+
+    let builtin = |rel: &str| -> Result<&'static str, String> {
+        managed_files()
+            .find(|(r, _)| *r == rel)
+            .map(|(_, c)| c)
+            .ok_or_else(|| format!("受管文件不在内置清单: {rel}"))
+    };
+
+    // 覆盖目标 = 全部 cleanOutdated + 已确认的 diverged
+    let confirmed: std::collections::HashSet<&str> =
+        confirm_diverged.iter().map(String::as_str).collect();
+    let mut overwrite = scan.clean_outdated.clone();
+    for rel in &scan.diverged {
+        if confirmed.contains(rel.as_str()) {
+            overwrite.push(rel.clone());
+        }
+    }
+    for rel in &overwrite {
+        let content = builtin(rel)?;
+        write_atomic(&root.join(rel), content.as_bytes())?;
+        m.upsert_managed_baseline(rel, &manifest::sha256_hex_upper(content.as_bytes()));
+        outcome.updated_files.push(rel.clone());
+    }
+    // upToDate 但基线缺失/陈旧(含 init 刚补写的缺失文件)→ 仅回填基线,不改内容
+    for rel in &scan.backfill_baseline {
+        let content = builtin(rel)?;
+        m.upsert_managed_baseline(rel, &manifest::sha256_hex_upper(content.as_bytes()));
+    }
+    if !outcome.updated_files.is_empty() || !scan.backfill_baseline.is_empty() {
+        m.generated_utc = Some(manifest::now_utc_rfc3339()?);
+        manifest::save(workspace, &m)?;
+    }
+    Ok(())
 }
 
 fn upsert_protected(m: &mut manifest::WorkflowManifest, rel: &str, sha: &str) {
@@ -361,9 +433,54 @@ mod tests {
         assert!(preview.already_initialized);
         assert!(preview.will_fetch_skills.contains(&"beta-tool".to_string()));
 
-        let outcome = complete_execute(&ws, &lib).unwrap();
+        let outcome = complete_execute(&ws, &lib, &[]).unwrap();
         assert!(outcome.fetched_skills.contains(&"beta-tool".to_string()));
         assert!(ws.join(".htyworkflows/skills/beta-tool/SKILL.md").is_file());
         assert!(manifest::load(&ws).unwrap().skills.len() > before);
+    }
+
+    #[test]
+    fn complete_updates_outdated_and_respects_diverged_confirm() {
+        let wtmp = tempfile::tempdir().unwrap();
+        let ltmp = tempfile::tempdir().unwrap();
+        let ws = wtmp.path().to_path_buf();
+        let lib = ltmp.path().join("global-env");
+        init_execute(&ws, &lib).unwrap();
+        // init 后受管文件均 == 内置 → 首次 complete 回填基线,零更新
+        let out0 = complete_execute(&ws, &lib, &[]).unwrap();
+        assert!(out0.updated_files.is_empty(), "初装后无可更新");
+        let m = manifest::load(&ws).unwrap();
+        assert!(m.managed_baseline("tools/verify.ps1").is_some(), "回填了基线");
+
+        let root = manifest::env_root(&ws);
+        // 场景 A:把 verify.ps1 改成"旧官方版"并令基线=旧 → cleanOutdated → 安全一键更新
+        let mut m = manifest::load(&ws).unwrap();
+        fs::write(root.join("tools/verify.ps1"), b"OLD OFFICIAL").unwrap();
+        m.upsert_managed_baseline("tools/verify.ps1", &manifest::sha256_hex_upper(b"OLD OFFICIAL"));
+        // 场景 B:把 path-audit.ps1 改成"用户本地版",基线保持内置 → diverged
+        fs::write(root.join("tools/path-audit.ps1"), b"USER LOCAL EDIT").unwrap();
+        manifest::save(&ws, &m).unwrap();
+
+        let prev = complete_preview(&ws, &lib).unwrap();
+        assert!(prev.will_update_files.contains(&"tools/verify.ps1".to_string()));
+        assert!(prev.diverged_files.contains(&"tools/path-audit.ps1".to_string()));
+
+        // 不确认 diverged:verify 被安全更新,path-audit 保留用户改动
+        let out = complete_execute(&ws, &lib, &[]).unwrap();
+        assert!(out.updated_files.contains(&"tools/verify.ps1".to_string()));
+        assert!(!out.updated_files.contains(&"tools/path-audit.ps1".to_string()));
+        assert_eq!(
+            fs::read(root.join("tools/path-audit.ps1")).unwrap(),
+            b"USER LOCAL EDIT",
+            "未确认的 diverged 绝不覆盖"
+        );
+        // verify 已回内置 → 再 preview 应无它
+        let prev2 = complete_preview(&ws, &lib).unwrap();
+        assert!(!prev2.will_update_files.contains(&"tools/verify.ps1".to_string()));
+
+        // 确认 path-audit 后才覆盖
+        let out2 = complete_execute(&ws, &lib, &["tools/path-audit.ps1".to_string()]).unwrap();
+        assert!(out2.updated_files.contains(&"tools/path-audit.ps1".to_string()));
+        assert!(complete_preview(&ws, &lib).unwrap().diverged_files.is_empty(), "确认后 diverged 清空");
     }
 }

@@ -130,7 +130,7 @@ pub fn ensure_library(library_dir: &Path) -> Result<LibraryManifest, String> {
 
 const BUNDLED_KEY: &str = "bundled";
 
-fn is_bundled_entry(entry: &LibrarySkillEntry) -> bool {
+pub(crate) fn is_bundled_entry(entry: &LibrarySkillEntry) -> bool {
     entry
         .extra
         .get(BUNDLED_KEY)
@@ -797,13 +797,16 @@ mod tests {
         let lib = libtmp.path().join("global-env");
         collect_skill(&ws, &lib, "alpha").unwrap();
         let list = list_library_skills(&lib).unwrap();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].id, "alpha");
-        assert_eq!(list[0].versions.len(), 1);
-        assert!(!list[0].entry_missing);
-        assert!(list[0].versions[0].source_workspace.is_some());
+        // 库含收编的 alpha + 出厂种子 htyenv-native-migrate（ensure_library 必装）→ 定向断言 alpha，勿硬编码计数
+        let alpha = list.iter().find(|s| s.id == "alpha").expect("alpha 应在库内");
+        assert_eq!(alpha.versions.len(), 1);
+        assert!(!alpha.entry_missing);
+        assert!(alpha.versions[0].source_workspace.is_some());
         delete_library_skill(&lib, "alpha").unwrap();
-        assert!(list_library_skills(&lib).unwrap().is_empty());
+        assert!(
+            list_library_skills(&lib).unwrap().iter().all(|s| s.id != "alpha"),
+            "alpha 应已移除（种子仍在）"
+        );
         assert!(!lib.join("skills/alpha").exists(), "实体应移除");
         assert!(delete_library_skill(&lib, "alpha").is_err(), "重删应报无此 skill");
         // 删除后同 id 目录位腾空,可再收编

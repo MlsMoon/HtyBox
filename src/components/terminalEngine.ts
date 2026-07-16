@@ -392,3 +392,25 @@ export function injectIntoTerminal(termId: string, text: string): Promise<void> 
   if (!e || !e.created) return Promise.reject(new Error("终端不存在或尚未就绪"));
   return invoke("write_terminal", { id: termId, data: pasteData(e.agentKind, text) });
 }
+
+// 提交回车与文本之间的延时：文本按 agent 粘贴语义写入后，等 TUI 消费完这段"粘贴"再送 Enter。
+// codex/cursor 的 TUI 把"文本+\r 单次写入"当作粘贴、末尾 \r 被并进输入框当换行 → 不提交；故
+// Enter 必须作为【独立事件】在文本被消费后送达（claude 亦兼容——等价 Ctrl+V 后按回车）。值可调。
+const SUBMIT_ENTER_DELAY = 80; // ms
+
+/**
+ * 工作流「执行阶段/发送」跨 agent 提交：先用 pasteData 按 agent 规范写入文本(agent=bracketed-paste，
+ * 等价程序化 Ctrl+V)，pressEnter 时【另起一次】写 \r 离散提交(见 SUBMIT_ENTER_DELAY 注释)。
+ * 不主动改键盘焦点——由调用侧决定(执行阶段聚焦终端、人工发送保持焦点在输入框)。
+ */
+export function injectAndSubmit(termId: string, text: string, pressEnter: boolean): void {
+  const e = engines.get(termId);
+  if (!e || !e.created) return;
+  invoke("write_terminal", { id: termId, data: pasteData(e.agentKind, text) }).catch(() => {});
+  if (!pressEnter) return;
+  window.setTimeout(() => {
+    const e2 = engines.get(termId);
+    if (!e2 || !e2.created) return; // 终端已关闭 → 放弃提交
+    invoke("write_terminal", { id: termId, data: "\r" }).catch(() => {});
+  }, SUBMIT_ENTER_DELAY);
+}

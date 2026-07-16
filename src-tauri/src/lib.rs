@@ -415,13 +415,35 @@ async fn htyenv_complete_preview(
 async fn htyenv_complete_execute(
     workspace: String,
     library_dir: Option<String>,
+    confirm_diverged: Option<Vec<String>>,
 ) -> Result<htyenv::init::InitOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dir = htyenv::library::resolve_library_dir(library_dir.as_deref())?;
-        htyenv::init::complete_execute(std::path::Path::new(&workspace), &dir)
+        let confirmed = confirm_diverged.unwrap_or_default();
+        htyenv::init::complete_execute(std::path::Path::new(&workspace), &dir, &confirmed)
     })
     .await
     .map_err(|error| format!("hty环境补全任务失败：{error}"))?
+}
+
+/// hty环境:diverged 官方文件的注入裁决指令(导出官方内置版到 runtime/tmp + 生成语义合并文本,供注入 AI 终端)。
+#[tauri::command]
+async fn htyenv_managed_merge_brief(workspace: String, rels: Vec<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        htyenv::managed::merge_brief(std::path::Path::new(&workspace), &rels)
+    })
+    .await
+    .map_err(|error| format!("hty环境裁决指令生成失败：{error}"))?
+}
+
+/// hty环境:标记已裁决(对给定 Managed 文件设基线=当前内置,不改内容 → 转 Reconciled 不再报 diverged)。
+#[tauri::command]
+async fn htyenv_managed_reconcile(workspace: String, rels: Vec<String>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        htyenv::managed::reconcile(std::path::Path::new(&workspace), &rels)
+    })
+    .await
+    .map_err(|error| format!("hty环境标记已裁决失败：{error}"))?
 }
 
 /// hty环境:工作区 ↔ 全局权威库谱系五态对比(零写入;库漂移仅报告)。
@@ -871,14 +893,20 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
     fs_tree::reveal_in_explorer(&path)
 }
 
-/// 剪贴板图片（截图等位图）存为 `<工作区>/.htybox/tmp/clip-<ts>.png`，返回绝对路径
-/// （终端/工作流输入框粘图用；剪贴板无图返回 Err）。
+/// 剪贴板图片存到 `<工作区>/.htybox/<subdir>/`，返回绝对路径（剪贴板无图返回 Err）。
+/// `subdir` 缺省/`None`/`""` → `"tmp"`（终端/Flow）；书签传 `"bookmarks"`（无 48h 清理）。
 /// 重活（PowerShell 读图 + PNG 落盘）走 spawn_blocking，避免同步命令堵死 UI。
 #[tauri::command]
-async fn save_clipboard_image(workspace_dir: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || fs_tree::save_clipboard_image(&workspace_dir))
-        .await
-        .map_err(|error| format!("剪贴板图片落盘任务失败：{error}"))?
+async fn save_clipboard_image(
+    workspace_dir: String,
+    subdir: Option<String>,
+) -> Result<String, String> {
+    let sub = subdir.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        fs_tree::save_clipboard_image(&workspace_dir, &sub)
+    })
+    .await
+    .map_err(|error| format!("剪贴板图片落盘任务失败：{error}"))?
 }
 
 /// M9：编辑器打开文件时开始监听其外部变化（变化后 emit "file-changed"）。
@@ -1208,6 +1236,8 @@ pub fn run() {
             htyenv_init_execute,
             htyenv_complete_preview,
             htyenv_complete_execute,
+            htyenv_managed_merge_brief,
+            htyenv_managed_reconcile,
             htyenv_compare,
             htyenv_update_from_library,
             htyenv_backflow_to_library,

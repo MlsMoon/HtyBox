@@ -457,7 +457,7 @@ export default function App() {
             </div>
           </div>
           <div className="ml-auto flex items-center gap-2 pr-1">
-            <BookmarkBar scope={active.id} />
+            <BookmarkBar scope={active.id} workspacePath={active.path} />
             <button
               onClick={() => setSetting("envDashboardMode", true)}
               title="hty环境仪表盘(终端保持后台运行)"

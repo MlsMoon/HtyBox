@@ -65,41 +65,66 @@ pub const ACTIVE_WRITE_DIRS: &[&str] = &[
     "memory",
 ];
 
-/// 落到 env 根内的模板文件(env 相对路径 '/' 分隔, 内容);已存在一律跳过(幂等)。
-pub const TEMPLATE_FILES: &[(&str, &str)] = &[
-    ("README.md", include_str!("../../assets/htyenv-template/env-README.md")),
-    ("rules/common.md", include_str!("../../assets/htyenv-template/rules-common.md")),
-    ("rules/claude.md", include_str!("../../assets/htyenv-template/rules-claude.md")),
-    ("rules/codex.md", include_str!("../../assets/htyenv-template/rules-codex.md")),
-    ("adapters/README.md", include_str!("../../assets/htyenv-template/adapters-README.md")),
-    ("adapters/claude/README.md", include_str!("../../assets/htyenv-template/overlay-claude.md")),
-    ("adapters/codex/README.md", include_str!("../../assets/htyenv-template/overlay-codex.md")),
-    ("memory/MEMORY.md", include_str!("../../assets/htyenv-template/memory-MEMORY.md")),
+/// 官方模板文件的更新策略(决策 2,权威集中此一处):
+/// - `Managed`:官方受管资产,纳入「环境补全」更新检测(基线三态);
+/// - `SeedOnce`:仅初始化/补缺时下发一次,永不检更新(项目级会随使用变更的内容)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePolicy {
+    Managed,
+    SeedOnce,
+}
+
+use FilePolicy::{Managed, SeedOnce};
+
+/// 落到 env 根内的模板文件(env 相对路径 '/' 分隔, 内容, 更新策略);已存在一律跳过(幂等)。
+/// SeedOnce = `memory/MEMORY.md`(用户填索引正文)+ `tools/path-audit-skip.json`(工程特有豁免配置点);其余官方资产 = Managed。
+pub const TEMPLATE_FILES: &[(&str, &str, FilePolicy)] = &[
+    ("README.md", include_str!("../../assets/htyenv-template/env-README.md"), Managed),
+    ("rules/common.md", include_str!("../../assets/htyenv-template/rules-common.md"), Managed),
+    ("rules/claude.md", include_str!("../../assets/htyenv-template/rules-claude.md"), Managed),
+    ("rules/codex.md", include_str!("../../assets/htyenv-template/rules-codex.md"), Managed),
+    ("adapters/README.md", include_str!("../../assets/htyenv-template/adapters-README.md"), Managed),
+    ("adapters/claude/README.md", include_str!("../../assets/htyenv-template/overlay-claude.md"), Managed),
+    ("adapters/codex/README.md", include_str!("../../assets/htyenv-template/overlay-codex.md"), Managed),
+    ("memory/MEMORY.md", include_str!("../../assets/htyenv-template/memory-MEMORY.md"), SeedOnce),
     (
         "AgentDocument/ClaudeCode规则-Skill与记忆路径对照.md",
         include_str!("../../assets/htyenv-template/agentdoc-claude.md"),
+        Managed,
     ),
     (
         "AgentDocument/Codex规则-Skill与记忆路径对照.md",
         include_str!("../../assets/htyenv-template/agentdoc-codex.md"),
+        Managed,
     ),
-    ("tools/bootstrap.ps1", include_str!("../../assets/htyenv-template/bootstrap.ps1")),
-    ("tools/sync-adapters.ps1", include_str!("../../assets/htyenv-template/sync-adapters.ps1")),
-    ("tools/verify.ps1", include_str!("../../assets/htyenv-template/verify.ps1")),
-    ("tools/path-audit.ps1", include_str!("../../assets/htyenv-template/path-audit.ps1")),
+    ("tools/bootstrap.ps1", include_str!("../../assets/htyenv-template/bootstrap.ps1"), Managed),
+    ("tools/sync-adapters.ps1", include_str!("../../assets/htyenv-template/sync-adapters.ps1"), Managed),
+    ("tools/verify.ps1", include_str!("../../assets/htyenv-template/verify.ps1"), Managed),
+    ("tools/path-audit.ps1", include_str!("../../assets/htyenv-template/path-audit.ps1"), Managed),
     (
         "tools/path-audit-skip.json",
         include_str!("../../assets/htyenv-template/path-audit-skip.json"),
+        SeedOnce,
     ),
     (
         "agentsSynchronizer/README.md",
         include_str!("../../assets/htyenv-template/agentsSynchronizer-README.md"),
+        Managed,
     ),
     (
         "agentsSynchronizer/sync-all.ps1",
         include_str!("../../assets/htyenv-template/sync-all.ps1"),
+        Managed,
     ),
 ];
+
+/// Managed 官方文件视图:(env 相对路径, 内置内容)——供「环境补全」更新检测遍历。
+pub fn managed_files() -> impl Iterator<Item = (&'static str, &'static str)> {
+    TEMPLATE_FILES
+        .iter()
+        .filter(|(_, _, policy)| *policy == FilePolicy::Managed)
+        .map(|(rel, content, _)| (*rel, *content))
+}
 
 /// native 薄引导(工程根相对路径 '/' 分隔, 内容, 所属 provider;决策 3A:仅规则入口两件)。
 /// 已存在则跳过生成、不入保护基线、报告"需人工接线"(主题群决策 5)。
@@ -166,6 +191,7 @@ pub fn factory_manifest() -> super::manifest::WorkflowManifest {
         })),
         providers: factory_providers(),
         protected_native_config: Some(Vec::new()),
+        managed_template_files: None,
         renames: None,
         zero_loss_constraints: None,
         skills: Vec::new(),
@@ -190,7 +216,7 @@ mod tests {
 
     #[test]
     fn template_files_land_inside_template_dirs_or_root() {
-        for (rel, content) in TEMPLATE_FILES {
+        for (rel, content, _policy) in TEMPLATE_FILES {
             assert!(!content.is_empty(), "{rel} 模板内容为空");
             if let Some((dir, _)) = rel.rsplit_once('/') {
                 let covered = TEMPLATE_DIRS.contains(&dir)
@@ -222,5 +248,25 @@ mod tests {
             assert!(entry.is_some(), "{id} 缺 SKILL.md");
             assert!(!entry.unwrap().1.is_empty(), "{id} SKILL.md 为空");
         }
+    }
+
+    #[test]
+    fn seed_once_set_is_exactly_project_level_files() {
+        // SeedOnce 只应含"项目级会变内容";新增官方文件默认应为 Managed。
+        let seed_once: Vec<&str> = TEMPLATE_FILES
+            .iter()
+            .filter(|(_, _, p)| *p == FilePolicy::SeedOnce)
+            .map(|(rel, _, _)| *rel)
+            .collect();
+        assert_eq!(
+            seed_once,
+            vec!["memory/MEMORY.md", "tools/path-audit-skip.json"],
+            "SeedOnce 集合漂移——新增官方文件默认应为 Managed"
+        );
+        // Managed 视图 + SeedOnce 恰好覆盖全部 TEMPLATE_FILES(无遗漏、无重复)。
+        assert_eq!(
+            managed_files().count() + seed_once.len(),
+            TEMPLATE_FILES.len()
+        );
     }
 }

@@ -345,3 +345,30 @@ html.dark .cursor-glyph {
   .hty-scrollhint::before,
   .hty-hint-arrow { animation: none; }
 }
+
+/* ============ 工作流自动执行动效：顶边流光 + stepper 流光点 ============ */
+/* 顶边流光条：陶土渐变沿 x 平移，读作"自动接续在流动" */
+.htybox-auto-flow {
+  background-image: linear-gradient(90deg, transparent 0%, var(--accent) 50%, transparent 100%);
+  background-size: 220px 100%;
+  background-repeat: repeat-x;
+  animation: htybox-auto-flow 1.3s linear infinite;
+}
+@keyframes htybox-auto-flow {
+  from { background-position: 0 0; }
+  to { background-position: 220px 0; }
+}
+/* stepper 流光点：沿 stepper 从左到右滑动、末尾淡出复位 */
+.htybox-auto-travel {
+  animation: htybox-auto-travel 1.9s ease-in-out infinite;
+}
+@keyframes htybox-auto-travel {
+  0% { left: 0; opacity: 0; }
+  12% { opacity: 1; }
+  85% { opacity: 1; }
+  100% { left: 100%; opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .htybox-auto-flow,
+  .htybox-auto-travel { animation: none; }
+}

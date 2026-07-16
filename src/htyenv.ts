@@ -141,6 +141,12 @@ export interface InitPreview {
   skippedExisting: string[];
   library: LibraryStatus;
   willFetchSkills: string[];
+  /** 受管官方文件:与已装基线一致但内置已更新 → 可安全一键更新(仅 complete_preview 填充) */
+  willUpdateFiles: string[];
+  /** 受管官方文件:本地改动/首装无基线且内容异 → 需逐项确认覆盖或注入裁决(仅 complete_preview 填充) */
+  divergedFiles: string[];
+  /** 受管官方文件:已针对当前官方版裁决、保留本地变体(无动作,供回溯) */
+  reconciledFiles: string[];
 }
 
 export interface InitOutcome {
@@ -151,6 +157,8 @@ export interface InitOutcome {
   nativeManual: string[];
   fetchedSkills: string[];
   writtenAdapters: number;
+  /** 受管官方文件本次覆盖到最新的(cleanOutdated + 已确认 diverged) */
+  updatedFiles: string[];
 }
 
 /** 全局权威库状态(libraryDir 缺省 = 引擎默认位置;设置项可配)。 */
@@ -185,9 +193,25 @@ export const htyenvInitExecute = (workspace: string, libraryDir?: string) =>
 export const htyenvCompletePreview = (workspace: string, libraryDir?: string) =>
   invoke<InitPreview>("htyenv_complete_preview", { workspace, libraryDir: libraryDir || null });
 
-/** 执行环境补全(刷新库种子 + 只增不覆)。 */
-export const htyenvCompleteExecute = (workspace: string, libraryDir?: string) =>
-  invoke<InitOutcome>("htyenv_complete_execute", { workspace, libraryDir: libraryDir || null });
+/** 执行环境补全(补缺 + cleanOutdated 安全更新 + confirmDiverged 列表内覆盖)。 */
+export const htyenvCompleteExecute = (
+  workspace: string,
+  libraryDir?: string,
+  confirmDiverged?: string[],
+) =>
+  invoke<InitOutcome>("htyenv_complete_execute", {
+    workspace,
+    libraryDir: libraryDir || null,
+    confirmDiverged: confirmDiverged ?? [],
+  });
+
+/** diverged 官方文件:生成注入裁决指令(每个官方内置版导出到 runtime/tmp + 合并指令文本);单个传 [rel]、批量传全部。 */
+export const htyenvManagedMergeBrief = (workspace: string, rels: string[]) =>
+  invoke<string>("htyenv_managed_merge_brief", { workspace, rels });
+
+/** 标记已裁决:对给定 Managed 文件设基线=当前内置(不改内容)→ 转 Reconciled 不再报 diverged。返回处理条数。 */
+export const htyenvManagedReconcile = (workspace: string, rels: string[]) =>
+  invoke<number>("htyenv_managed_reconcile", { workspace, rels });
 
 /* ===== plan-3:工作区 ↔ 全局权威库双向同步 ===== */
 
@@ -217,6 +241,8 @@ export interface SkillLineage {
   treeMatch?: boolean;
   /** 双侧内容一致但基线陈旧(更新/回流任一即对齐) */
   baselineStale: boolean;
+  /** 库侧为内置种子(SEED_SKILLS):供环境补全聚合"官方 skill 有更新"入口筛选 */
+  bundled: boolean;
   changedFiles: ChangedFile[];
   detail?: string;
 }

@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { Workflow, WorkflowStage } from "./workflows";
+import { migrateStage, type Workflow, type WorkflowStage } from "./workflows";
 
 // 工作流运行实例：termId → 进度。**绑 termId**（dockview 布局 round-trip 后 termId 不变 →
 // 重启/重开工作区进度自动复原；Session 面板手动复原=新 termId、不继承，为已知边界。见计划决策 4）。
@@ -14,16 +14,31 @@ export interface WorkflowRun {
   cursor: number; // 当前阶段下标；=== stages.length 即全部完成
   states: StageStatus[]; // 与 stages 等长
   collapsed?: boolean; // 面板收起为右下角浮标（每终端独立，随实例持久化）
+  auto?: boolean; // 自动执行模式：注入阶段跑完静默即自动接续下一阶段，遇人工暂停（随实例持久化）
   startedAt: number;
   updatedAt: number;
 }
 
 const KEY = "htybox.workflowRuns.v1";
 
+/** 迁移旧 run 快照的阶段（{kind,text}→segments），与模板加载迁移共用 `migrateStage`。 */
+function migrateRun(r: WorkflowRun): WorkflowRun {
+  return { ...r, stages: Array.isArray(r.stages) ? r.stages.map(migrateStage) : [] };
+}
+
+function migrateRunStore(v: unknown): Record<string, WorkflowRun> {
+  const out: Record<string, WorkflowRun> = {};
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    for (const [tid, run] of Object.entries(v as Record<string, unknown>)) {
+      out[tid] = migrateRun(run as WorkflowRun);
+    }
+  }
+  return out;
+}
+
 function load(): Record<string, WorkflowRun> {
   try {
-    const v = JSON.parse(localStorage.getItem(KEY) || "{}");
-    if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, WorkflowRun>;
+    return migrateRunStore(JSON.parse(localStorage.getItem(KEY) || "{}"));
   } catch {
     /* localStorage 不可用 / 损坏 → 降级空表 */
   }
@@ -141,6 +156,13 @@ export function setRunCollapsed(termId: string, collapsed: boolean): void {
   commit(termId, { ...r, collapsed, updatedAt: Date.now() });
 }
 
+/** 自动执行模式开关（每实例持久化；driver 在 WorkflowBar 据此自动接续/暂停）。 */
+export function setRunAuto(termId: string, auto: boolean): void {
+  const r = store[termId];
+  if (!r) return;
+  commit(termId, { ...r, auto, updatedAt: Date.now() });
+}
+
 /** 解绑/终端关闭清理：删除该终端的实例。 */
 export function clearRun(termId: string): void {
   if (store[termId]) commit(termId, undefined);
@@ -155,8 +177,7 @@ const SKEY = "htybox.workflowRunsBySession.v1"; // { [sessionKey]: WorkflowRun }
 
 function loadSessionStore(): Record<string, WorkflowRun> {
   try {
-    const v = JSON.parse(localStorage.getItem(SKEY) || "{}");
-    if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, WorkflowRun>;
+    return migrateRunStore(JSON.parse(localStorage.getItem(SKEY) || "{}"));
   } catch {
     /* ignore */
   }

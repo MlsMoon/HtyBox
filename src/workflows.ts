@@ -8,13 +8,20 @@ import { useSyncExternalStore } from "react";
 
 export type StageKind = "inject" | "manual";
 
+/** 阶段片段：一个阶段由若干有序片段拼接。inject=固定文本(skill/@引用/文本)；manual=执行时用户填写(text=指引/占位)。 */
+export interface StageSegment {
+  id: string;
+  kind: StageKind;
+  /** inject：固定注入文本；manual：给用户的指引/占位文案 */
+  text: string;
+}
+
 export interface WorkflowStage {
   id: string;
   name: string; // 阶段名，如"预热上下文"
-  kind: StageKind;
-  /** inject：注入终端的命令文本（如 "/htybox-dev"）；manual：给用户的指引文案 */
-  text: string;
-  /** inject 专用：注入后是否自动补回车（false = 用户补参数后自己回车） */
+  /** 有序片段序列（人工/注入混排，执行时按序拼接）；旧 {kind,text} 单一阶段在 load 迁移为单片段 */
+  segments: StageSegment[];
+  /** 注入后是否自动补回车（作用于整条拼接消息） */
   pressEnter: boolean;
 }
 
@@ -37,13 +44,66 @@ export function genId(): string {
   return `wf-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
 }
 
+export function emptySegment(kind: StageKind = "inject"): StageSegment {
+  return { id: genId(), kind, text: "" };
+}
+
 const stage = (name: string, kind: StageKind, text: string, pressEnter = true): WorkflowStage => ({
   id: genId(),
   name,
-  kind,
-  text,
+  segments: [{ id: genId(), kind, text }],
   pressEnter,
 });
+
+/** 阶段是否含人工片段（执行时需用户填写→暂停点；无则纯注入，可一键/自动执行）。 */
+export function hasManual(s: WorkflowStage): boolean {
+  return s.segments.some((seg) => seg.kind === "manual");
+}
+
+/** 纯注入阶段：全部注入片段按序空格拼接（供一键 / 自动执行）。 */
+export function injectOnlyText(s: WorkflowStage): string {
+  return s.segments
+    .filter((seg) => seg.kind === "inject")
+    .map((seg) => seg.text)
+    .filter(Boolean)
+    .join(" ");
+}
+
+/** 旧 {kind,text} 单一阶段 → 单片段；已是 segments 则规整化。加载期（模板 + run 快照）迁移共用。 */
+export function migrateStage(s: unknown): WorkflowStage {
+  const o = (s ?? {}) as Record<string, unknown>;
+  const name = typeof o.name === "string" ? o.name : "";
+  const pressEnter = o.pressEnter !== false;
+  const id = typeof o.id === "string" ? o.id : genId();
+  const segFrom = (kind: unknown, text: unknown): StageSegment => ({
+    id: genId(),
+    kind: kind === "manual" ? "manual" : "inject",
+    text: typeof text === "string" ? text : "",
+  });
+  if (Array.isArray(o.segments)) {
+    const segs = o.segments.map((seg) => {
+      const so = (seg ?? {}) as Record<string, unknown>;
+      return {
+        id: typeof so.id === "string" ? so.id : genId(),
+        kind: so.kind === "manual" ? "manual" : "inject",
+        text: typeof so.text === "string" ? so.text : "",
+      } as StageSegment;
+    });
+    return { id, name, segments: segs.length ? segs : [emptySegment()], pressEnter };
+  }
+  return { id, name, segments: [segFrom(o.kind, o.text)], pressEnter };
+}
+
+/** 迁移整条工作流（其阶段逐个迁移）。 */
+export function migrateWorkflow(w: unknown): Workflow {
+  const o = (w ?? {}) as Record<string, unknown>;
+  return {
+    id: typeof o.id === "string" ? o.id : genId(),
+    name: typeof o.name === "string" ? o.name : "",
+    description: typeof o.description === "string" ? o.description : undefined,
+    stages: Array.isArray(o.stages) ? o.stages.map(migrateStage) : [],
+  };
+}
 
 /** 工作区首次播种的内置种子：用户的常规 skill 驱动开发流。 */
 function seedWorkflow(): Workflow {
@@ -69,7 +129,7 @@ function seedWorkflow(): Workflow {
 function loadLegacy(): Workflow[] | null {
   try {
     const v = JSON.parse(localStorage.getItem(LEGACY_KEY) || "null");
-    if (Array.isArray(v) && v.length) return v as Workflow[];
+    if (Array.isArray(v) && v.length) return (v as unknown[]).map(migrateWorkflow);
   } catch {
     /* ignore */
   }
@@ -79,7 +139,13 @@ function loadLegacy(): Workflow[] | null {
 function load(): Record<string, Workflow[]> {
   try {
     const v = JSON.parse(localStorage.getItem(KEY) || "{}");
-    if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, Workflow[]>;
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      const out: Record<string, Workflow[]> = {};
+      for (const [scope, list] of Object.entries(v as Record<string, unknown>)) {
+        if (Array.isArray(list)) out[scope] = list.map(migrateWorkflow); // 旧 {kind,text} 阶段迁移为单片段
+      }
+      return out;
+    }
   } catch {
     /* localStorage 不可用 / 损坏 → 降级空表 */
   }
@@ -160,7 +226,7 @@ export function duplicateWorkflow(scope: string, id: string): void {
 }
 
 export function emptyStage(): WorkflowStage {
-  return { id: genId(), name: "", kind: "inject", text: "", pressEnter: true };
+  return { id: genId(), name: "", segments: [emptySegment("inject")], pressEnter: true };
 }
 
 export function emptyWorkflow(): Workflow {
@@ -174,7 +240,11 @@ export function validateWorkflow(wf: Workflow): string | null {
   for (let i = 0; i < wf.stages.length; i++) {
     const s = wf.stages[i];
     if (!s.name.trim()) return `阶段 ${i + 1} 缺少名称`;
-    if (s.kind === "inject" && !s.text.trim()) return `阶段 ${i + 1}「${s.name}」为注入型但注入文本为空`;
+    if (s.segments.length === 0) return `阶段 ${i + 1}「${s.name}」至少需要一个片段`;
+    for (const seg of s.segments) {
+      if (seg.kind === "inject" && !seg.text.trim())
+        return `阶段 ${i + 1}「${s.name}」有注入片段为空`;
+    }
   }
   return null;
 }

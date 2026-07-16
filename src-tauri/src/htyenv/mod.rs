@@ -6,6 +6,7 @@ pub mod dashboard;
 pub mod init;
 pub mod library;
 pub mod lineage;
+pub mod managed;
 pub mod manifest;
 pub mod memory_sync;
 pub mod report;
