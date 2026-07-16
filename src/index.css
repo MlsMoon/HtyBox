@@ -372,3 +372,13 @@ html.dark .cursor-glyph {
   .htybox-auto-flow,
   .htybox-auto-travel { animation: none; }
 }
+
+/* 内联填空：人工片段 textarea 随内容自适应宽高、无长度上限，超出容器宽即自动换行（保持连贯可读）。
+   field-sizing:content 让 textarea 按内容撑宽/撑高；到 max-width 即换行、高度自增。 */
+.htybox-seg-field {
+  field-sizing: content;
+  min-width: 4ch;
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

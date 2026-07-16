@@ -97,6 +97,7 @@ export default function WorkflowBar({
   const [attachments, setAttachments] = useState<string[]>([]);
   // 多段人工阶段：每个人工片段各自的输入（文字 + 粘贴的截图附件），键=片段 id。瞬态（决策 3-A）。
   const [segInputs, setSegInputs] = useState<Record<string, { text: string; atts: string[] }>>({});
+  const [dragSeg, setDragSeg] = useState<string | null>(null); // 内联填空：拖拽悬停的目标人工片段 id（落点高亮）
   const [confirmUnbind, setConfirmUnbind] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const ranThisStage = useRef(false); // 本阶段注入后 agent 是否跑起来过（区分"未开跑"与"已静默"）
@@ -316,10 +317,6 @@ export default function WorkflowBar({
     }
   };
 
-  // 内联填空：人工片段 input 的字符宽（CJK 计 2），随内容自适应、6~44 夹逼
-  const dispWidth = (s: string) =>
-    Math.min(Math.max([...s].reduce((n, c) => n + (c.charCodeAt(0) > 0x2e80 ? 2 : 1), 0) + 1, 6), 44);
-
   // 输入框显隐：手动覆盖优先，否则含人工片段的阶段自动展开
   const showInput = !done && (inputOverride ?? (!!cur && hasManual(cur)));
 
@@ -418,7 +415,12 @@ export default function WorkflowBar({
             ) : (
               /* 内联填空式：注入=橙 token 只读、人工=下划线可填、图片内联；框本身即最终发送（无独立预览） */
               <>
-                <div className="flex flex-wrap items-center gap-x-1 gap-y-2 rounded-xl border border-[var(--accent)]/50 bg-[#1f1e1d] px-3 py-2.5">
+                <div
+                  className="flex flex-wrap items-center gap-x-1 gap-y-2 rounded-xl border border-[var(--accent)]/50 bg-[#1f1e1d] px-3 py-2.5"
+                  onDragLeave={(e) => {
+                    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragSeg(null);
+                  }}
+                >
                   {cur.segments.map((seg) =>
                     seg.kind === "inject" ? (
                       <span
@@ -430,9 +432,9 @@ export default function WorkflowBar({
                       </span>
                     ) : (
                       <span key={seg.id} className="inline-flex items-center gap-1">
-                        <input
+                        <textarea
                           value={segVal(seg.id).text}
-                          size={dispWidth(segVal(seg.id).text || seg.text || "填写")}
+                          rows={1}
                           onChange={(e) => setSegText(seg.id, e.target.value)}
                           onKeyDown={(e) => {
                             e.stopPropagation();
@@ -447,10 +449,19 @@ export default function WorkflowBar({
                             if (!e.dataTransfer.types.includes(DRAG_MIME)) return;
                             e.preventDefault();
                             e.dataTransfer.dropEffect = "copy";
+                            if (dragSeg !== seg.id) setDragSeg(seg.id);
                           }}
-                          onDrop={(e) => onSegDrop(seg.id, e)}
+                          onDrop={(e) => {
+                            setDragSeg(null);
+                            onSegDrop(seg.id, e);
+                          }}
                           placeholder={seg.text || "填写…"}
-                          className="border-b border-dashed border-[var(--accent)]/50 bg-transparent px-0.5 text-[12px] text-[#e5e2dc] outline-none placeholder:text-[#8c8a82]/70 focus:border-solid focus:border-[var(--accent)]"
+                          className={
+                            "htybox-seg-field resize-none rounded border-b border-dashed bg-transparent px-1 py-0.5 align-bottom text-[12px] leading-snug text-[#e5e2dc] outline-none placeholder:text-[#8c8a82]/70 " +
+                            (dragSeg === seg.id
+                              ? "border-solid border-[var(--accent)] bg-[var(--accent)]/15 ring-1 ring-[var(--accent)]"
+                              : "border-[var(--accent)]/50 focus:border-solid focus:border-[var(--accent)]")
+                          }
                         />
                         {segVal(seg.id).atts.map((p) => (
                           <span
