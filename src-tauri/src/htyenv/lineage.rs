@@ -121,6 +121,10 @@ struct SkillFacts {
     base: Option<String>,
     lib_registered: bool,
     lib_sha: Option<String>,
+    /// 基线 sha 是否出现在库版本链或库登记 current 中。
+    /// 用于识破「librarySha 被抬成工程现值、但库从未收过该版」的失效基线,
+    /// 避免误判 LibraryAhead(UI 显示「更新」而实为工程领先)。
+    base_known_by_library: bool,
     tree_match: Option<bool>,
     changed_files: Vec<ChangedFile>,
 }
@@ -144,13 +148,18 @@ fn collect_facts(
         .iter()
         .find(|s| s.id == id)
         .and_then(|s| s.library_sha.clone());
-    let lib_registered = library.skills.iter().any(|s| s.id == id);
+    let lib_entry = library.skills.iter().find(|s| s.id == id);
+    let lib_registered = lib_entry.is_some();
     let lib_dir = library_dir.join(library::LIBRARY_SKILLS_DIR).join(id);
     let lib_file = lib_dir.join(manifest::SKILL_ENTRY);
     let lib_sha = if lib_registered && lib_file.is_file() {
         Some(manifest::sha256_file_upper(&lib_file)?)
     } else {
         None
+    };
+    let base_known_by_library = match (base.as_deref(), lib_entry) {
+        (Some(b), Some(entry)) => library_knows_sha(entry, b),
+        _ => false,
     };
     let (tree_match, changed_files) = if ws_sha.is_some() && lib_sha.is_some() {
         let (matched, changed) = diff_trees(&tree_digests(&ws_dir)?, &tree_digests(&lib_dir)?);
@@ -163,9 +172,15 @@ fn collect_facts(
         base,
         lib_registered,
         lib_sha,
+        base_known_by_library,
         tree_match,
         changed_files,
     })
+}
+
+/// 库是否曾以该 sha 为登记 current 或版本链节点(不含仅实文件漂移、尚未 refresh 的现值)。
+fn library_knows_sha(entry: &library::LibrarySkillEntry, sha: &str) -> bool {
+    entry.current_sha256 == sha || entry.versions.iter().any(|v| v.sha256 == sha)
 }
 
 /// 目录树内容指纹:相对路径('/' 分隔) → 文件 SHA-256 大写(含隐藏文件,不跟符号链接)。
@@ -281,7 +296,16 @@ fn judge(f: &SkillFacts) -> (LineageState, bool, Option<String>) {
                         false,
                         d("库内已有同 id 但内容不同(可能同名非同源)——建立关联需注入终端裁决"),
                     ),
-                    Some(b) if b == w => (LineageState::LibraryAhead, false, None),
+                    // b==w 本义=「工程未动、库前进」→ LibraryAhead;但若库版本史从未有过 b,
+                    // 则基线是失效的(常为工程 librarySha 被抬成现值却未回流),绝不能提示「更新」盖掉工程。
+                    Some(b) if b == w && f.base_known_by_library => {
+                        (LineageState::LibraryAhead, false, None)
+                    }
+                    Some(b) if b == w => (
+                        LineageState::Diverged,
+                        false,
+                        d("谱系基线 librarySha 不在库版本史上(基线失效,常见于未回流却抬基线)——勿点更新;确认后以工程为准回流或以库为准覆盖"),
+                    ),
                     Some(b) if b == l => (LineageState::WorkspaceAhead, false, None),
                     Some(_) => (LineageState::Diverged, false, d("双侧各自演进——注入终端裁决")),
                 }
@@ -785,6 +809,49 @@ mod tests {
             report.library_only.contains(&"lib-extra".to_string()),
             "lib-extra 应属 library_only: {:?}",
             report.library_only
+        );
+    }
+
+    /// 失效基线:librarySha 被抬成工程现值,但该 sha 从未进入库版本史 → 不得误判 LibraryAhead。
+    #[test]
+    fn corrupt_baseline_not_in_library_history_is_diverged_not_library_ahead() {
+        let (_w, ws) = setup_ws();
+        let ltmp = tempfile::tempdir().unwrap();
+        let lib = ltmp.path().join("global-env");
+        add_skill(&ws, "svg-x", &fm("svg-x", "OLD"));
+        library::collect_skill(&ws, &lib, "svg-x").unwrap();
+        // 工程前进到 NEW,并把 librarySha 伪造成 NEW(模拟未回流却抬基线)
+        let new_body = fm("svg-x", "NEW");
+        let new_sha = manifest::sha256_hex_upper(new_body.as_bytes());
+        fs::write(ws.join(".htyworkflows/skills/svg-x/SKILL.md"), &new_body).unwrap();
+        let mut m = manifest::load(&ws).unwrap();
+        let e = m.skills.iter_mut().find(|s| s.id == "svg-x").unwrap();
+        e.entry_sha256 = new_sha.clone();
+        e.library_sha = Some(new_sha);
+        manifest::save(&ws, &m).unwrap();
+
+        let report = compare(&ws, &lib).unwrap();
+        let row = report.skills.iter().find(|s| s.id == "svg-x").unwrap();
+        assert_eq!(
+            row.state,
+            LineageState::Diverged,
+            "失效基线不得显示为可更新: {:?}",
+            row.detail
+        );
+        assert!(
+            row.detail.as_deref().unwrap_or("").contains("基线失效"),
+            "detail={:?}",
+            row.detail
+        );
+
+        // 对照:真 LibraryAhead(库文件外部演进、基线仍在版本史)仍应成立
+        add_skill(&ws, "lib-ok", &fm("lib-ok", "A1"));
+        library::collect_skill(&ws, &lib, "lib-ok").unwrap();
+        fs::write(lib.join("skills/lib-ok/SKILL.md"), fm("lib-ok", "A2")).unwrap();
+        let report2 = compare(&ws, &lib).unwrap();
+        assert_eq!(
+            report2.skills.iter().find(|s| s.id == "lib-ok").unwrap().state,
+            LineageState::LibraryAhead
         );
     }
 
