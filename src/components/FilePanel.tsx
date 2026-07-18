@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   listDir,
   createEntry,
@@ -92,6 +92,8 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
   const [showIgnore, setShowIgnore] = useState(false);
   const [showTop, setShowTop] = useState(false); // 滚动超过阈值 → 浮现「回到顶部」按钮（瞬时态，不持久化）
   const scrollDoneFor = useRef<string | null>(null);
+  // ⟳ 刷新周期内暂存 scrollTop；树重新可滚后写回（不落盘）
+  const pendingScrollTop = useRef<number | null>(null);
   // 拖拽时的自动滚动（悬停上/下条带即滚动列表）
   const scrollRef = useRef<HTMLDivElement>(null);
   const autoScroll = useRef<number | null>(null);
@@ -125,6 +127,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
 
   useEffect(() => {
     const saved = getWsState<string[]>(EXP_KEY, root, []); // 复原该工作区上次展开的目录
+    pendingScrollTop.current = null; // 切工作区不沿用上一 root 的刷新恢复
     setChildren({}); setExpanded(new Set(saved)); setErrors({}); setMenu(null);
     setIgnore(loadIgnore(root)); setActiveFile(null); setSelected(new Set()); setAnchor(null); setShowTop(false);
     setFavFolders(loadFavFolders(root));
@@ -153,7 +156,32 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
   const relOf = (p: string) => (p.startsWith(root) ? p.slice(root.length).replace(/^[\\/]/, "") : p);
   const dirFor = (n: DirEntry) => (n.isDir ? n.path : dirOf(n.path));
   const reloadDir = (d: string) => { if (d === root || children[d]) load(d); };
-  const refresh = () => { setChildren({}); if (root) load(root); expanded.forEach((p) => p !== root && load(p)); };
+  const refresh = () => {
+    if (scrollRef.current) pendingScrollTop.current = scrollRef.current.scrollTop;
+    setChildren({});
+    if (root) load(root);
+    expanded.forEach((p) => p !== root && load(p));
+  };
+
+  // ⟳ 清空 children 后 scrollTop 被浏览器归零；等展开目录 load 完再写回（reveal 进行中则让位）
+  useLayoutEffect(() => {
+    const pending = pendingScrollTop.current;
+    if (pending == null) return;
+    if (activeFile && scrollDoneFor.current !== activeFile) {
+      pendingScrollTop.current = null;
+      return;
+    }
+    const wait: string[] = [];
+    if (root) wait.push(root);
+    expanded.forEach((p) => { if (p !== root) wait.push(p); });
+    if (wait.some((p) => loading.has(p))) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const max = Math.max(0, el.scrollHeight - el.clientHeight);
+    el.scrollTop = Math.min(Math.max(0, pending), max);
+    setShowTop(el.scrollTop > 200);
+    pendingScrollTop.current = null;
+  }, [children, loading, expanded, root, activeFile]);
 
   // N6：忽略过滤（顶层文件夹按名 + 文件按扩展名）
   const filterEntries = (list: DirEntry[], depth: number) =>
