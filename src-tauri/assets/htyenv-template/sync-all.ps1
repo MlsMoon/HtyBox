@@ -1,5 +1,6 @@
-# sync-all.ps1 — 全 Agent 完整同步与对齐检查（机械部分；人工项只报告不代劳）
+﻿# sync-all.ps1 — 全 Agent 完整同步与对齐检查（机械部分；人工项只报告不代劳）
 # 产物: agentsSynchronizer/last-sync-report.md;退出码 0=全绿, 1=存在需处理项
+# 编码: 本文件必须保存为 UTF-8 with BOM，否则 Windows PowerShell 5.1 会按系统代码页误读中文并解析失败。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $w = Join-Path $root '.htyworkflows'

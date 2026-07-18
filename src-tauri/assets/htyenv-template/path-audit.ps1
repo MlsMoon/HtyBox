@@ -1,7 +1,8 @@
-# path-audit.ps1 — 旧 Agent 路径语义审计：扫描 .claude/.agents 业务引用，对照 allowlist 分类
+﻿# path-audit.ps1 — 旧 Agent 路径语义审计：扫描 .claude/.agents 业务引用，对照 allowlist 分类
 # 违规定义：活跃能力层（canonical skills/rules/memory 索引；若存在则含工程代码根如 Unity Assets）中出现未登记的 .claude/.agents 业务路径
 # 用法: .\path-audit.ps1  （退出码 0=干净, 1=有违规）
 # 豁免清单（工程特有数据的配置点）：tools/path-audit-skip.json = ["skills/x/SKILL.md", ...]（env 根相对、'/' 分隔）
+# 编码: 本文件必须保存为 UTF-8 with BOM，否则 Windows PowerShell 5.1 会按系统代码页误读中文并解析失败。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 

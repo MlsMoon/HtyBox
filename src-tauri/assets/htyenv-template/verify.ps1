@@ -1,5 +1,6 @@
-# verify.ps1 — canonical 完整性综合校验（数量/大小写/frontmatter/编码/哈希/引用/适配器/registry/记忆/保护基线）
+﻿# verify.ps1 — canonical 完整性综合校验（数量/大小写/frontmatter/编码/哈希/引用/适配器/registry/记忆/保护基线）
 # 用法: .\verify.ps1   （全部通过退出码 0；任何一项失败退出码 1）
+# 编码: 本文件必须保存为 UTF-8 with BOM，否则 Windows PowerShell 5.1 会按系统代码页误读中文并解析失败。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $w = Join-Path $root '.htyworkflows'

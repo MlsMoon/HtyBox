@@ -1,4 +1,4 @@
-# sync-adapters.ps1 — 从 canonical 确定性生成两端薄适配器（.claude/skills、.agents/skills）
+﻿# sync-adapters.ps1 — 从 canonical 确定性生成两端薄适配器（.claude/skills、.agents/skills）
 # 格式契约 v1：与 HtyHubApp skillsService.buildAdapterContent / HtyBox htyenv::adapters 字节一致——
 #   适配器 = canonical SKILL.md 的 frontmatter 原字节块(含可选 BOM 与结尾换行) + "\n" + LF 模板
 # 用法:
@@ -9,6 +9,7 @@
 #       决策 6 改名的旧目录(.claude/skills/skill-creator 等旧正文)不在本工具管辖，留 Step 12 清理。
 # NTFS 注意: Windows 大小写不敏感，对已存在的 skill.md 直接 WriteAllBytes(SKILL.md)
 #           只会覆盖内容、不会改正文件名大小写；写入前必须先删除任意大小写变体。
+# 编码: 本文件必须保存为 UTF-8 with BOM，否则 Windows PowerShell 5.1 会按系统代码页误读中文并解析失败。
 param([switch]$Check, [string]$SkillId)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent   # 工程根
@@ -19,7 +20,10 @@ $MARK = 'AUTO-GENERATED ADAPTER (hty-sync-adapters v1)'
 # 提取 frontmatter 原字节块（与 TS sliceFrontmatterBytes 同规则）
 function Get-FrontmatterBytes([byte[]]$raw) {
     $text = [Text.Encoding]::UTF8.GetString($raw)
-    $m = [regex]::Match($text, "(?s)^﻿?---\r?\n.*?\r?\n---(\r?\n|$)")
+    # 可选 UTF-8 BOM（U+FEFF），避免在源码中嵌入不可见字符
+    $bom = [string][char]0xFEFF
+    $pattern = '(?s)^' + [regex]::Escape($bom) + '?\-\-\-\r?\n.*?\r?\n\-\-\-(\r?\n|$)'
+    $m = [regex]::Match($text, $pattern)
     if (-not $m.Success) { return $null }
     return [Text.Encoding]::UTF8.GetBytes($m.Value)
 }
@@ -28,7 +32,12 @@ function Get-FrontmatterBytes([byte[]]$raw) {
 function Build-AdapterBytes([string]$skillId, [byte[]]$canonicalRaw) {
     $fm = Get-FrontmatterBytes $canonicalRaw
     $sha = [System.Security.Cryptography.SHA256]::Create()
-    $hash = ([BitConverter]::ToString($sha.ComputeHash($canonicalRaw)) -replace '-', '').ToUpperInvariant()
+    try {
+        $hash = ([BitConverter]::ToString($sha.ComputeHash($canonicalRaw)) -replace '-', '').ToUpperInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
     $template = @(
         "<!-- $MARK - DO NOT EDIT -->",
         "<!-- canonical: .htyworkflows/skills/$skillId/SKILL.md -->",
@@ -46,11 +55,16 @@ function Build-AdapterBytes([string]$skillId, [byte[]]$canonicalRaw) {
     return [Text.Encoding]::UTF8.GetBytes($template)
 }
 
+# 判断文件名是否为 skill.md（忽略大小写）
+function Test-IsSkillMdName([string]$name) {
+    return [string]::Equals($name, 'SKILL.md', [StringComparison]::OrdinalIgnoreCase)
+}
+
 # 取目录内 skill 入口文件的真实大小写名；无则返回 $null
 function Get-SkillEntryExactName([string]$dir) {
     if (-not (Test-Path -LiteralPath $dir)) { return $null }
     $di = [IO.DirectoryInfo]::new($dir)
-    $f = $di.GetFiles() | Where-Object { $_.Name -match '^(?i)skill\.md$' } | Select-Object -First 1
+    $f = $di.GetFiles() | Where-Object { Test-IsSkillMdName $_.Name } | Select-Object -First 1
     if ($null -eq $f) { return $null }
     return $f.Name
 }
@@ -60,7 +74,7 @@ function Write-AdapterSkillMd([string]$dst, [byte[]]$bytes) {
     $dir = Split-Path $dst -Parent
     New-Item -ItemType Directory -Force $dir | Out-Null
     $di = [IO.DirectoryInfo]::new($dir)
-    foreach ($f in @($di.GetFiles() | Where-Object { $_.Name -match '^(?i)skill\.md$' })) {
+    foreach ($f in @($di.GetFiles() | Where-Object { Test-IsSkillMdName $_.Name })) {
         $f.Delete()
     }
     [IO.File]::WriteAllBytes((Join-Path $dir 'SKILL.md'), $bytes)

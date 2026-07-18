@@ -119,7 +119,7 @@ function seedWorkflow(): Workflow {
       stage("执行计划", "inject", "/plan-auto-execute"),
       stage("验收", "manual", "验证产物：实测 / 构建 / UI 检查"),
       stage("归档计划", "inject", "/plan-finish"),
-      stage("沉淀记忆", "inject", "/htybox-memory-skill-update"),
+      stage("沉淀记忆", "inject", "/htyworkflows-memory-skill-update"),
       stage("更新日志（可跳过）", "inject", "/changelog-append"),
     ],
   };

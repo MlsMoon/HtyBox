@@ -1,6 +1,7 @@
-# bootstrap.ps1 — 首次建立/修复 .htyworkflows 目录骨架与 Agent 适配入口
+﻿# bootstrap.ps1 — 首次建立/修复 .htyworkflows 目录骨架与 Agent 适配入口
 # 幂等：已存在的目录与文件不会被覆盖；只补缺失结构
 # 用法: .\bootstrap.ps1 [-WithAdapters]  (-WithAdapters 会调用 sync-adapters.ps1 重建两端适配器)
+# 编码: 本文件必须保存为 UTF-8 with BOM，否则 Windows PowerShell 5.1 会按系统代码页误读中文并解析失败。
 param([switch]$WithAdapters)
 $ErrorActionPreference = 'Stop'
 $w = Split-Path $PSScriptRoot -Parent   # .htyworkflows 根

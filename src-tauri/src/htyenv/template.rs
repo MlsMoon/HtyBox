@@ -9,7 +9,7 @@ use serde_json::{json, Map};
 
 use super::manifest::ProviderConfig;
 
-pub const TEMPLATE_VERSION: u32 = 2;
+pub const TEMPLATE_VERSION: u32 = 3;
 
 /// env 根下目录权威清单('/' 分隔,初始化必建;只增不删)。
 pub const TEMPLATE_DIRS: &[&str] = &[
