@@ -1,4 +1,4 @@
-//! 监听 skill / memory / Claude·Codex·Cursor 会话落盘，防抖后向前端发刷新事件（M3b）。
+//! 监听 skill / memory / Claude·Codex·Cursor·Kimi 会话落盘，防抖后向前端发刷新事件（M3b）。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -74,6 +74,18 @@ fn is_cursor_session_watch_path(path: &Path, chats_root: &Path) -> bool {
     path_key.ends_with("/meta.json")
 }
 
+/// Kimi：`<数据根>/sessions/<workDirKey>/<sessionId>/state.json`（title / updatedAt 更新）。
+fn is_kimi_session_watch_path(path: &Path, sessions_root: &Path) -> bool {
+    let path_key = watch_path_key(path);
+    let root = watch_path_key(sessions_root)
+        .trim_end_matches('/')
+        .to_string();
+    if !path_key.starts_with(&format!("{root}/")) {
+        return false;
+    }
+    path_key.ends_with("/state.json")
+}
+
 /// `projects/<slug>/memory` 本身或其任意后代才是原生 Memory 变化。
 /// 同级导入 staging/old/conflict 即使内部含 `payload/memory` 也不能暴露。
 fn is_claude_memory_path(path: &Path, projects_root: &Path) -> bool {
@@ -121,6 +133,15 @@ pub fn start(app: AppHandle) {
     let codex_for_handler = codex.clone();
     let cursor_chats = home.join(".cursor").join("chats");
     let cursor_chats_for_handler = cursor_chats.clone();
+    // kimi 数据根：KIMI_CODE_HOME 优先，缺省 ~/.kimi-code（与 sessions::kimi_data_root 同契约）
+    let kimi_data = std::env::var("KIMI_CODE_HOME")
+        .ok()
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".kimi-code"));
+    let kimi_sessions_root = kimi_data.join("sessions");
+    let kimi_sessions_for_handler = kimi_sessions_root.clone();
 
     let handler_app = app.clone();
     let debouncer = new_debouncer(
@@ -134,6 +155,7 @@ pub fn start(app: AppHandle) {
             let mut claude_sessions = false;
             let mut codex_sessions = false;
             let mut cursor_sessions = false;
+            let mut kimi_sessions = false;
             for e in &events {
                 let p = e.path.to_string_lossy().replace('\\', "/");
                 if p.contains("/.claude/skills/") || p.contains("/plugins/") {
@@ -155,6 +177,9 @@ pub fn start(app: AppHandle) {
                 if is_cursor_session_watch_path(&e.path, &cursor_chats_for_handler) {
                     cursor_sessions = true;
                 }
+                if is_kimi_session_watch_path(&e.path, &kimi_sessions_for_handler) {
+                    kimi_sessions = true;
+                }
             }
             if skills {
                 let _ = handler_app.emit("skills-changed", ());
@@ -170,6 +195,9 @@ pub fn start(app: AppHandle) {
             }
             if cursor_sessions {
                 let _ = handler_app.emit("cursor-sessions-changed", ());
+            }
+            if kimi_sessions {
+                let _ = handler_app.emit("kimi-sessions-changed", ());
             }
         },
     );
@@ -194,6 +222,8 @@ pub fn start(app: AppHandle) {
     let _ = w.watch(&codex.join("sessions"), RecursiveMode::Recursive);
     // Cursor：chats/<hash>/<chatId>/meta.json 的 title 更新
     let _ = w.watch(&cursor_chats, RecursiveMode::Recursive);
+    // Kimi：sessions/<workDirKey>/<sessionId>/state.json 的 title/updatedAt 更新
+    let _ = w.watch(&kimi_sessions_root, RecursiveMode::Recursive);
 
     // 保活到进程结束：drop 会停止监听
     std::mem::forget(debouncer);

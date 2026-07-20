@@ -17,6 +17,8 @@ import {
   focusEngine,
   setEngineTitleHandler,
   refitEngine,
+  injectAndSubmit,
+  listEngines,
 } from "./terminalEngine";
 import {
   PROFILES,
@@ -31,6 +33,7 @@ import {
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
 import cursorIcon from "../assets/cursor.svg";
+import kimiIcon from "../assets/kimi.svg";
 import { ProfileIcon } from "./ProfileIcon";
 import HtyBoxLogo from "./ui/HtyBoxLogo";
 import {
@@ -46,7 +49,7 @@ import DockEditor, { disposeEditorBuf, isEditorDirty } from "./DockEditor";
 import RunConfigBar from "./RunConfigBar";
 import DockActionsMenu from "./DockActionsMenu";
 import { registerDockHost } from "../dockBus";
-import { captureSessionIds, listClaudeSessions, listCodexSessions, listCursorSessions } from "../catalog";
+import { captureSessionIds, listClaudeSessions, listCodexSessions, listCursorSessions, listKimiSessions } from "../catalog";
 import { getSessionTitle, setSessionTitle, onSessionTitlesChange, splitStatusPrefix } from "../sessionTitles";
 import {
   getNativeSessionLabel,
@@ -157,6 +160,21 @@ function abortSessionCapture(termId: string): void {
   delete CAPTURE_SINCE[termId];
 }
 
+/** kimi 无位置 prompt 参数：团队简报改为终端 PTY 就绪后注入。
+ *  typed-ahead 由控制台输入缓冲保存、TUI 启动即消费（已实测），故引擎建好即可注入。 */
+function injectBriefWhenReady(termId: string, prompt: string): void {
+  let tries = 0;
+  const timer = window.setInterval(() => {
+    tries += 1;
+    if (listEngines(termId).some((e) => e.termId === termId)) {
+      window.clearInterval(timer);
+      injectAndSubmit(termId, prompt, true);
+    } else if (tries >= 100) {
+      window.clearInterval(timer); // 10s 未就绪（面板被秒关等）→ 放弃注入
+    }
+  }, 100);
+}
+
 /** 把当前 cwd 下该 agent 的 list label 写入原生名缓存，供 Tab 与 Session 列表同构。 */
 async function refreshNativeLabels(agentKind: AgentKind, cwd: string): Promise<void> {
   if (!cwd || !isAgentTerminal(agentKind)) return;
@@ -166,7 +184,9 @@ async function refreshNativeLabels(agentKind: AgentKind, cwd: string): Promise<v
         ? listClaudeSessions
         : agentKind === "codex"
           ? listCodexSessions
-          : listCursorSessions;
+          : agentKind === "kimi"
+            ? listKimiSessions
+            : listCursorSessions;
     const list = await fetcher(cwd);
     setNativeSessionLabels(
       agentKind,
@@ -328,7 +348,7 @@ export function markWorkspaceClosing(workspaceId: string): void {
   CLOSING.add(workspaceId);
 }
 
-// Tab 类型图标（方案 B 实心彩色徽章）：ClaudeCode/Codex 用现有素材（codex 随主题 invert）；
+// Tab 类型图标（方案 B 实心彩色徽章）：ClaudeCode/Codex/Cursor/Kimi 用官方素材（codex/cursor 随主题 invert，kimi 浅色带底）；
 // 其余 6 类内联彩色徽章。普通终端随主题色（底=var(--text)、字=var(--bg)，暗色下不糊）。
 const TAB_CODE_RE = /\.(ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|c|h|cc|cpp|hpp|cs|rb|php|swift|kt|kts|scala|sh|bash|zsh|ps1|bat|lua|sql|r|dart|vue|svelte|astro|json|json5|jsonc|ya?ml|toml|xml|html?|css|scss|sass|less|styl|graphql|proto)$/i;
 const TAB_IMG_RE = /\.(png|jpe?g|jfif|gif|webp|bmp|ico|avif)$/i;
@@ -340,6 +360,7 @@ function TabTypeIcon({ params }: { params: TermParams & { editorPath?: string } 
     if (params.agentKind === "claude") return <img src={claudeIcon} alt="" className={cls} draggable={false} />;
     if (params.agentKind === "codex") return <img src={codexIcon} alt="" className={"codex-glyph " + cls} draggable={false} />;
     if (params.agentKind === "cursor") return <img src={cursorIcon} alt="" className={"cursor-glyph " + cls} draggable={false} />;
+    if (params.agentKind === "kimi") return <img src={kimiIcon} alt="" className={"kimi-glyph " + cls} draggable={false} />;
     return (
       <svg className={cls} viewBox="0 0 24 24">
         <rect x="2" y="3.5" width="20" height="17" rx="5" fill="var(--text)" />
@@ -632,7 +653,7 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
       applyTabTitle(termId, agentKind, apiRef.current, SESSION_IDS[termId] ?? props.params.sessionId);
     const titleSub = onSessionTitlesChange(refreshTitle);
     const nativeSub = onNativeSessionLabelsChange(refreshTitle);
-    // Claude ai-title / Codex rollout·index / Cursor meta.json → 重拉原生 label，自动命名进 Tab
+    // Claude ai-title / Codex rollout·index / Cursor meta.json / Kimi state.json → 重拉原生 label，自动命名进 Tab
     const sessionsEvt =
       agentKind === "claude"
         ? "claude-sessions-changed"
@@ -640,7 +661,9 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
           ? "codex-sessions-changed"
           : agentKind === "cursor"
             ? "cursor-sessions-changed"
-            : null;
+            : agentKind === "kimi"
+              ? "kimi-sessions-changed"
+              : null;
     let sessionsUnlisten: (() => void) | undefined;
     let sessionsDisposed = false;
     if (sessionsEvt && cwd) {
@@ -1003,7 +1026,7 @@ export default function TerminalDock({
         } catch (e) {
           console.error("write_agent_brief failed", e);
         }
-        // claude 读 .mcp.json、codex 读 .codex/config.toml（setupMcpAgent 已分别写好）；普通启动即可
+        // 各 agent 的 MCP 配置 setupMcpAgent 已写好（.mcp.json / .codex/config.toml / .cursor/mcp.json / .kimi-code/mcp.json）
         api.addPanel({
           id,
           component: "terminal",
@@ -1028,6 +1051,8 @@ export default function TerminalDock({
             ? { referencePanel: prevId, direction: "right" }
             : undefined,
         });
+        // kimi 无位置 prompt 参数（-p 是非交互模式）：简报改为终端就绪后 injectAndSubmit 注入
+        if (spec.agentKind === "kimi") injectBriefWhenReady(id, briefPrompt(spec.agentId));
         prevId = id;
       }
     });

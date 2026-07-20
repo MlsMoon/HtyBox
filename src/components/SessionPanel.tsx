@@ -5,9 +5,11 @@ import {
   listClaudeSessions,
   listCodexSessions,
   listCursorSessions,
+  listKimiSessions,
   deleteClaudeSession,
   deleteCodexSession,
   deleteCursorSession,
+  deleteKimiSession,
   exportSessionArchive,
   importSessionArchive,
   type SessionAgent,
@@ -29,11 +31,13 @@ import { useMaskDismiss } from "./ui/maskDismiss";
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
 import cursorIcon from "../assets/cursor.svg";
+import kimiIcon from "../assets/kimi.svg";
 
 const AGENTS = [
   { k: "claude" as const, label: "Claude Code", icon: claudeIcon },
   { k: "codex" as const, label: "Codex", icon: codexIcon },
   { k: "cursor" as const, label: "Cursor", icon: cursorIcon },
+  { k: "kimi" as const, label: "Kimi", icon: kimiIcon },
 ];
 
 // 会话收藏：按工作区 root 分组，存 "agentKind:id"（持久化，跨重启），收藏的置顶成区显示。
@@ -56,9 +60,9 @@ function saveSessFavs(root: string, keys: string[]): void {
   }
 }
 
-// Session 的 claude/codex/cursor 选择按工作区持久化（用户点名要持久化的"有状态选择"）
+// Session 的 claude/codex/cursor/kimi 选择按工作区持久化（用户点名要持久化的"有状态选择"）
 type SessionAgentKind = SessionAgent;
-const AGENT_KINDS: SessionAgentKind[] = ["claude", "codex", "cursor"];
+const AGENT_KINDS: SessionAgentKind[] = ["claude", "codex", "cursor", "kimi"];
 const AGENT_KEY = "htybox.sessionAgent.v1";
 const readAgent = (root: string): SessionAgentKind => {
   const v = getWsState<SessionAgentKind>(AGENT_KEY, root, "claude");
@@ -159,7 +163,13 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
       return;
     }
     const fetcher =
-      kind === "claude" ? listClaudeSessions : kind === "codex" ? listCodexSessions : listCursorSessions;
+      kind === "claude"
+        ? listClaudeSessions
+        : kind === "codex"
+          ? listCodexSessions
+          : kind === "kimi"
+            ? listKimiSessions
+            : listCursorSessions;
     fetcher(root)
       .then((next) => {
         if (seq !== loadSeq.current) return;
@@ -178,7 +188,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   useEffect(() => {
     load(agentKind);
   }, [agentKind, load]);
-  // Claude ai-title / Codex index·rollout / Cursor meta.json 落盘后，后端 watcher 发事件；
+  // Claude ai-title / Codex index·rollout / Cursor meta.json / Kimi state.json 落盘后，后端 watcher 发事件；
   // Session 页签静默重拉（不置 loading，避免列表闪烁/滚动位置跳回顶部）。
   useEffect(() => {
     const evt =
@@ -188,7 +198,9 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
           ? "codex-sessions-changed"
           : agentKind === "cursor"
             ? "cursor-sessions-changed"
-            : null;
+            : agentKind === "kimi"
+              ? "kimi-sessions-changed"
+              : null;
     if (!evt) return;
     let un: (() => void) | undefined;
     let disposed = false;
@@ -299,6 +311,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
     try {
       if (agentKind === "claude") await deleteClaudeSession(s.id);
       else if (agentKind === "codex") await deleteCodexSession(s.path);
+      else if (agentKind === "kimi") await deleteKimiSession(s.path);
       else await deleteCursorSession(s.path);
       // 乐观移除：直接从列表剔除该项，避免整列重载导致滚动条跳回顶部
       setList((prev) => (prev ? prev.filter((x) => x.id !== s.id) : prev));
@@ -429,7 +442,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
             disabled={busy !== null}
             className="flex w-full items-center gap-2 rounded-lg bg-[var(--surface-hover)] px-3 py-1.5 text-xs font-semibold text-[var(--text)] hover:bg-[var(--border-soft)] disabled:cursor-not-allowed disabled:opacity-60"
           >
-            <img src={cur.icon} alt="" className={(cur.k === "codex" ? "codex-glyph " : cur.k === "cursor" ? "cursor-glyph " : "") + "h-4 w-4"} draggable={false} />
+            <img src={cur.icon} alt="" className={(cur.k === "codex" ? "codex-glyph " : cur.k === "cursor" ? "cursor-glyph " : cur.k === "kimi" ? "kimi-glyph " : "") + "h-4 w-4"} draggable={false} />
             <span className="min-w-0 flex-1 truncate text-left">{cur.label}</span>
             <svg className="h-3 w-3 shrink-0 text-[var(--text-3)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="m6 9 6 6 6-6" />
@@ -451,7 +464,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
                       (a.k === agentKind ? "bg-[var(--accent)]/10 text-[var(--text)]" : "text-[var(--text-deep)] hover:bg-[var(--surface)]")
                     }
                   >
-                    <img src={a.icon} alt="" className={(a.k === "codex" ? "codex-glyph " : a.k === "cursor" ? "cursor-glyph " : "") + "h-4 w-4"} draggable={false} />
+                    <img src={a.icon} alt="" className={(a.k === "codex" ? "codex-glyph " : a.k === "cursor" ? "cursor-glyph " : a.k === "kimi" ? "kimi-glyph " : "") + "h-4 w-4"} draggable={false} />
                     <span className="flex-1">{a.label}</span>
                     {a.k === agentKind && (
                       <svg className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -629,7 +642,8 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
           y={menu.y}
           items={[
             { id: "resume", label: "复原到终端" },
-            { id: "export", label: "导出会话…" },
+            // kimi 归档导入导出本期未接入（决策 3=A）→ 隐藏其导出入口
+            ...(agentKind === "kimi" ? [] : [{ id: "export", label: "导出会话…" }]),
             { id: "rename", label: "重命名" },
             { id: "tags", label: "标签…" },
             { id: "fav", label: isFav(menu.s) ? "取消收藏" : "收藏" },

@@ -6,7 +6,7 @@ import type { AgentKind } from "./profiles";
 export interface TeamAgentDef {
   id: string;
   roleName: string; // 身份/角色名，如 "负责人""维护员""计划书写员"
-  agentKind: Exclude<AgentKind, "shell">; // 团队成员只能是 claude / codex
+  agentKind: Exclude<AgentKind, "shell">; // 团队成员只能是真正的 agent(非裸 shell)
   model: string; // 模型（--model）；空 = 用 CLI 默认
   responsibility: string; // 职责内容（自由文本）→ 启动注入为该 agent 角色（完整注入在 M7-C）
   isLead: boolean; // 编排者(Lead)；整队恰好一个为 true
@@ -25,6 +25,8 @@ export const DEFAULT_MODELS: Record<Exclude<AgentKind, "shell">, string[]> = {
   claude: ["opus", "sonnet", "haiku"],
   codex: ["gpt-5-codex", "o3"],
   cursor: ["auto", "claude-sonnet-5-high", "gpt-5.2", "composer-2.5"],
+  // kimi 别名来自 `kimi provider list --json` 实测(v0.26.0 managed:kimi-code 共 3 个；k3 为本机默认)
+  kimi: ["kimi-code/k3", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
 };
 
 const KEY = "htybox.teams.v1";
@@ -114,7 +116,7 @@ export function exportTeams(teams: Team[]): string {
   return JSON.stringify(teams, null, 2);
 }
 
-const VALID_AGENT_KINDS: Exclude<AgentKind, "shell">[] = ["claude", "codex", "cursor"];
+const VALID_AGENT_KINDS: Exclude<AgentKind, "shell">[] = ["claude", "codex", "cursor", "kimi"];
 
 /** 解析导入 JSON（数组或单个），重新分配 id 避免与现有冲突。 */
 export function importTeams(json: string): Team[] {

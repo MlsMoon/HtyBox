@@ -1,8 +1,9 @@
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
 import cursorIcon from "../assets/cursor.svg";
+import kimiIcon from "../assets/kimi.svg";
 
-/** 按 Profile id 渲染品牌图标：Claude / Codex / Cursor 用官方 SVG 素材；PowerShell 用终端 >_。 */
+/** 按 Profile id 渲染品牌图标：Claude / Codex / Cursor / Kimi 用官方 SVG 素材；PowerShell 用终端 >_。 */
 export function ProfileIcon({ id }: { id: string }) {
   if (id === "claude")
     return (
@@ -15,6 +16,10 @@ export function ProfileIcon({ id }: { id: string }) {
   if (id === "cursor")
     return (
       <img src={cursorIcon} alt="Cursor" className="cursor-glyph h-4 w-4" draggable={false} />
+    );
+  if (id === "kimi")
+    return (
+      <img src={kimiIcon} alt="Kimi" className="kimi-glyph h-4 w-4" draggable={false} />
     );
   return (
     <svg

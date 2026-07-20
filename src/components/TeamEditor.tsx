@@ -53,6 +53,11 @@ export default function TeamEditor({
           <option key={m} value={m} />
         ))}
       </datalist>
+      <datalist id="models-kimi">
+        {DEFAULT_MODELS.kimi.map((m) => (
+          <option key={m} value={m} />
+        ))}
+      </datalist>
       <div
         className="flex max-h-[82vh] w-[680px] max-w-full flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg)] shadow-2xl"
         onClick={(e) => e.stopPropagation()}
@@ -114,6 +119,7 @@ export default function TeamEditor({
                   <option value="claude">ClaudeCode</option>
                   <option value="codex">Codex</option>
                   <option value="cursor">Cursor</option>
+                  <option value="kimi">Kimi</option>
                 </select>
                 <input
                   className={inputCls + " w-[120px]"}

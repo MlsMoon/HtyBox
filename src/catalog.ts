@@ -77,8 +77,8 @@ export const listMemoryTree = (projectDir: string) =>
 export const listCanonicalMemoryTree = (projectDir: string) =>
   invoke<MemoryNode[]>("list_canonical_memory_tree", { projectDir });
 
-// ---- M9：claude/codex/cursor 会话记录 ----
-export type SessionAgent = "claude" | "codex" | "cursor";
+// ---- M9：claude/codex/cursor/kimi 会话记录 ----
+export type SessionAgent = "claude" | "codex" | "cursor" | "kimi";
 
 export interface SessionRef {
   id: string;
@@ -149,6 +149,10 @@ export const deleteCodexSession = (path: string) =>
   invoke<void>("delete_codex_session", { path });
 export const deleteCursorSession = (path: string) =>
   invoke<void>("delete_cursor_session", { path });
+export const listKimiSessions = (cwd: string) =>
+  invoke<SessionRef[]>("list_kimi_sessions", { cwd });
+export const deleteKimiSession = (path: string) =>
+  invoke<void>("delete_kimi_session", { path });
 export const exportSessionArchive = (
   agent: SessionAgent,
   id: string,
@@ -189,7 +193,7 @@ export const importMemoryArchive = (
     expectedArchiveSha256,
     expectedTargetRevision,
   });
-/** 运行后捕获 agent(claude/codex/cursor) 在 cwd 下、启动时刻(sinceMs)之后新生成的会话 id（按时间升序）。 */
+/** 运行后捕获 agent(claude/codex/cursor/kimi) 在 cwd 下、启动时刻(sinceMs)之后新生成的会话 id（按时间升序）。 */
 export const captureSessionIds = (agent: string, cwd: string, sinceMs: number) =>
   invoke<string[]>("capture_session_ids", { agent, cwd, sinceMs });
 

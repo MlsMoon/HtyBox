@@ -1,4 +1,4 @@
-//! M9：列出/删除 claude & codex & cursor 的工作区会话（"会话记录"按钮）。已按官方文档 + CLI --help 实证：
+//! M9：列出/删除 claude & codex & cursor & kimi 的工作区会话（"会话记录"按钮）。已按官方文档 + CLI --help 实证：
 //! - claude：会话存 ~/.claude/projects/<slug>/<id>.jsonl；标题取自会话内最新 ai-title(claude 自动起的会话标题，与 /resume 选择器一致)，回退 history.jsonl 的 display；
 //!   复原 `claude --resume <id>`(须在该 cwd 下跑)；无原生删除 → 删 <id>.jsonl 文件。
 //! - codex：会话 ~/.codex/sessions/Y/M/D/rollout-*.jsonl，首行 session_meta.payload{id,cwd}；
@@ -8,6 +8,9 @@
 //!   外层 hash 目录大概率是 cwd 哈希分桶，不逆向算法、直接扫全部子目录按 meta.json.cwd 过滤；
 //!   标题优先取原生 title，未命名(hasConversation:false)的空壳会话跳过展示，其余回退 prompt_history.json 首条用户输入；
 //!   复原 `cursor-agent --resume <chatId>`(flag 风格，与 claude 同构，已实测)；删除走删整个 chat 目录。
+//! - kimi：会话 <KIMI_CODE_HOME|~/.kimi-code>/sessions/<workDirKey>/<sessionId>/state.json（{createdAt,updatedAt,title,lastPrompt,workDir}，ISO 时间串）；
+//!   workDirKey 为 cwd 派生分桶，不逆向算法、直接扫全部 state.json 按 workDir 过滤；title 缺失回退 lastPrompt；
+//!   复原 `kimi --session <sessionId>`(flag 风格，id 形态 session_<uuid>，resume 精确性已实测)；删除走删整个 session 目录 + session_index.jsonl 剔行。
 //! 删除统一移入回收站(trash，非交互、可恢复)。
 
 use std::collections::{HashMap, HashSet};
@@ -1330,6 +1333,148 @@ pub fn delete_cursor_session(path: &str) -> Result<(), String> {
     trash::delete(path).map_err(|e| e.to_string())
 }
 
+// ---------------- kimi ----------------
+
+const MAX_KIMI_SCAN: usize = 2000; // 最多扫描的 kimi state.json 数（安全上限，目录名不含时间故按遍历序截断）
+
+/// kimi 数据根：`KIMI_CODE_HOME` 环境变量优先（官方契约），缺省 `~/.kimi-code`。
+fn kimi_data_root() -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("KIMI_CODE_HOME") {
+        let v = v.trim().trim_matches('"');
+        if !v.is_empty() {
+            return Some(PathBuf::from(v));
+        }
+    }
+    home().map(|h| h.join(".kimi-code"))
+}
+
+/// RFC3339 时间串（kimi state.json 的 createdAt/updatedAt，如 2026-07-20T11:55:25.353Z）→ 毫秒时间戳。
+/// 解析失败归 0：该条仅排到列表最末/不参与捕获，不影响其他会话。
+fn rfc3339_ms(s: &str) -> i64 {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64)
+        .unwrap_or(0)
+}
+
+/// kimi：扫 <数据根>/sessions/<workDirKey>/<sessionId>/state.json，workDir 匹配的列出；
+/// 标题取 title（缺失回退 lastPrompt），ts 取 updatedAt；id = 目录名（session_<uuid> 完整形态）。
+pub fn list_kimi_sessions(cwd: &str) -> Vec<SessionRef> {
+    let Some(data_root) = kimi_data_root() else {
+        return Vec::new();
+    };
+    list_kimi_sessions_in(&data_root, cwd)
+}
+
+pub(crate) fn list_kimi_sessions_in(data_root: &Path, cwd: &str) -> Vec<SessionRef> {
+    let root = data_root.join("sessions");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for entry in WalkDir::new(&root)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_name().to_str() == Some("state.json"))
+        .take(MAX_KIMI_SCAN)
+    {
+        let p = entry.path();
+        let Ok(txt) = std::fs::read_to_string(p) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+            continue;
+        };
+        if v.get("workDir")
+            .and_then(|value| value.as_str())
+            .map(|value| same_path(value, cwd))
+            != Some(true)
+        {
+            continue;
+        }
+        let Some(session_dir) = p.parent() else {
+            continue;
+        };
+        let Some(id) = session_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let fallback = v
+            .get("lastPrompt")
+            .and_then(|value| value.as_str())
+            .map(|s| s.chars().take(80).collect());
+        let label = cursor_label(v.get("title").and_then(|value| value.as_str()), fallback);
+        let ts = v
+            .get("updatedAt")
+            .and_then(|value| value.as_str())
+            .map(rfc3339_ms)
+            .unwrap_or(0);
+        out.push(SessionRef {
+            label,
+            id: id.to_string(),
+            ts,
+            path: session_dir.to_string_lossy().into_owned(),
+        });
+    }
+    out.sort_by(|a, b| b.ts.cmp(&a.ts));
+    out
+}
+
+/// 删除 kimi 会话：整个 session 目录移入回收站（仅限 <数据根>/sessions 内），
+/// 并从 session_index.jsonl 剔除对应行（读-改-写走临时文件 + rename 原子替换，防与 kimi 并发追加打架）。
+pub fn delete_kimi_session(path: &str) -> Result<(), String> {
+    let Some(data_root) = kimi_data_root() else {
+        return Err("无 kimi 数据目录".into());
+    };
+    let root = data_root.join("sessions");
+    let path = canonical_existing_under(&root, Path::new(path), ExistingPathKind::Directory)?;
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let relative = path
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "Kimi 删除路径逃逸 sessions 根".to_string())?;
+    let parts: Vec<_> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect();
+    if parts.len() != 2 {
+        return Err("Kimi 删除目标必须恰为 bucket/sessionId".into());
+    }
+    let bucket = parts[0];
+    let id = parts[1];
+    if !bucket.starts_with("wd_") {
+        return Err("Kimi 删除目标 bucket 不是 wd_ 前缀".into());
+    }
+    let valid_id = id
+        .strip_prefix("session_")
+        .map(|u| u.len() == 36 && u.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(false);
+    if !valid_id {
+        return Err("Kimi 删除目标目录名不是 session_<uuid>".into());
+    }
+    // state.json 必须存在且可解析（防误删 sessions 根下的同名杂物目录）
+    let state_path = canonical_existing_under(&path, &path.join("state.json"), ExistingPathKind::File)?;
+    read_small_json(&state_path, "Kimi state.json")?;
+    trash::delete(&path).map_err(|e| e.to_string())?;
+    let index = data_root.join("session_index.jsonl");
+    if let Ok(content) = std::fs::read_to_string(&index) {
+        let needle = format!("\"sessionId\":\"{id}\"");
+        let kept: Vec<&str> = content.lines().filter(|l| !l.contains(&needle)).collect();
+        if kept.len() != content.lines().count() {
+            let mut out = kept.join("\n");
+            if content.ends_with('\n') {
+                out.push('\n');
+            }
+            let tmp = index.with_extension("jsonl.htytmp");
+            std::fs::write(&tmp, out).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, &index).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 // ---------------- 运行后捕获 agent 自生成的 session id ----------------
 
 /// 只比较两个现存目录的 canonical identity；解析失败即不匹配。
@@ -1337,13 +1482,14 @@ fn same_path(a: &str, b: &str) -> bool {
     canonical_same_existing_path(Path::new(a), Path::new(b)).unwrap_or(false)
 }
 
-/// 捕获某 agent(claude/codex/cursor) 在 cwd 下、启动时刻(since_ms)之后新生成的会话 id（按时间升序）。
-/// 三者都不便在新建时预分配 id，故新建发裸命令、启动后由此关联各自终端的真实 session id。
+/// 捕获某 agent(claude/codex/cursor/kimi) 在 cwd 下、启动时刻(since_ms)之后新生成的会话 id（按时间升序）。
+/// 四者都不便在新建时预分配 id，故新建发裸命令、启动后由此关联各自终端的真实 session id。
 pub fn capture_session_ids(agent: &str, cwd: &str, since_ms: i64) -> Vec<String> {
     match agent {
         "claude" => capture_claude_ids(cwd, since_ms),
         "codex" => capture_codex_ids(cwd, since_ms),
         "cursor" => capture_cursor_ids(cwd, since_ms),
+        "kimi" => capture_kimi_ids(cwd, since_ms),
         _ => Vec::new(),
     }
 }
@@ -1489,6 +1635,58 @@ fn capture_cursor_ids(cwd: &str, since_ms: i64) -> Vec<String> {
             continue;
         };
         if let Some(id) = chat_dir.file_name().and_then(|n| n.to_str()) {
+            hits.push((created, id.to_string()));
+        }
+    }
+    hits.sort_by_key(|(t, _)| *t);
+    hits.into_iter().map(|(_, id)| id).collect()
+}
+
+/// kimi：扫 <数据根>/sessions 的 state.json，取 workDir 匹配、createdAt>=since 的 session id，按 createdAt 升序。
+/// 不按 title/空会话过滤——刚启动还没来得及说话的会话正是本函数要捕获的目标（state.json 启动即创建，已实测）。
+fn capture_kimi_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+    let Some(data_root) = kimi_data_root() else {
+        return Vec::new();
+    };
+    let root = data_root.join("sessions");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(i64, String)> = Vec::new();
+    for entry in WalkDir::new(&root)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_name().to_str() == Some("state.json"))
+        .take(MAX_KIMI_SCAN)
+    {
+        let p = entry.path();
+        let Ok(txt) = std::fs::read_to_string(p) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+            continue;
+        };
+        let created = v
+            .get("createdAt")
+            .and_then(|value| value.as_str())
+            .map(rfc3339_ms)
+            .unwrap_or(0);
+        if created < since_ms {
+            continue;
+        }
+        if v.get("workDir")
+            .and_then(|value| value.as_str())
+            .map(|value| same_path(value, cwd))
+            != Some(true)
+        {
+            continue;
+        }
+        let Some(session_dir) = p.parent() else {
+            continue;
+        };
+        if let Some(id) = session_dir.file_name().and_then(|n| n.to_str()) {
             hits.push((created, id.to_string()));
         }
     }

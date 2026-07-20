@@ -978,7 +978,19 @@ fn delete_cursor_session(path: String) -> Result<(), String> {
     sessions::delete_cursor_session(&path)
 }
 
-/// 运行后捕获 agent(claude/codex/cursor) 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
+/// 列本工作区 kimi 会话（<KIMI_CODE_HOME|~/.kimi-code>/sessions 按 state.json.workDir）。
+#[tauri::command]
+fn list_kimi_sessions(cwd: String) -> Vec<sessions::SessionRef> {
+    sessions::list_kimi_sessions(&cwd)
+}
+
+/// 删除 kimi 会话（删整个 session 目录入回收站 + session_index.jsonl 剔行）。
+#[tauri::command]
+fn delete_kimi_session(path: String) -> Result<(), String> {
+    sessions::delete_kimi_session(&path)
+}
+
+/// 运行后捕获 agent(claude/codex/cursor/kimi) 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
 #[tauri::command]
 fn capture_session_ids(agent: String, cwd: String, since_ms: i64) -> Vec<String> {
     sessions::capture_session_ids(&agent, &cwd, since_ms)
@@ -1097,6 +1109,38 @@ fn write_cursor_config(cwd: &str, url: &str) -> Result<(), String> {
     std::fs::write(&path, pretty).map_err(|e| e.to_string())
 }
 
+/// 把 htybox 这个 MCP server **合并**进 `<cwd>/.kimi-code/mcp.json`（保留用户已有配置）。
+/// kimi 官方契约：项目级 `.kimi-code/mcp.json` 的 mcpServers；HTTP server 用 `url` +
+/// `bearerTokenEnvVar`（kimi 原生字段，token 走 `HTYBOX_MCP_TOKEN` 环境变量，比 headers 占位符更干净）。
+fn write_kimi_config(cwd: &str, url: &str) -> Result<(), String> {
+    let dir = std::path::Path::new(cwd).join(".kimi-code");
+    let path = dir.join("mcp.json");
+    let mut root: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let obj = root.as_object_mut().unwrap();
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        *servers = serde_json::json!({});
+    }
+    servers.as_object_mut().unwrap().insert(
+        "htybox".to_string(),
+        serde_json::json!({
+            "url": url,
+            "bearerTokenEnvVar": "HTYBOX_MCP_TOKEN"
+        }),
+    );
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&path, pretty).map_err(|e| e.to_string())
+}
+
 /// M7-A：注册一个 agent（token→身份）并把 htybox 合并进该 cwd 的 .mcp.json。
 /// 之后前端用 `HTYBOX_MCP_TOKEN=<token>` 等环境变量起该 agent 的终端。
 #[tauri::command]
@@ -1121,7 +1165,8 @@ fn setup_mcp_agent(
     let url = format!("http://127.0.0.1:{}/mcp", state.broker.port());
     write_mcp_json(&cwd, &url)?; // claude 读
     write_codex_config(&cwd, &url)?; // codex 读（信任项目时）
-    write_cursor_config(&cwd, &url) // cursor 读
+    write_cursor_config(&cwd, &url)?; // cursor 读
+    write_kimi_config(&cwd, &url) // kimi 读
 }
 
 /// M7-C：写某 agent 的协作简报到 `<cwd>/.htybox/brief-<agentId>.md`。
@@ -1282,9 +1327,11 @@ pub fn run() {
             list_claude_sessions,
             list_codex_sessions,
             list_cursor_sessions,
+            list_kimi_sessions,
             delete_claude_session,
             delete_codex_session,
             delete_cursor_session,
+            delete_kimi_session,
             capture_session_ids,
             mcp_broker_url,
             setup_mcp_agent,
