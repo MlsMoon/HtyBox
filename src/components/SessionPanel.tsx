@@ -17,6 +17,7 @@ import {
 } from "../catalog";
 import { openTerminalCmd } from "../dockBus";
 import { launchCmdFor } from "../profiles";
+import { KimiIcon } from "./ProfileIcon";
 import { searchMatch } from "../search";
 import SearchBox from "./ui/SearchBox";
 import ContextMenu, { MENU_SEP } from "./ui/ContextMenu";
@@ -31,13 +32,12 @@ import { useMaskDismiss } from "./ui/maskDismiss";
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
 import cursorIcon from "../assets/cursor.svg";
-import kimiIcon from "../assets/kimi.svg";
 
-const AGENTS = [
+const AGENTS: { k: SessionAgentKind; label: string; icon?: string }[] = [
   { k: "claude" as const, label: "Claude Code", icon: claudeIcon },
   { k: "codex" as const, label: "Codex", icon: codexIcon },
   { k: "cursor" as const, label: "Cursor", icon: cursorIcon },
-  { k: "kimi" as const, label: "Kimi", icon: kimiIcon },
+  { k: "kimi" as const, label: "Kimi" }, // kimi 图标走内联 KimiIcon（深色需反转白底黑 K，img 做不到）
 ];
 
 // 会话收藏：按工作区 root 分组，存 "agentKind:id"（持久化，跨重启），收藏的置顶成区显示。
@@ -442,7 +442,11 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
             disabled={busy !== null}
             className="flex w-full items-center gap-2 rounded-lg bg-[var(--surface-hover)] px-3 py-1.5 text-xs font-semibold text-[var(--text)] hover:bg-[var(--border-soft)] disabled:cursor-not-allowed disabled:opacity-60"
           >
-            <img src={cur.icon} alt="" className={(cur.k === "codex" ? "codex-glyph " : cur.k === "cursor" ? "cursor-glyph " : cur.k === "kimi" ? "kimi-glyph " : "") + "h-4 w-4"} draggable={false} />
+            {cur.k === "kimi" ? (
+              <KimiIcon className="h-4 w-4" />
+            ) : (
+              <img src={cur.icon} alt="" className={(cur.k === "codex" ? "codex-glyph " : cur.k === "cursor" ? "cursor-glyph " : "") + "h-4 w-4"} draggable={false} />
+            )}
             <span className="min-w-0 flex-1 truncate text-left">{cur.label}</span>
             <svg className="h-3 w-3 shrink-0 text-[var(--text-3)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="m6 9 6 6 6-6" />
@@ -464,7 +468,11 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
                       (a.k === agentKind ? "bg-[var(--accent)]/10 text-[var(--text)]" : "text-[var(--text-deep)] hover:bg-[var(--surface)]")
                     }
                   >
-                    <img src={a.icon} alt="" className={(a.k === "codex" ? "codex-glyph " : a.k === "cursor" ? "cursor-glyph " : a.k === "kimi" ? "kimi-glyph " : "") + "h-4 w-4"} draggable={false} />
+                    {a.k === "kimi" ? (
+                      <KimiIcon className="h-4 w-4" />
+                    ) : (
+                      <img src={a.icon} alt="" className={(a.k === "codex" ? "codex-glyph " : a.k === "cursor" ? "cursor-glyph " : "") + "h-4 w-4"} draggable={false} />
+                    )}
                     <span className="flex-1">{a.label}</span>
                     {a.k === agentKind && (
                       <svg className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">

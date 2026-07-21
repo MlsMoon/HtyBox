@@ -5,6 +5,7 @@ import { THEMES, applyTheme, watchSystemTheme } from "../theme";
 import { loadIgnore } from "../fileIgnore";
 import { countWorkspaceFiles } from "../catalog";
 import ConnectionSettings from "./ConnectionSettings";
+import AgentSettings from "./AgentSettings";
 import { getVersion } from "@tauri-apps/api/app";
 import { checkForUpdateDetailed, type Update } from "../updater";
 import { useMaskDismiss } from "./ui/maskDismiss";
@@ -223,6 +224,7 @@ type SectionKey =
   | "general"
   | "appearance"
   | "terminal"
+  | "agents"
   | "files"
   | "skill"
   | "htyenv"
@@ -231,6 +233,7 @@ const SECTIONS: { key: SectionKey; label: string }[] = [
   { key: "general", label: "通用" },
   { key: "appearance", label: "外观" },
   { key: "terminal", label: "终端" },
+  { key: "agents", label: "Agent" },
   { key: "files", label: "文件与搜索" },
   { key: "skill", label: "Skill" },
   { key: "htyenv", label: "hty环境" },
@@ -781,6 +784,7 @@ export default function SettingsModal({
                 </div>
               </div>
             )}
+            {section === "agents" && <AgentSettings />}
             {section === "connection" && <ConnectionSettings />}
             <div className="mt-4 border-t border-[var(--border)] pt-3 text-[10px] text-[var(--text-3)]">
               更多全局设置将陆续加入此处。

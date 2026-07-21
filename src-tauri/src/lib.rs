@@ -1,3 +1,4 @@
+mod agent_env;
 mod broker;
 mod catalog;
 mod fs_tree;
@@ -86,6 +87,22 @@ fn set_workspaces(
 #[tauri::command]
 fn ws_port(state: State<'_, AppState>) -> u16 {
     state.ws_port
+}
+
+/// 设置「Agent」页：检测四家 agent CLI 安装状态（实时 PATH = 进程+注册表合并，where.exe + best-effort --version）。
+#[tauri::command]
+async fn detect_agents() -> Result<Vec<agent_env::AgentInstallStatus>, String> {
+    Ok(tauri::async_runtime::spawn_blocking(agent_env::detect_agents)
+        .await
+        .map_err(|error| format!("agent 安装检测任务失败：{error}"))?)
+}
+
+/// 设置「Agent」页：对指定 agent 跑官方 Windows 安装脚本（后台执行，300s 超时，输出尾部随结果返回）。
+#[tauri::command]
+async fn install_agent(id: String) -> Result<agent_env::InstallResult, String> {
+    Ok(tauri::async_runtime::spawn_blocking(move || agent_env::install_agent(&id))
+        .await
+        .map_err(|error| format!("agent 安装任务失败：{error}"))??)
 }
 
 /// L3：配对 offer（二维码 SVG + 链接）。
@@ -1333,6 +1350,8 @@ pub fn run() {
             delete_cursor_session,
             delete_kimi_session,
             capture_session_ids,
+            detect_agents,
+            install_agent,
             mcp_broker_url,
             setup_mcp_agent,
             write_agent_brief,

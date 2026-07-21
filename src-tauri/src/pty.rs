@@ -51,10 +51,16 @@ pub fn open_pty(opts: SpawnOptions) -> Result<PtyParts, String> {
             }
         }
     }
-    if let Some(env) = opts.env {
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
+    let env = opts.env.unwrap_or_default();
+    // PATH 实时化：HtyBox 进程 PATH 固定在启动时，运行期新装的 CLI（安装器写注册表 User PATH）
+    // 在新终端里会找不到 → 合并注册表实时值（agent_env::fresh_path 带 10s 缓存，热路径无感）；
+    // 前端显式给了 PATH（Windows 环境变量名忽略大小写）时不覆盖。
+    let has_path = env.keys().any(|k| k.eq_ignore_ascii_case("PATH"));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    if !has_path {
+        cmd.env("PATH", crate::agent_env::fresh_path());
     }
 
     let child = pair

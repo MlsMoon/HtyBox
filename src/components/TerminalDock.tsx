@@ -33,8 +33,13 @@ import {
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
 import cursorIcon from "../assets/cursor.svg";
-import kimiIcon from "../assets/kimi.svg";
-import { ProfileIcon } from "./ProfileIcon";
+import { ProfileIcon, KimiIcon } from "./ProfileIcon";
+import {
+  agentUnavailable,
+  ensureDetected,
+  useAgentInstall,
+  type AgentState,
+} from "../agentInstall";
 import HtyBoxLogo from "./ui/HtyBoxLogo";
 import {
   setupMcpAgent,
@@ -360,7 +365,7 @@ function TabTypeIcon({ params }: { params: TermParams & { editorPath?: string } 
     if (params.agentKind === "claude") return <img src={claudeIcon} alt="" className={cls} draggable={false} />;
     if (params.agentKind === "codex") return <img src={codexIcon} alt="" className={"codex-glyph " + cls} draggable={false} />;
     if (params.agentKind === "cursor") return <img src={cursorIcon} alt="" className={"cursor-glyph " + cls} draggable={false} />;
-    if (params.agentKind === "kimi") return <img src={kimiIcon} alt="" className={"kimi-glyph " + cls} draggable={false} />;
+    if (params.agentKind === "kimi") return <KimiIcon className={cls} />;
     return (
       <svg className={cls} viewBox="0 0 24 24">
         <rect x="2" y="3.5" width="20" height="17" rx="5" fill="var(--text)" />
@@ -800,6 +805,13 @@ function DockWatermark() {
   );
 }
 
+/** 顶栏新建按钮 tooltip：未安装/安装中给出引导，否则原「新建 X 终端」。 */
+function addTerminalTitle(p: Profile, st: AgentState | undefined): string {
+  if (st?.phase === "missing") return `未安装 ${p.label}，请到 设置 → Agent 安装`;
+  if (st?.phase === "installing") return `${p.label} 正在安装，稍候…`;
+  return `新建 ${p.label} 终端`;
+}
+
 /** 终端区：一个 workspace 一个实例；终端 id/布局键按 workspace 隔离，cwd=工作区文件夹。 */
 export default function TerminalDock({
   workspaceId,
@@ -972,6 +984,12 @@ export default function TerminalDock({
     [],
   );
 
+  // Agent CLI 安装检测：本组件订阅 store（顶栏置灰用），首个订阅触发一次检测（幂等）。
+  const agentInstall = useAgentInstall();
+  useEffect(() => {
+    ensureDetected();
+  }, []);
+
   // M7-A：响应 App「多 Agent 协作」，在本工作区起 agent 终端（注册身份 + 注入 token env）。
   // 顺序创建并左右分屏（都可见 → 都按真实列宽起、都连上 broker）。
   useEffect(() => {
@@ -1139,17 +1157,26 @@ export default function TerminalDock({
   return (
     <div className="flex h-full w-full flex-col bg-[#1f1e1d]">
       <div className="flex shrink-0 items-center gap-0.5 border-b border-[var(--border)] bg-[var(--surface)] px-2 py-1.5">
-        {PROFILES.map((p) => (
-          <button
-            key={p.id}
-            onClick={() => addTerminal(p)}
-            title={`新建 ${p.label} 终端`}
-            style={{ color: p.dotColor }}
-            className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--elevated)]"
-          >
-            <ProfileIcon id={p.id} />
-          </button>
-        ))}
+        {PROFILES.map((p) => {
+          // 非 shell 且 CLI 未安装/安装中 → 置灰禁点（tooltip 引导去设置页安装）
+          const st = isAgentTerminal(p.agentKind) ? agentInstall[p.agentKind] : undefined;
+          const un = agentUnavailable(st);
+          return (
+            <button
+              key={p.id}
+              disabled={un}
+              onClick={() => addTerminal(p)}
+              title={addTerminalTitle(p, st)}
+              style={{ color: p.dotColor }}
+              className={
+                "flex h-7 w-7 items-center justify-center rounded-md transition-colors " +
+                (un ? "cursor-not-allowed opacity-35 grayscale" : "hover:bg-[var(--elevated)]")
+              }
+            >
+              <ProfileIcon id={p.id} />
+            </button>
+          );
+        })}
         <button
           onClick={(e) => {
             const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
