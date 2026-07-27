@@ -13,11 +13,14 @@ export default function QuickOpen({
   workspaceId,
   onClose,
   onEnsureSidebar,
+  onPick,
 }: {
   root: string;
   workspaceId: string;
   onClose: () => void;
-  onEnsureSidebar: () => void;
+  onEnsureSidebar?: () => void;
+  /** 给了就只做"挑一个文件交出去"（内容预览窗口用）：不碰主窗左栏，也不看 openFileFromSearch 设置 */
+  onPick?: (path: string) => void;
 }) {
   const [all, setAll] = useState<FileRef[]>([]);
   const [total, setTotal] = useState(0);
@@ -52,23 +55,31 @@ export default function QuickOpen({
   }, [root, s.maxFiles]);
 
   const results = useMemo(() => {
-    const items = [
-      ...all.map((f) => ({ f, isDir: false })),
-      ...allFolders.map((f) => ({ f, isDir: true })),
-    ];
+    // onPick 模式（预览窗）只找文件：那边没有文件树，"定位文件夹"无处可去
+    const items = onPick
+      ? all.map((f) => ({ f, isDir: false }))
+      : [
+          ...all.map((f) => ({ f, isDir: false })),
+          ...allFolders.map((f) => ({ f, isDir: true })),
+        ];
     return items
       .map((it) => ({ ...it, sc: searchScore(q, it.f.name, it.f.rel) }))
       .filter((x) => x.sc > 0)
       .sort((a, b) => b.sc - a.sc)
       .slice(0, 50);
-  }, [all, allFolders, q]);
+  }, [all, allFolders, q, onPick]);
 
   useEffect(() => setSel(0), [q]);
 
   const act = (f: FileRef, isDir: boolean) => {
+    if (onPick) {
+      if (!isDir) onPick(f.path);
+      onClose();
+      return;
+    }
     if (isDir) {
       // 文件夹：始终在 File 页签定位选中（无"编辑器打开"概念，不受 openFileFromSearch 影响）
-      onEnsureSidebar();
+      onEnsureSidebar?.();
       requestSidebarTab(workspaceId, "file");
       emitActiveFolder(workspaceId, f.path, true); // 挂载后补发 → revealFolder 定位选中
     } else if (s.openFileFromSearch) {
@@ -78,7 +89,7 @@ export default function QuickOpen({
       emitActiveFile(workspaceId, f.path, true);
     } else {
       // 仅选中：切到 File 页签并定位选中，不打开、不切走终端（找文件喂 AI 用）
-      onEnsureSidebar(); // 侧边栏若折叠则展开
+      onEnsureSidebar?.(); // 侧边栏若折叠则展开
       requestSidebarTab(workspaceId, "file"); // 切 File 页签 → FilePanel 挂载
       emitActiveFile(workspaceId, f.path, true); // 挂载后补发 → reveal 定位选中
     }

@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { emit } from "@tauri-apps/api/event";
 import type { FontKey } from "./fontKeys";
 import type { ThemeKey } from "./themeKeys";
 
@@ -27,6 +28,9 @@ export interface Settings {
   showWorkflowPanel: boolean;
   /** 终端中键自动滚动：按下鼠标中键出滚轮锚点、移动即按距离自动滚动（仿浏览器）。默认开 */
   middleClickScroll: boolean;
+  /** 标签页可选中：开=点击标签会选中它（可按 Delete/Backspace 关闭）；
+   *  关(默认)=点击只切换并把焦点直接交给终端输入，标签不吃焦点，删除键自然落不到标签上 */
+  tabSelectable: boolean;
   /** 左栏 File/Skill/Memory/Session/Flow 分段切换条：开=仅图标(更紧凑) / 关=图标+文字(现状,默认) */
   sidebarTabIconOnly: boolean;
   /**
@@ -63,6 +67,7 @@ const DEFAULTS: Settings = {
   maxEditMB: 10,
   showWorkflowPanel: true,
   middleClickScroll: true,
+  tabSelectable: false,
   sidebarTabIconOnly: false,
   skillRootEntries: DEFAULT_ENTRIES.map((e) => ({ ...e })),
   skillRoots: DEFAULT_ENTRIES.filter((e) => e.enabled).map((e) => e.path),
@@ -142,6 +147,18 @@ export function setSetting<K extends keyof Settings>(
   } catch {
     /* ignore */
   }
+  listeners.forEach((l) => l());
+  // 内容预览窗口是独立 webview：localStorage 共享但模块内存态不共享，
+  // 广播一次让它重读（写入方只有主窗，故这里只发不收）。
+  emit(SETTINGS_CHANGED).catch(() => {});
+}
+
+/** 跨窗口设置变更事件名（主窗写入后广播 → 预览窗重读）。 */
+export const SETTINGS_CHANGED = "htybox:settings-changed";
+
+/** 从 localStorage 重新载入设置并通知订阅者。供预览窗收到广播后调用。 */
+export function reloadSettings(): void {
+  current = load();
   listeners.forEach((l) => l());
 }
 

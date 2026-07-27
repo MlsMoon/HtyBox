@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { IDockviewPanelProps } from "dockview-react";
-import { marked } from "marked";
+import { renderMarkdown } from "../mdRender";
+import { highlightToHtml, langForPath, onHighlighterReady } from "../highlighter";
+import { CODE_RE, IMAGE_RE, MD_RE, SVG_RE } from "../fileKinds";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { readTextFile, writeTextFile, readImageDataUrl, watchFile, unwatchFile } from "../catalog";
+import { readTextFile, writeTextFile, readImageDataUrl, watchFile, unwatchFile, fileExists } from "../catalog";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { openFileInScope, revealFileInScope } from "../fileOpenBus";
 import { sanitizeForRender } from "../svgSanitize";
-import { emitActiveFile } from "../dockBus";
 import { getSettings } from "../settings";
 
 // 透明图棋盘格背景（SVG / 图片预览共用）。
@@ -14,9 +17,6 @@ const CHECKER_BG: React.CSSProperties = {
   backgroundSize: "18px 18px",
   backgroundPosition: "0 0,0 9px,9px -9px,-9px 0",
 };
-// 受支持的位图预览扩展名（svg 走文本预览，不在此列）。
-const IMAGE_RE = /\.(png|jpe?g|jfif|gif|webp|bmp|ico|avif)$/i;
-
 // 跨分屏/重排保活：dockview 会卸载重挂面板，用模块级 store 按 panelId 留住未保存缓冲。
 interface Buf {
   content: string;
@@ -49,12 +49,25 @@ export function disposeEditorBuf(panelId: string): void {
 export function isEditorDirty(panelId: string): boolean {
   return editorStore.get(panelId)?.dirty ?? false;
 }
+/** 迁移到内容预览窗口时取走未保存内容；无改动返回 undefined（对端自行读盘即可）。 */
+export function collectEditorBuf(panelId: string): string | undefined {
+  const b = editorStore.get(panelId);
+  return b?.dirty ? b.content : undefined;
+}
+/** 迁移接收端：面板挂载前预置未保存缓冲，让脏标与内容原样落到新窗口。 */
+export function adoptEditorBuf(panelId: string, content: string): void {
+  editorStore.set(panelId, { content, dirty: true, loaded: true, editable: true });
+}
 
 const basename = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
+// 代码预览的高亮上限：shiki 是同步 API，超大文件硬上会卡住整个窗口。
+// 按字符数近似（纯 ASCII 源码 1 字符≈1 字节；含中文时更保守），超限则只给无高亮的行号预览。
+const CODE_HL_MAX_CHARS = 512 * 1024;
+
 /** M9：简易文本编辑器面板（textarea，无语法高亮）。Ctrl+S 保存；脏标在面板内。 */
 export default function DockEditor(
-  props: IDockviewPanelProps<{ editorPath: string; workspaceId?: string }>,
+  props: IDockviewPanelProps<{ editorPath: string; workspaceId?: string; workspaceRoot?: string }>,
 ) {
   const panelId = props.api.id;
   const path = props.params.editorPath;
@@ -67,15 +80,36 @@ export default function DockEditor(
   const isImage = IMAGE_RE.test(path);
   const [img, setImg] = useState<ImgState | null>(() => imageStore.get(panelId) ?? null);
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
-  const isMd = /\.(md|markdown)$/i.test(path);
-  const isSvg = /\.svg$/i.test(path);
-  const previewable = isMd || isSvg;
-  const [view, setView] = useState<"edit" | "preview">(isSvg ? "preview" : "edit");
+  const isMd = MD_RE.test(path);
+  const isSvg = SVG_RE.test(path);
+  const isCode = !isMd && !isSvg && CODE_RE.test(path);
+  const previewable = isMd || isSvg || isCode;
+  // 可预览的文件一律默认进预览态（用户 2026-07-27 拍板；此前只有 svg 默认预览）
+  const [view, setView] = useState<"edit" | "preview">("preview");
   const [imgFailed, setImgFailed] = useState(false); // SVG <img> 渲染失败(onError)安全网标志
+  // 代码块语法按需加载：某语法就绪后 tick+1 触发重渲染，把先前的无高亮代码块换成着色版。
+  const [hlTick, setHlTick] = useState(0);
+  useEffect(() => {
+    if (!isMd && !isCode) return;
+    return onHighlighterReady(() => setHlTick((n) => n + 1));
+  }, [isMd, isCode]);
   // 预览产物仅在预览视图计算：上限放宽后大文件在编辑视图打字，避免每键全量 parse/encode。
   const html = useMemo(
-    () => (isMd && view === "preview" ? (marked.parse(buf.content, { async: false }) as string) : ""),
-    [isMd, view, buf.content],
+    () => (isMd && view === "preview" ? renderMarkdown(buf.content) : ""),
+    [isMd, view, buf.content, hlTick],
+  );
+  // 代码文件只读预览：同一个 shiki 实例，行结构与 md 代码块同构（每行 <span class="line">）；
+  // 超过上限则传 null 语言 → 走同构的无高亮兜底，行号照旧，窗口不卡。
+  const codeTooBig = isCode && buf.content.length > CODE_HL_MAX_CHARS;
+  const codeHtml = useMemo(
+    () =>
+      isCode && view === "preview" && buf.loaded
+        ? highlightToHtml(
+            buf.content,
+            buf.content.length > CODE_HL_MAX_CHARS ? null : langForPath(path),
+          )
+        : "",
+    [isCode, view, buf.loaded, buf.content, path, hlTick],
   );
   // SVG 预览：良构性校验（DOMParser 失败时 Chromium 插入 <parsererror>，取明细作诊断）+ 容错重试。
   // 解析失败时把「孤立 &」（后面不是合法实体）转义为 &amp; 再试一次——损坏/AI 生成的 mockup 常见
@@ -157,9 +191,9 @@ export default function DockEditor(
   useEffect(() => {
     const wsId = props.params.workspaceId;
     if (!wsId) return;
-    if (props.api.isActive) emitActiveFile(wsId, path);
+    if (props.api.isActive) revealFileInScope(wsId, path);
     const d = props.api.onDidActiveChange((e) => {
-      if (e.isActive) emitActiveFile(wsId, path);
+      if (e.isActive) revealFileInScope(wsId, path);
     });
     return () => d.dispose();
   }, [props.api, path, props.params.workspaceId]);
@@ -245,6 +279,58 @@ export default function DockEditor(
       })
       .catch((e) => setErr(String(e)));
   };
+  // md 预览里的 <a> 一律拦截：webview 若真按 href 导航，整个窗口会被目标页面顶掉
+  // （内容预览窗口曾因此加载 index.html 变成第二个主窗）。拦下后按链接类型分派：
+  // 外部协议交系统程序、页内锚点滚动、其余当作工作区文件路径在当前窗口打开。
+  const onPreviewClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    const a = (e.target as HTMLElement).closest("a");
+    if (!a) return;
+    e.preventDefault();
+    const raw = a.getAttribute("href") ?? "";
+    if (!raw) return;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) {
+      // http / https / mailto 等外部协议 → 系统默认程序打开，不动本窗口
+      openUrl(raw).catch((er) => setErr(String(er)));
+      return;
+    }
+    if (raw.startsWith("#")) {
+      const id = decodeURIComponent(raw.slice(1));
+      if (!id) return;
+      const el = e.currentTarget.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
+      el?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    // 相对/绝对文件路径：先去掉 #L12 之类的行锚点与查询串
+    let rel = raw.split("#")[0].split("?")[0];
+    if (!rel) return;
+    try {
+      rel = decodeURIComponent(rel);
+    } catch {
+      /* 非法百分号编码 → 按原样当路径 */
+    }
+    rel = rel.replace(/^\.\//, "");
+    const dir = path.replace(/[\\/][^\\/]*$/, "");
+    const root = props.params.workspaceRoot;
+    // 同一条链接可能相对当前文件目录，也可能相对工作区根（AI 生成的计划文档常用后者）→ 按序探测
+    const candidates = /^([a-zA-Z]:[\\/]|\\\\|\/)/.test(rel)
+      ? [rel]
+      : [`${dir}/${rel}`, root ? `${root}/${rel}` : ""].filter(Boolean);
+    (async () => {
+      for (const c of candidates) {
+        const hit = await fileExists(c).catch((er) => {
+          console.error("判断链接目标是否存在失败", c, er);
+          return false;
+        });
+        if (hit) {
+          openFileInScope(props.params.workspaceId ?? "", c);
+          setErr(null);
+          return;
+        }
+      }
+      setErr(`链接目标不存在：${rel}`);
+    })();
+  };
+
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
       e.preventDefault();
@@ -358,6 +444,13 @@ export default function DockEditor(
           保存
         </button>
       </div>
+      {codeTooBig && view === "preview" && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-3 py-1.5">
+          <span className="min-w-0 flex-1 text-[10.5px] text-[var(--accent-text)]">
+            文件较大（{(buf.content.length / 1024 / 1024).toFixed(1)} MB，超过 512 KB），已关闭语法高亮以保证流畅；阅读与编辑不受影响
+          </span>
+        </div>
+      )}
       {buf.lossy && (
         <div className="flex shrink-0 items-center gap-2 border-b border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-3 py-1.5">
           <span className="min-w-0 flex-1 text-[10.5px] text-[var(--accent-text)]">
@@ -417,9 +510,15 @@ export default function DockEditor(
               ) : null}
             </div>
           )
+        ) : isCode ? (
+          <div
+            className="code-preview min-h-0 flex-1 overflow-auto"
+            dangerouslySetInnerHTML={{ __html: codeHtml }}
+          />
         ) : (
           <div
             className="md-preview min-h-0 flex-1 overflow-y-auto p-4 text-[13px] text-[var(--text)]"
+            onClick={onPreviewClick}
             dangerouslySetInnerHTML={{ __html: html }}
           />
         )

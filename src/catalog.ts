@@ -274,6 +274,8 @@ export const readTextFile = (path: string, opts?: { forceLossy?: boolean; maxByt
   });
 export const writeTextFile = (path: string, content: string) =>
   invoke<void>("write_text_file", { path, content });
+/** md 预览的相对链接解析：判断路径是否为已存在的文件（目录返回 false）。 */
+export const fileExists = (path: string) => invoke<boolean>("file_exists", { path });
 /** M9：读图片为 base64 data URL（图片预览；非图片/超大 → ok=false + reason）。 */
 export interface ReadImageResult {
   dataUrl: string;

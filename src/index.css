@@ -61,6 +61,7 @@ body {
   --focus-border: #d97757;
   --logo-stroke: #2a211c;   /* HtyBox 纸箱 logo 箱体描边（暗色翻暖棕以勾勒，见 .hty-logo） */
   --checker: #eceae3;       /* 透明图预览棋盘格（DockEditor 内联 style 引用） */
+  --md-code-bg: #f4f3ee;    /* md 预览代码块底：跟随主题（浅=奶油浅底配 Light+，深=暖深底配 Dark+） */
   /* 全局界面字体（默认鸿蒙；由设置面板切换，见 fonts.ts） */
   --app-font: "HarmonyOS Sans SC", "Microsoft YaHei", "PingFang SC", sans-serif;
 }
@@ -97,6 +98,7 @@ html.dark {
   --focus-border: #d97757;
   --logo-stroke: #6b574a;
   --checker: #2f2a24;
+  --md-code-bg: #1f1e1d;
 }
 
 /* 细窄滚动条（浅色奶油主题） */
@@ -227,10 +229,14 @@ html.dark .kimi-glyph .kimi-k {
   box-shadow: inset 0 2px 0 var(--accent);
 }
 
-/* M9：Markdown 预览（无 IDE 代码高亮，仅基础排版） */
+/* Markdown 预览：结构元素分级配色 + 代码块 shiki 语法高亮（VSCode Light+/Dark+ 同款）。
+   目标是"扫一眼就能分出层级"——四级标题异色、表头有底、行内码陶土、代码块多色。 */
 .md-preview {
   line-height: 1.7;
+  color: var(--text-deep);
 }
+/* 标题一律主文字色（对齐 VSCode 预览：层级靠字号 / 粗细 / 下边框区分，不靠色相染色），
+   正文用略柔的 --text-deep → 形成"标题实、正文柔"的层次，扫视时标题自然凸出。 */
 .md-preview h1,
 .md-preview h2,
 .md-preview h3,
@@ -242,7 +248,7 @@ html.dark .kimi-glyph .kimi-k {
 }
 .md-preview h1 {
   font-size: 1.5em;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1.5px solid var(--accent-border);
   padding-bottom: 0.2em;
 }
 .md-preview h2 {
@@ -253,8 +259,21 @@ html.dark .kimi-glyph .kimi-k {
 .md-preview h3 {
   font-size: 1.12em;
 }
+.md-preview h4 {
+  font-size: 1em;
+}
 .md-preview p {
   margin: 0.6em 0;
+}
+.md-preview strong {
+  font-weight: 700;
+  color: var(--text);
+}
+.md-preview em {
+  color: var(--text-2);
+}
+.md-preview del {
+  color: var(--text-3);
 }
 .md-preview a {
   color: var(--accent-text);
@@ -268,16 +287,39 @@ html.dark .kimi-glyph .kimi-k {
 .md-preview li {
   margin: 0.2em 0;
 }
+.md-preview li::marker {
+  color: var(--accent);
+}
+/* 任务列表：勾选框走强调色，已完成项弱化 */
+.md-preview li:has(> input[type="checkbox"]) {
+  list-style: none;
+  margin-left: -1.1em;
+}
+.md-preview input[type="checkbox"] {
+  accent-color: var(--success);
+  margin-right: 0.45em;
+}
+.md-preview li:has(> input[type="checkbox"]:checked) {
+  color: var(--text-3);
+  text-decoration: line-through;
+}
+/* 行内代码：陶土字 + 淡底 + 细边，与正文明确区分（此前只有底、字色与正文同色）。
+   字体跟随全局界面字体 --app-font —— 界面字体设置必须全局统一，代码字符不另起一套字体栈。 */
 .md-preview code {
-  background: var(--surface-soft);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border: 1px solid var(--accent-border-soft);
   border-radius: 4px;
-  padding: 0.1em 0.35em;
-  font-family: ui-monospace, monospace;
+  padding: 0.05em 0.35em;
+  font-family: var(--app-font);
   font-size: 0.9em;
 }
+/* 代码块：底色跟随主题（浅色浅底 + Light+，深色深底 + Dark+）。
+   显式写 font-family 覆盖浏览器对 <pre> 的等宽默认值，与全局字体保持一致。 */
 .md-preview pre {
-  background: var(--term-bg);
-  color: var(--term-fg);
+  font-family: var(--app-font);
+  background: var(--md-code-bg);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0.8em 1em;
   overflow-x: auto;
@@ -285,13 +327,29 @@ html.dark .kimi-glyph .kimi-k {
 }
 .md-preview pre code {
   background: transparent;
+  border: 0;
   color: inherit;
   padding: 0;
 }
+/* shiki 产物：背景改用项目色板；深色主题下切到 --shiki-dark 变量组 */
+.md-preview .shiki {
+  background: var(--md-code-bg) !important;
+}
+html.dark .md-preview .shiki,
+html.dark .md-preview .shiki span,
+html.dark .code-preview .shiki,
+html.dark .code-preview .shiki span {
+  color: var(--shiki-dark) !important;
+  font-style: var(--shiki-dark-font-style) !important;
+  font-weight: var(--shiki-dark-font-weight) !important;
+  text-decoration: var(--shiki-dark-text-decoration) !important;
+}
 .md-preview blockquote {
-  border-left: 3px solid var(--accent-border);
+  border-left: 3px solid var(--accent);
+  background: var(--surface-soft);
+  border-radius: 0 4px 4px 0;
   margin: 0.7em 0;
-  padding: 0.2em 0 0.2em 1em;
+  padding: 0.35em 0 0.35em 1em;
   color: var(--text-2);
 }
 .md-preview table {
@@ -303,6 +361,14 @@ html.dark .kimi-glyph .kimi-k {
   border: 1px solid var(--border);
   padding: 0.3em 0.6em;
 }
+.md-preview th {
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 700;
+}
+.md-preview tbody tr:nth-child(even) {
+  background: var(--surface-soft);
+}
 .md-preview img {
   max-width: 100%;
 }
@@ -310,6 +376,55 @@ html.dark .kimi-glyph .kimi-k {
   border: none;
   border-top: 1px solid var(--border);
   margin: 1em 0;
+}
+
+/* 代码文件只读预览态：行号列 + shiki 语法高亮。
+   与 md 预览的代码块共用 --md-code-bg 与上面的 html.dark token 规则，两处观感一致。 */
+.code-preview {
+  background: var(--md-code-bg);
+}
+.code-preview pre {
+  margin: 0;
+  padding: 10px 0;
+  background: transparent !important; /* 压过 shiki 内联的 background-color，底色交给容器 */
+  font-family: var(--app-font);
+  font-size: 12.5px;
+  line-height: 1.45;
+  tab-size: 4;
+  /* 必须关掉 <pre> 的 white-space:pre —— shiki 在每个 <span class="line"> 之间还输出真实 
+，
+     行本身已 block 化，若再按 pre 处理这些换行符，每行后面会多出一个空行（行距翻倍）。
+     行内的缩进与空格由 .line 自己的 white-space:pre 保留。 */
+  white-space: normal;
+}
+.code-preview code {
+  display: block;
+  counter-reset: ln;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+}
+/* shiki 与兜底路径都逐行输出 <span class="line">，行号因此对两条路径通用 */
+.code-preview .line {
+  display: block;
+  position: relative;
+  counter-increment: ln;
+  padding: 0 16px 0 62px;
+  white-space: pre; /* 行内保留缩进；不折行 → 长行横向滚动，行号永不错位 */
+  min-height: 1.45em; /* 空行也占一行高 */
+}
+.code-preview .line::before {
+  content: counter(ln);
+  position: absolute;
+  left: 0;
+  width: 44px;
+  padding-right: 9px;
+  text-align: right;
+  color: var(--text-3);
+  border-right: 1px solid var(--border);
+  user-select: none;
 }
 
 /* ============ 拖拽自动滚动提示条：纯颗粒（陶土噪点向内淡出 + 缓慢流动）============ */

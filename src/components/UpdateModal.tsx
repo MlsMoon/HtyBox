@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { marked } from "marked";
+import { renderMarkdown } from "../mdRender";
 import { relaunch, type Update } from "../updater";
 
 /** 自定义「发现新版本」弹窗：显示版本号 + 更新日志(md)，可「跳过此版本」或「立刻更新」。
@@ -43,7 +43,7 @@ export default function UpdateModal({
     }
   };
 
-  const html = update.body ? (marked.parse(update.body, { async: false }) as string) : "";
+  const html = update.body ? renderMarkdown(update.body) : "";
   const date = update.date?.match(/^\d{4}-\d{2}-\d{2}/)?.[0] ?? "";
 
   return (

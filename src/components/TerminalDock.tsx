@@ -9,6 +9,7 @@ import {
   type IDockviewPanelHeaderProps,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
+import FileTypeIcon from "./ui/FileTypeIcon";
 import {
   ensureEngine,
   attachEngine,
@@ -50,10 +51,12 @@ import {
   type AgentSpec,
 } from "../mcp";
 import { buildBrief, briefPrompt } from "../protocol";
-import DockEditor, { disposeEditorBuf, isEditorDirty } from "./DockEditor";
+import DockEditor, { collectEditorBuf, disposeEditorBuf, isEditorDirty } from "./DockEditor";
 import RunConfigBar from "./RunConfigBar";
 import DockActionsMenu from "./DockActionsMenu";
-import { registerDockHost } from "../dockBus";
+import { registerDockHost, emitActiveFile, openEditor as routeOpenEditor } from "../dockBus";
+import { registerFileOpener, registerFileRevealer } from "../fileOpenBus";
+import { getSettings } from "../settings";
 import { captureSessionIds, listClaudeSessions, listCodexSessions, listCursorSessions, listKimiSessions } from "../catalog";
 import { getSessionTitle, setSessionTitle, onSessionTitlesChange, splitStatusPrefix } from "../sessionTitles";
 import {
@@ -355,66 +358,20 @@ export function markWorkspaceClosing(workspaceId: string): void {
 
 // Tab 类型图标（方案 B 实心彩色徽章）：ClaudeCode/Codex/Cursor/Kimi 用官方素材（codex/cursor 随主题 invert，kimi 浅色带底）；
 // 其余 6 类内联彩色徽章。普通终端随主题色（底=var(--text)、字=var(--bg)，暗色下不糊）。
-const TAB_CODE_RE = /\.(ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|c|h|cc|cpp|hpp|cs|rb|php|swift|kt|kts|scala|sh|bash|zsh|ps1|bat|lua|sql|r|dart|vue|svelte|astro|json|json5|jsonc|ya?ml|toml|xml|html?|css|scss|sass|less|styl|graphql|proto)$/i;
-const TAB_IMG_RE = /\.(png|jpe?g|jfif|gif|webp|bmp|ico|avif)$/i;
-
 function TabTypeIcon({ params }: { params: TermParams & { editorPath?: string } }) {
   const ep = params.editorPath;
   const cls = "h-[15px] w-[15px] shrink-0";
-  if (!ep) {
-    if (params.agentKind === "claude") return <img src={claudeIcon} alt="" className={cls} draggable={false} />;
-    if (params.agentKind === "codex") return <img src={codexIcon} alt="" className={"codex-glyph " + cls} draggable={false} />;
-    if (params.agentKind === "cursor") return <img src={cursorIcon} alt="" className={"cursor-glyph " + cls} draggable={false} />;
-    if (params.agentKind === "kimi") return <KimiIcon className={cls} />;
-    return (
-      <svg className={cls} viewBox="0 0 24 24">
-        <rect x="2" y="3.5" width="20" height="17" rx="5" fill="var(--text)" />
-        <polyline points="6.5 9.5 9.5 12 6.5 14.5" fill="none" stroke="var(--bg)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-        <line x1="11.5" y1="14.8" x2="16" y2="14.8" stroke="var(--bg)" strokeWidth="1.8" strokeLinecap="round" />
-      </svg>
-    );
-  }
-  if (TAB_IMG_RE.test(ep))
-    return (
-      <svg className={cls} viewBox="0 0 24 24">
-        <rect x="2" y="3.5" width="20" height="17" rx="5" fill="#2fa35e" />
-        <circle cx="8" cy="9.5" r="1.6" fill="#fff" />
-        <path d="M4.5 16.5 L9 12 L12 14.5 L15.5 11 L19.5 16" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-    );
-  if (/\.svg$/i.test(ep))
-    return (
-      <svg className={cls} viewBox="0 0 24 24">
-        <rect x="2" y="3.5" width="20" height="17" rx="5" fill="#d97757" />
-        <path d="M5 15 C 8.5 9.5, 15.5 9.5, 19 15" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" />
-        <rect x="3.4" y="13.6" width="3" height="3" rx="0.5" fill="#fff" />
-        <rect x="17.6" y="13.6" width="3" height="3" rx="0.5" fill="#fff" />
-        <circle cx="12" cy="9.2" r="1.5" fill="#fff" />
-      </svg>
-    );
-  if (/\.(md|markdown)$/i.test(ep))
-    return (
-      <svg className={cls} viewBox="0 0 24 24">
-        <rect x="2" y="3.5" width="20" height="17" rx="5" fill="#4f7cc4" />
-        <path d="M6 15 V9.2 L8.4 12.2 L10.8 9.2 V15" fill="none" stroke="#fff" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-        <path d="M14.6 9.2 V13.6 M12.5 11.8 L14.6 14 L16.7 11.8" fill="none" stroke="#fff" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-    );
-  if (TAB_CODE_RE.test(ep))
-    return (
-      <svg className={cls} viewBox="0 0 24 24">
-        <rect x="2" y="3.5" width="20" height="17" rx="5" fill="#8b7cff" />
-        <polyline points="9 8.5 6 12 9 15.5" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-        <polyline points="15 8.5 18 12 15 15.5" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-        <line x1="13.2" y1="7.6" x2="10.8" y2="16.4" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" />
-      </svg>
-    );
+  // 编辑器面板 → 按扩展名走共享的文件类型徽章（与内容预览窗口同一套）
+  if (ep) return <FileTypeIcon path={ep} className={cls} />;
+  if (params.agentKind === "claude") return <img src={claudeIcon} alt="" className={cls} draggable={false} />;
+  if (params.agentKind === "codex") return <img src={codexIcon} alt="" className={"codex-glyph " + cls} draggable={false} />;
+  if (params.agentKind === "cursor") return <img src={cursorIcon} alt="" className={"cursor-glyph " + cls} draggable={false} />;
+  if (params.agentKind === "kimi") return <KimiIcon className={cls} />;
   return (
     <svg className={cls} viewBox="0 0 24 24">
-      <rect x="2" y="3.5" width="20" height="17" rx="5" fill="#8c8a82" />
-      <line x1="7" y1="9" x2="17" y2="9" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" />
-      <line x1="7" y1="12" x2="17" y2="12" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" />
-      <line x1="7" y1="15" x2="13" y2="15" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" />
+      <rect x="2" y="3.5" width="20" height="17" rx="5" fill="var(--text)" />
+      <polyline points="6.5 9.5 9.5 12 6.5 14.5" fill="none" stroke="var(--bg)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <line x1="11.5" y1="14.8" x2="16" y2="14.8" stroke="var(--bg)" strokeWidth="1.8" strokeLinecap="round" />
     </svg>
   );
 }
@@ -645,6 +602,18 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     const dimSub = apiRef.current.onDidDimensionsChange(() => refitEngine(termId));
     const visSub = apiRef.current.onDidVisibilityChange(() => refitEngine(termId));
 
+    // 「标签页可选中」关闭时：本面板成为活动面板即把焦点交给终端，切过去可直接打字，
+    // 标签自身不保持选中态（删除键因此落不到标签上）。
+    // 必须等 dockview 真正把面板显示出来：对隐藏元素调 focus() 无效，故等到
+    // api.isVisible 且延后一帧（避开浏览器 mousedown 把焦点给可聚焦标签的默认行为）。
+    const grabFocus = () => {
+      if (getSettings().tabSelectable) return;
+      if (!apiRef.current.isActive || !apiRef.current.isVisible) return;
+      requestAnimationFrame(() => focusEngine(termId));
+    };
+    const actSub = apiRef.current.onDidActiveChange(grabFocus);
+    const visFocusSub = apiRef.current.onDidVisibilityChange(grabFocus);
+
     // 程序设置终端标题(OSC)时：记下原始标题(含状态前缀)并刷新 Tab。
     setEngineTitleHandler(termId, (t) => {
       const raw = t.trim();
@@ -732,6 +701,8 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
       c.removeEventListener("drop", onDrop);
       dimSub.dispose();
       visSub.dispose();
+      actSub.dispose();
+      visFocusSub.dispose();
       titleSub();
       nativeSub();
       // 故意不 abort 捕获：见 ensureSessionCapture 注释
@@ -1077,6 +1048,17 @@ export default function TerminalDock({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId, cwd]);
 
+  // 编辑器面板与宿主之间的两条通道（DockEditor 只认 fileOpenBus，不直接依赖 dockBus / 窗口状态）：
+  // 打开另一个文件 → 走 dockBus 分流（预览窗开着会自动转过去）；面板激活 → 左栏文件树揭示定位。
+  useEffect(() => {
+    const un1 = registerFileOpener(workspaceId, (p) => routeOpenEditor(workspaceId, p));
+    const un2 = registerFileRevealer(workspaceId, (p) => emitActiveFile(workspaceId, p));
+    return () => {
+      un1();
+      un2();
+    };
+  }, [workspaceId]);
+
   // M9：注册"打开编辑器 / 在此开终端"总线（FilePanel 点击文件、右键操作经此路由到本 dock）。
   useEffect(() => {
     return registerDockHost(workspaceId, {
@@ -1094,7 +1076,7 @@ export default function TerminalDock({
           id: `${workspaceId}::e-${Date.now().toString(36)}-${(seq++).toString(36)}`,
           component: "editor",
           title: baseName(filePath),
-          params: { editorPath: filePath, workspaceId },
+          params: { editorPath: filePath, workspaceId, workspaceRoot: cwd },
         });
       },
       openTerminalAt: (atCwd) => {
@@ -1142,6 +1124,27 @@ export default function TerminalDock({
         if (panel) {
           panel.api.setActive();
           focusEngine(termId);
+        }
+      },
+      collectEditors: () => {
+        const api = apiRef.current;
+        if (!api) return [];
+        const out: { path: string; content?: string }[] = [];
+        for (const p of api.panels) {
+          const path = (p.params as { editorPath?: string } | undefined)?.editorPath;
+          if (!path) continue;
+          const content = collectEditorBuf(p.id); // 未保存的随行搬走，已保存的让对端读盘
+          out.push(content === undefined ? { path } : { path, content });
+        }
+        return out;
+      },
+      closeEditors: (paths) => {
+        const api = apiRef.current;
+        if (!api) return;
+        const want = new Set(paths);
+        for (const p of [...api.panels]) {
+          const path = (p.params as { editorPath?: string } | undefined)?.editorPath;
+          if (path && want.has(path)) p.api.close();
         }
       },
       terminalTitle: (termId) => {
@@ -1211,7 +1214,17 @@ export default function TerminalDock({
           onClose={() => setSpawnPicker(null)}
         />
       )}
-      <div className="dockview-theme-light min-h-0 flex-1">
+      <div
+        className="dockview-theme-light min-h-0 flex-1"
+        // 「标签页可选中」关闭时的兜底：键盘导航（Tab 键）仍可能把焦点送进标签栏，
+        // 此时删除键会落到标签上关掉面板。dockview 的 keydown 绑在 tabsList 上走冒泡，
+        // 捕获阶段 stopPropagation 即可拦下；开关打开时放行其原生行为。
+        onKeyDownCapture={(e) => {
+          if (getSettings().tabSelectable) return;
+          if (e.key !== "Delete" && e.key !== "Backspace") return;
+          if ((e.target as HTMLElement).closest(".dv-tab")) e.stopPropagation();
+        }}
+      >
         <DockviewReact
           components={components}
           defaultTabComponent={DockTab}

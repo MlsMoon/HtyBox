@@ -1,7 +1,7 @@
 {
   "name": "htybox-app",
   "private": true,
-  "version": "1.11.0",
+  "version": "1.12.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -25,7 +25,8 @@
     "dockview-react": "^7.0.2",
     "marked": "^18.0.5",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "shiki": "^4.3.1"
   },
   "devDependencies": {
     "@resvg/resvg-js": "^2.6.2",

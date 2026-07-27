@@ -470,6 +470,12 @@ export default function SettingsModal({
                   onChange={(v) => setSetting("hoverPreview", v)}
                 />
                 <ToggleRow
+                  title="标签页可选中"
+                  desc="开启后点击标签页会选中它，可按 Delete / Backspace 关闭该标签；关闭时点击标签只切换，并立即聚焦终端输入框可直接打字，标签不会被选中、也不会误按删除键关掉（关闭标签请点标签上的 ✕）"
+                  on={s.tabSelectable}
+                  onChange={(v) => setSetting("tabSelectable", v)}
+                />
+                <ToggleRow
                   title="多 Agent 全自动接力"
                   desc="开：唤醒自动注入（终端静默后），团队无人工接力跑；关：半自动（弹提示，点击才唤醒）"
                   on={s.autoRelay}
@@ -786,9 +792,6 @@ export default function SettingsModal({
             )}
             {section === "agents" && <AgentSettings />}
             {section === "connection" && <ConnectionSettings />}
-            <div className="mt-4 border-t border-[var(--border)] pt-3 text-[10px] text-[var(--text-3)]">
-              更多全局设置将陆续加入此处。
-            </div>
           </div>
         </div>
       </div>

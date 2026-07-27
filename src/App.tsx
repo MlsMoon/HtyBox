@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import { Allotment } from "allotment";
 import Sidebar from "./components/Sidebar";
 import TerminalDock, { markWorkspaceClosing } from "./components/TerminalDock";
@@ -22,8 +22,11 @@ import { checkForUpdate, getSkippedVersion, setSkippedVersion, type Update } fro
 import { getWsState, setWsState } from "./wsState";
 import { onAgentStatusChange, workspaceStatus, setActiveWorkspace, clearWorkspace, type WsStatus } from "./agentStatus";
 import { useMaskDismiss } from "./components/ui/maskDismiss";
+import { useDoubleShift } from "./components/ui/useDoubleShift";
 import DashboardShell from "./components/htyenv/DashboardShell";
 import { setSetting, useSettings } from "./settings";
+import * as previewWin from "./previewWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 // hty环境仪表盘入口图标(布局面板风格)
 function DashboardIcon() {
@@ -33,6 +36,26 @@ function DashboardIcon() {
       <rect x="14" y="3" width="7" height="5" rx="1.5" />
       <rect x="14" y="12" width="7" height="9" rx="1.5" />
       <rect x="3" y="16" width="7" height="5" rx="1.5" />
+    </svg>
+  );
+}
+
+// 内容预览窗口入口图标（两形态）：未开 = 后窗虚线（第二窗口尚未打开）；已开 = 双窗实线 + 后窗带内容行。
+// 两态都用 currentColor / var(--accent-soft)，浅色深色主题各自适配（图标须随主题适配的既定纪律）。
+function PreviewWindowIcon({ on }: { on: boolean }) {
+  return (
+    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round">
+      <rect x="1.6" y="3.2" width="13.6" height="10.4" rx="2.2" />
+      <path d="M1.6 6.6h13.6" />
+      {on ? (
+        <>
+          <rect x="8.8" y="10.4" width="13.6" height="10.4" rx="2.2" fill="var(--accent-soft)" />
+          <path d="M8.8 13.8h13.6" />
+          <path d="M11.8 17h7.6M11.8 19.4h4.6" strokeWidth={1.6} />
+        </>
+      ) : (
+        <rect x="8.8" y="10.4" width="13.6" height="10.4" rx="2.2" strokeDasharray="3 2.6" opacity={0.75} />
+      )}
     </svg>
   );
 }
@@ -214,6 +237,32 @@ export default function App() {
   // 运行状态总线：订阅刷新顶栏标签三态图标 + 把当前激活工作区告知总线（切到即清"完成待查看"）
   useEffect(() => onAgentStatusChange(forceStatusTick), [forceStatusTick]);
   useEffect(() => setActiveWorkspace(activeId), [activeId]);
+  // 内容预览窗口跟随活动工作区：目标工作区记忆为「开」的自动显示，其余隐藏（Tab 不丢）。
+  // 应用启动后这个 effect 同样会跑一次 → 退出前开着的预览窗自动复原。
+  // 依赖只取 activeId：工作区列表的其它变动不该把预览窗抢到前台。
+  const wsRef = useRef(openWs);
+  wsRef.current = openWs;
+  useEffect(() => {
+    const w = wsRef.current.find((x) => x.id === activeId) ?? null;
+    previewWin.syncToActiveWorkspace(w ? { id: w.id, path: w.path, name: w.name } : null);
+  }, [activeId]);
+
+  // 关主窗 = 退出应用：先收掉全部预览窗（否则进程被它们吊着不退出），记忆保留待下次复原
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let un: (() => void) | undefined;
+    win
+      .onCloseRequested(async (e) => {
+        e.preventDefault();
+        await previewWin.closeAllOnExit();
+        await win.destroy();
+      })
+      .then((u) => {
+        un = u;
+      });
+    return () => un?.();
+  }, []);
+
   // L5-4P：把已打开工作区 + 当前激活发布给本机 Host，供 iOS 远程镜像（纯加法，桌面行为不变）
   useEffect(() => {
     invoke("set_workspaces", {
@@ -273,6 +322,7 @@ export default function App() {
   const closeWs = (id: string) => {
     // 标记关闭中：卸载期间别把残缺布局写回；但【保留】布局键 → 重新打开可复原终端
     markWorkspaceClosing(id);
+    previewWin.closeForWorkspace(id); // 工作区没了，它的内容预览窗口也一并收掉（并清记忆）
     disposeByPrefix(id + "::"); // 结束该工作区全部终端（PTY）
     clearWorkspace(id); // 清该工作区运行状态总线
     const rest = openWs.filter((w) => w.id !== id);
@@ -301,29 +351,18 @@ export default function App() {
   }, [activeId]);
 
   const active = openWs.find((w) => w.id === activeId) ?? null;
+  // 顶栏「内容预览窗口」按钮的开/关形态（窗口在别处被关掉时也会同步过来）
+  const previewOpen = useSyncExternalStore(previewWin.subscribe, () =>
+    activeId ? previewWin.isLive(activeId) : false,
+  );
 
-  // 双击 Shift → 全局文件搜索（quick-open，仅在有活动工作区时）
+  // 双击 Shift → 全局文件搜索（quick-open，仅在有活动工作区时）。
+  // 判定逻辑与内容预览窗口共用 useDoubleShift，两窗手感一致。
   const activeRef = useRef(active);
   activeRef.current = active;
-  useEffect(() => {
-    let lastShift = 0;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Shift") {
-        if (e.repeat) return;
-        const now = Date.now();
-        if (now - lastShift < 320 && activeRef.current) {
-          setShowQuickOpen(true);
-          lastShift = 0;
-        } else {
-          lastShift = now;
-        }
-      } else {
-        lastShift = 0;
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  useDoubleShift(() => {
+    if (activeRef.current) setShowQuickOpen(true);
+  });
 
   return (
     <div className="relative flex h-screen w-screen flex-col bg-[var(--bg)] text-[var(--text)]">
@@ -457,6 +496,22 @@ export default function App() {
             </div>
           </div>
           <div className="ml-auto flex items-center gap-2 pr-1">
+            <button
+              onClick={() => previewWin.toggle({ id: active.id, path: active.path, name: active.name })}
+              title={
+                previewOpen
+                  ? "关闭内容预览窗口"
+                  : "打开内容预览窗口（文件 / SVG / 图片改在独立窗口预览）"
+              }
+              className={
+                "flex h-7 w-7 items-center justify-center rounded-md transition-colors " +
+                (previewOpen
+                  ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                  : "text-[var(--text-2)] hover:bg-[var(--elevated)] hover:text-[var(--text)]")
+              }
+            >
+              <PreviewWindowIcon on={previewOpen} />
+            </button>
             <BookmarkBar scope={active.id} workspacePath={active.path} />
             <button
               onClick={() => setSetting("envDashboardMode", true)}

@@ -871,6 +871,13 @@ fn read_text_file(
     fs_tree::read_text_file(&path, force_lossy.unwrap_or(false), max_bytes)
 }
 
+/// md 预览里的相对链接解析用：判断某路径是否为已存在的文件（目录不算）。
+/// 同一个链接可能相对"当前文件所在目录"也可能相对"工作区根"，前端按序探测取存在的那个。
+#[tauri::command]
+fn file_exists(path: String) -> bool {
+    std::path::Path::new(&path).is_file()
+}
+
 /// M9：保存文本文件。
 #[tauri::command]
 fn write_text_file(path: String, content: String) -> Result<(), String> {
@@ -1358,6 +1365,7 @@ pub fn run() {
             list_dir,
             read_text_file,
             write_text_file,
+            file_exists,
             read_image_data_url,
             create_entry,
             rename_entry,

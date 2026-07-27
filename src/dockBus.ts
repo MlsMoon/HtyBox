@@ -1,8 +1,15 @@
 // M9：把"打开编辑器 / 在此开终端"从 Sidebar(FilePanel) 路由到对应 workspace 的
 // TerminalDock(dockview 宿主)。仿 mcp.ts 的 registerAgentLauncher，按 workspaceId 注册。
+import { listen } from "@tauri-apps/api/event";
+import { isLive, sendAdopt, sendOpenFile } from "./previewWindow";
+import { EV_READY } from "./previewProtocol";
 
 interface DockHost {
   openEditor: (path: string) => void;
+  /** 主窗里已开的编辑器（未保存内容随行），供移交给内容预览窗口 */
+  collectEditors: () => Array<{ path: string; content?: string }>;
+  /** 关掉这些路径对应的编辑器面板（移交完成后主窗只剩终端） */
+  closeEditors: (paths: string[]) => void;
   openTerminalAt: (cwd: string) => void;
   openTerminalCmd: (opts: { command: string; agentKind: string; title: string; cwd?: string; sessionId?: string }) => void;
   activateTerminal: (termId: string) => void;
@@ -18,10 +25,28 @@ export function registerDockHost(workspaceId: string, host: DockHost): () => voi
   };
 }
 
-/** 在某工作区的 dockview 里打开文件编辑器 Tab。 */
+/** 在某工作区的 dockview 里打开文件编辑器 Tab。
+ *  该工作区的内容预览窗口开着时改派给那个窗口——"非终端的打开一律不进主窗"的唯一分流点，
+ *  调用方（FilePanel / QuickOpen）无需关心去哪个窗口。 */
 export function openEditor(workspaceId: string, path: string): void {
+  if (isLive(workspaceId)) {
+    sendOpenFile(workspaceId, path);
+    return;
+  }
   hosts.get(workspaceId)?.openEditor(path);
 }
+
+// 预览窗建好并就绪 → 把主窗里该工作区已开的编辑器（含未保存内容）整体移交过去，主窗只剩终端。
+// 放在 dockBus 是因为这里同时握着 dock 宿主与预览窗派发通道，无需绕第三方。
+listen<{ wsId: string }>(EV_READY, (e) => {
+  const wsId = e.payload.wsId;
+  const host = hosts.get(wsId);
+  if (!host) return;
+  const items = host.collectEditors();
+  if (!items.length) return;
+  sendAdopt(wsId, items);
+  host.closeEditors(items.map((i) => i.path));
+}).catch((e) => console.error("监听内容预览窗口就绪事件失败", e));
 
 /** 在某工作区的 dockview 里新开一个 cwd=指定目录的终端。 */
 export function openTerminalAt(workspaceId: string, cwd: string): void {
