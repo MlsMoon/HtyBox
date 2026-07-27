@@ -89,7 +89,7 @@ fn ws_port(state: State<'_, AppState>) -> u16 {
     state.ws_port
 }
 
-/// 设置「Agent」页：检测四家 agent CLI 安装状态（实时 PATH = 进程+注册表合并，where.exe + best-effort --version）。
+/// 设置「Agent」页：检测四家 agent CLI 安装状态（where.exe + --version + latest 对比）。
 #[tauri::command]
 async fn detect_agents() -> Result<Vec<agent_env::AgentInstallStatus>, String> {
     Ok(tauri::async_runtime::spawn_blocking(agent_env::detect_agents)
@@ -97,12 +97,44 @@ async fn detect_agents() -> Result<Vec<agent_env::AgentInstallStatus>, String> {
         .map_err(|error| format!("agent 安装检测任务失败：{error}"))?)
 }
 
-/// 设置「Agent」页：对指定 agent 跑官方 Windows 安装脚本（后台执行，300s 超时，输出尾部随结果返回）。
+/// Channel → 同步进度回调(Mutex 包一层以满足 Send+Sync,供 spawn_blocking 内多线程 reader 调用)。
+fn agent_progress_cb(
+    on_progress: Channel<agent_env::ProgressEvent>,
+) -> std::sync::Arc<dyn Fn(agent_env::ProgressEvent) + Send + Sync> {
+    let ch = std::sync::Arc::new(Mutex::new(on_progress));
+    std::sync::Arc::new(move |ev: agent_env::ProgressEvent| {
+        if let Ok(guard) = ch.lock() {
+            let _ = guard.send(ev);
+        }
+    })
+}
+
+/// 设置「Agent」页：对**单个** agent 跑官方 Windows 安装脚本（流式进度，300s 超时）。
 #[tauri::command]
-async fn install_agent(id: String) -> Result<agent_env::InstallResult, String> {
-    Ok(tauri::async_runtime::spawn_blocking(move || agent_env::install_agent(&id))
-        .await
-        .map_err(|error| format!("agent 安装任务失败：{error}"))??)
+async fn install_agent(
+    id: String,
+    on_progress: Channel<agent_env::ProgressEvent>,
+) -> Result<agent_env::InstallResult, String> {
+    let progress = agent_progress_cb(on_progress);
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || agent_env::install_agent(&id, Some(progress)))
+            .await
+            .map_err(|error| format!("agent 安装任务失败：{error}"))??,
+    )
+}
+
+/// 设置「Agent」页：对**单个** agent 更新（原生命令或该行 install 脚本；不批量、不连带其它 agent）。
+#[tauri::command]
+async fn update_agent(
+    id: String,
+    on_progress: Channel<agent_env::ProgressEvent>,
+) -> Result<agent_env::InstallResult, String> {
+    let progress = agent_progress_cb(on_progress);
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || agent_env::update_agent(&id, Some(progress)))
+            .await
+            .map_err(|error| format!("agent 更新任务失败：{error}"))??,
+    )
 }
 
 /// L3：配对 offer（二维码 SVG + 链接）。
@@ -1352,6 +1384,7 @@ pub fn run() {
             capture_session_ids,
             detect_agents,
             install_agent,
+            update_agent,
             mcp_broker_url,
             setup_mcp_agent,
             write_agent_brief,

@@ -388,6 +388,33 @@ html.dark .kimi-glyph .kimi-k {
   .htybox-auto-travel { animation: none; }
 }
 
+/* Agent CLI 安装/更新：不定进度条（从左扫到右，不假装百分比） */
+.agent-cli-indet-track {
+  position: relative;
+  overflow: hidden;
+}
+.agent-cli-indet-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 36%;
+  border-radius: 9999px;
+  background: var(--accent);
+  animation: agent-cli-indet 1.15s ease-in-out infinite;
+}
+@keyframes agent-cli-indet {
+  0% { left: -36%; }
+  100% { left: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-cli-indet-bar {
+    left: 0;
+    width: 100%;
+    animation: none;
+    opacity: 0.65;
+  }
+}
+
 /* 内联填空：人工片段 textarea 随内容自适应宽高、无长度上限，超出容器宽即自动换行（保持连贯可读）。
    field-sizing:content 让 textarea 按内容撑宽/撑高；到 max-width 即换行、高度自增。 */
 .htybox-seg-field {
