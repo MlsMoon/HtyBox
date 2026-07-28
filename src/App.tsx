@@ -23,6 +23,7 @@ import { getWsState, setWsState } from "./wsState";
 import { onAgentStatusChange, workspaceStatus, setActiveWorkspace, clearWorkspace, type WsStatus } from "./agentStatus";
 import { useMaskDismiss } from "./components/ui/maskDismiss";
 import { useDoubleShift } from "./components/ui/useDoubleShift";
+import { SidebarToggleIcon, useSidebarToggle } from "./components/ui/SidebarToggle";
 import DashboardShell from "./components/htyenv/DashboardShell";
 import { setSetting, useSettings } from "./settings";
 import * as previewWin from "./previewWindow";
@@ -73,17 +74,6 @@ function GearIcon() {
     >
       <circle cx="12" cy="12" r="3" />
       <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-    </svg>
-  );
-}
-
-// 侧边栏开关图标（PanelLeft 风格）：open 时左栏格高亮
-function SidebarToggleIcon({ open }: { open: boolean }) {
-  return (
-    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-      {open && <rect x="3" y="4" width="6" height="16" fill="currentColor" stroke="none" opacity="0.22" />}
-      <rect x="3" y="4" width="18" height="16" rx="2" />
-      <line x1="9" y1="4" x2="9" y2="20" />
     </svg>
   );
 }
@@ -206,10 +196,19 @@ export default function App() {
     () => new Set(persisted.active ? [persisted.active] : []),
   );
   const [splitSizes] = useState(loadSplit); // 分栏宽度（持久化）
-  const [sidebarVisible, setSidebarVisible] = useState(() =>
-    persisted.active ? getWsState<boolean>(SIDEBAR_KEY, persisted.active, true) : true,
+  // 侧栏显隐 + 收放动画：与内容预览窗口共用 useSidebarToggle，两窗手感一致
+  const {
+    visible: sidebarVisible,
+    animClass: sidebarAnimClass,
+    toggle: toggleSidebar,
+    syncFromDrag: syncSidebarFromDrag,
+    setVisible: setSidebarVisible,
+  } = useSidebarToggle(
+    () => (persisted.active ? getWsState<boolean>(SIDEBAR_KEY, persisted.active, true) : true),
+    (v) => {
+      if (activeId) setWsState(SIDEBAR_KEY, activeId, v);
+    },
   ); // 侧边栏显隐（按工作区持久化）
-  const [sbAnimating, setSbAnimating] = useState(false); // 收起/展开动画期间给容器加过渡 class
   const [update, setUpdate] = useState<Update | null>(null); // 可用更新（null=无）
   const [showUpdate, setShowUpdate] = useState(false); // 更新弹窗开关
   const [appVersion, setAppVersion] = useState(""); // 应用真实版本号（来自打包进二进制的 tauri.conf.json）
@@ -335,16 +334,6 @@ export default function App() {
     if (id === activeId) setActiveId(rest.length ? rest[rest.length - 1].id : null);
   };
 
-  const toggleSidebar = () => {
-    setSbAnimating(true);
-    setSidebarVisible((v) => {
-      const next = !v;
-      if (activeId) setWsState(SIDEBAR_KEY, activeId, next);
-      return next;
-    });
-    window.setTimeout(() => setSbAnimating(false), 280);
-  };
-
   // 切工作区 → 读该工作区各自的侧边栏显隐（按工作区独立）
   useEffect(() => {
     if (activeId) setSidebarVisible(getWsState<boolean>(SIDEBAR_KEY, activeId, true));
@@ -363,6 +352,36 @@ export default function App() {
   useDoubleShift(() => {
     if (activeRef.current) setShowQuickOpen(true);
   });
+
+  // 主窗被点回前台时，把当前工作区的预览窗一并提到其它应用之上——它是独立窗口，
+  // 否则回到 HtyBox 时它可能还压在别的应用下面。焦点全程留在主窗：
+  // 预览窗用「瞬时置顶再取消」提上来，随后主窗同样提一次，回到 主窗 > 预览窗 > 其它应用 的层序。
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let un: (() => void) | undefined;
+    let last = 0;
+    win
+      .onFocusChanged(({ payload: focused }) => {
+        const id = activeRef.current?.id;
+        if (!focused || !id || !previewWin.isLive(id)) return;
+        const now = Date.now();
+        if (now - last < 300) return; // 连续获焦事件只处理一次
+        last = now;
+        void (async () => {
+          try {
+            await previewWin.raiseWithoutFocus(id);
+            await win.setAlwaysOnTop(true);
+            await win.setAlwaysOnTop(false);
+          } catch (e) {
+            console.error("把内容预览窗口带到前台失败", e);
+          }
+        })();
+      })
+      .then((u) => {
+        un = u;
+      });
+    return () => un?.();
+  }, []);
 
   return (
     <div className="relative flex h-screen w-screen flex-col bg-[var(--bg)] text-[var(--text)]">
@@ -541,16 +560,13 @@ export default function App() {
 
       {/* 两栏：侧栏(Skill/Memory) | 终端区。终端区"始终挂载"——回欢迎页只是被覆盖层盖住，
           终端 PTY 后台存活、不卸载、不被误杀。 */}
-      <div className={"min-h-0 flex-1" + (sbAnimating ? " htybox-sidebar-anim" : "")}>
+      <div className={"min-h-0 flex-1" + sidebarAnimClass}>
         <Allotment
           proportionalLayout={false}
           defaultSizes={splitSizes}
           onChange={saveSplit}
           onVisibleChange={(index, visible) => {
-            if (index === 0) {
-              setSidebarVisible(visible);
-              if (activeId) setWsState(SIDEBAR_KEY, activeId, visible);
-            }
+            if (index === 0) syncSidebarFromDrag(visible);
           }}
         >
           <Allotment.Pane minSize={220} preferredSize={300} visible={sidebarVisible}>

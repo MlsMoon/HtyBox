@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { listAllFiles, type FileRef } from "../catalog";
-import { openEditor, emitActiveFile, emitActiveFolder, requestSidebarTab } from "../dockBus";
+import { emitActiveFile, emitActiveFolder, requestSidebarTab } from "../dockBus";
+import { openFileInScope } from "../fileOpenBus";
 import { loadFavFolders, toggleFavFolder, onFavFoldersChange } from "../favFolders";
 import { loadIgnore } from "../fileIgnore";
 import { searchScore } from "../search";
@@ -83,7 +84,7 @@ export default function QuickOpen({
       requestSidebarTab(workspaceId, "file");
       emitActiveFolder(workspaceId, f.path, true); // 挂载后补发 → revealFolder 定位选中
     } else if (s.openFileFromSearch) {
-      openEditor(workspaceId, f.path); // 直接在编辑器打开
+      openFileInScope(workspaceId, f.path); // 直接在编辑器打开（预览窗开着则由注册者改派过去）
       // 同时显式揭示：不能只靠 DockEditor 的"激活即揭示"——重复搜同一个已打开且已激活的
       // 文件时，编辑器 Tab 不会重新激活、onDidActiveChange 不触发，树的揭示/滚动就不会发生
       emitActiveFile(workspaceId, f.path, true);

@@ -56,6 +56,8 @@ import RunConfigBar from "./RunConfigBar";
 import DockActionsMenu from "./DockActionsMenu";
 import { registerDockHost, emitActiveFile, openEditor as routeOpenEditor } from "../dockBus";
 import { registerFileOpener, registerFileRevealer } from "../fileOpenBus";
+import * as previewWin from "../previewWindow";
+import { EV_READY } from "../previewProtocol";
 import { getSettings } from "../settings";
 import { captureSessionIds, listClaudeSessions, listCodexSessions, listCursorSessions, listKimiSessions } from "../catalog";
 import { getSessionTitle, setSessionTitle, onSessionTitlesChange, splitStatusPrefix } from "../sessionTitles";
@@ -1050,14 +1052,56 @@ export default function TerminalDock({
 
   // 编辑器面板与宿主之间的两条通道（DockEditor 只认 fileOpenBus，不直接依赖 dockBus / 窗口状态）：
   // 打开另一个文件 → 走 dockBus 分流（预览窗开着会自动转过去）；面板激活 → 左栏文件树揭示定位。
+  // 编辑器面板的收集 / 批量关闭：dock 宿主接口与「移交给预览窗」共用同一份实现
+  const collectEditors = useCallback((): Array<{ path: string; content?: string }> => {
+    const api = apiRef.current;
+    if (!api) return [];
+    const out: { path: string; content?: string }[] = [];
+    for (const p of api.panels) {
+      const path = (p.params as { editorPath?: string } | undefined)?.editorPath;
+      if (!path) continue;
+      const content = collectEditorBuf(p.id); // 未保存的随行搬走，已保存的让对端读盘
+      out.push(content === undefined ? { path } : { path, content });
+    }
+    return out;
+  }, []);
+  const closeEditors = useCallback((paths: string[]) => {
+    const api = apiRef.current;
+    if (!api) return;
+    const want = new Set(paths);
+    for (const p of [...api.panels]) {
+      const path = (p.params as { editorPath?: string } | undefined)?.editorPath;
+      if (path && want.has(path)) p.api.close();
+    }
+  }, []);
+
   useEffect(() => {
-    const un1 = registerFileOpener(workspaceId, (p) => routeOpenEditor(workspaceId, p));
+    // 打开文件的分流点：该工作区的内容预览窗口开着就改派过去，否则落本 dock。
+    // 放在主窗侧注册（而非 dockBus 内部），第二个窗口才不会被迫 import 窗口状态机。
+    const un1 = registerFileOpener(workspaceId, (p) => {
+      if (previewWin.isLive(workspaceId)) previewWin.sendOpenFile(workspaceId, p);
+      else routeOpenEditor(workspaceId, p);
+    });
     const un2 = registerFileRevealer(workspaceId, (p) => emitActiveFile(workspaceId, p));
+    // 预览窗建好并就绪 → 把本工作区已开的编辑器（含未保存内容）整体移交过去，主窗只剩终端
+    let unReady: (() => void) | undefined;
+    listen<{ wsId: string }>(EV_READY, (e) => {
+      if (e.payload.wsId !== workspaceId) return;
+      const items = collectEditors();
+      if (!items.length) return;
+      previewWin.sendAdopt(workspaceId, items);
+      closeEditors(items.map((i) => i.path));
+    })
+      .then((u) => {
+        unReady = u;
+      })
+      .catch((e) => console.error("监听内容预览窗口就绪事件失败", e));
     return () => {
       un1();
       un2();
+      unReady?.();
     };
-  }, [workspaceId]);
+  }, [workspaceId, collectEditors, closeEditors]);
 
   // M9：注册"打开编辑器 / 在此开终端"总线（FilePanel 点击文件、右键操作经此路由到本 dock）。
   useEffect(() => {
@@ -1126,27 +1170,8 @@ export default function TerminalDock({
           focusEngine(termId);
         }
       },
-      collectEditors: () => {
-        const api = apiRef.current;
-        if (!api) return [];
-        const out: { path: string; content?: string }[] = [];
-        for (const p of api.panels) {
-          const path = (p.params as { editorPath?: string } | undefined)?.editorPath;
-          if (!path) continue;
-          const content = collectEditorBuf(p.id); // 未保存的随行搬走，已保存的让对端读盘
-          out.push(content === undefined ? { path } : { path, content });
-        }
-        return out;
-      },
-      closeEditors: (paths) => {
-        const api = apiRef.current;
-        if (!api) return;
-        const want = new Set(paths);
-        for (const p of [...api.panels]) {
-          const path = (p.params as { editorPath?: string } | undefined)?.editorPath;
-          if (path && want.has(path)) p.api.close();
-        }
-      },
+      collectEditors,
+      closeEditors,
       terminalTitle: (termId) => {
         const api = apiRef.current;
         // PanelApi 的 title 属性（DockTab 的 props.api.title 同源，已实证）

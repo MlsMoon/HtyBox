@@ -7,6 +7,7 @@ import { initFont } from "./fonts";
 import { initTheme } from "./theme";
 import { IconProvider, DEFAULT_ICON_CONFIGS } from "@icon-park/react";
 import "@icon-park/react/styles/index.css";
+import "allotment/dist/style.css";
 import "./index.css";
 
 const ICON_CONFIG = {

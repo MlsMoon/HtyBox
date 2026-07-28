@@ -133,6 +133,18 @@ export async function closeAllOnExit(): Promise<void> {
   }
 }
 
+/** 把某工作区的预览窗提到所有应用之上，但**不夺走焦点**（焦点留在调用方窗口）。
+ *  用途：主窗被点回前台时，独立存在的预览窗不该还被别的应用压着。
+ *  手法：瞬时置顶再取消 —— Windows 上这是"提到最前而不激活"的既定做法，
+ *  常态层级不变（不会变成永久置顶，也不会像 setFocus 那样抢走输入焦点）。 */
+export async function raiseWithoutFocus(workspaceId: string): Promise<void> {
+  if (!live.has(workspaceId)) return;
+  const w = await WebviewWindow.getByLabel(labelFor(workspaceId));
+  if (!w) return;
+  await w.setAlwaysOnTop(true);
+  await w.setAlwaysOnTop(false);
+}
+
 /** 把「打开这个文件」派给某工作区的预览窗。 */
 export function sendOpenFile(workspaceId: string, path: string): void {
   emitTo(labelFor(workspaceId), EV_OPEN_FILE, { path }).catch((e) =>

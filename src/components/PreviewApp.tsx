@@ -19,10 +19,14 @@ import { SETTINGS_CHANGED, reloadSettings } from "../settings";
 import { writeTextFile } from "../catalog";
 import { useMaskDismiss } from "./ui/maskDismiss";
 import { useDoubleShift } from "./ui/useDoubleShift";
+import { SidebarToggleIcon, useSidebarToggle } from "./ui/SidebarToggle";
 import QuickOpen from "./QuickOpen";
 import { getWsState, setWsState } from "../wsState";
 import { getSettings } from "../settings";
-import { registerFileOpener } from "../fileOpenBus";
+import { registerFileOpener, registerFileRevealer } from "../fileOpenBus";
+import { emitActiveFile } from "../dockBus";
+import { Allotment } from "allotment";
+import FilePanel from "./FilePanel";
 import { initFont } from "../fonts";
 import { initTheme } from "../theme";
 
@@ -77,6 +81,9 @@ const components = { editor: DockEditor };
 
 /** 已打开的 Tab 按工作区持久化：窗口真关闭后重开，上次那批文件原样回来。 */
 const TABS_KEY = "htybox.previewTabs.v1";
+/** 预览窗左栏文件树的显隐与宽度，同样按工作区记忆。 */
+const SIDEBAR_KEY = "htybox.previewSidebar.v1";
+const SPLIT_KEY = "htybox.previewSplit.v1";
 
 export default function PreviewApp({
   workspaceId,
@@ -94,6 +101,16 @@ export default function PreviewApp({
   const [pendingClose, setPendingClose] = useState<Array<{ id: string; path: string }> | null>(null);
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [quickOpen, setQuickOpen] = useState(false);
+  // 与主窗共用 useSidebarToggle：显隐 + 收放动画 + 落盘，手感完全一致
+  const {
+    visible: sidebarVisible,
+    animClass: sidebarAnimClass,
+    toggle: toggleSidebar,
+    syncFromDrag: syncSidebarFromDrag,
+  } = useSidebarToggle(
+    () => getWsState<boolean>(SIDEBAR_KEY, workspaceId, true),
+    (v) => setWsState(SIDEBAR_KEY, workspaceId, v),
+  );
   const maskDismiss = useMaskDismiss(() => setPendingClose(null)); // 点遮罩 = 取消关闭
 
   /** 打开一个文件面板：已开则激活，未开则新建。 */
@@ -119,6 +136,11 @@ export default function PreviewApp({
 
   // md 预览里的链接点开另一个文件 → 在本窗新开 Tab（主窗那侧由 TerminalDock 注册同名通道）
   useEffect(() => registerFileOpener(workspaceId, (p) => openPath(p)), [workspaceId, openPath]);
+  // 本窗打开某文件时让左栏文件树揭示并定位它（与主窗同款链路）
+  useEffect(
+    () => registerFileRevealer(workspaceId, (p) => emitActiveFile(workspaceId, p)),
+    [workspaceId],
+  );
 
   const onReady = useCallback(
     (e: DockviewReadyEvent) => {
@@ -249,6 +271,13 @@ export default function PreviewApp({
         data-tauri-drag-region
         className="flex h-9 shrink-0 items-stretch border-b border-[var(--border)] bg-[var(--surface)]"
       >
+        <button
+          onClick={toggleSidebar}
+          title={sidebarVisible ? "隐藏文件树" : "显示文件树"}
+          className="flex h-full w-10 shrink-0 items-center justify-center text-[var(--text-2)] transition-colors hover:bg-[var(--elevated)] hover:text-[var(--text)]"
+        >
+          <SidebarToggleIcon open={sidebarVisible} />
+        </button>
         <div data-tauri-drag-region className="flex flex-1 items-center gap-2 px-3">
           <svg className="h-4 w-4 shrink-0 text-[var(--accent)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
             <rect x="1.5" y="3" width="14" height="11" rx="2.2" />
@@ -260,16 +289,35 @@ export default function PreviewApp({
         </div>
         <WindowControls />
       </div>
-      <div
-        className="dockview-theme-light relative min-h-0 flex-1"
-        onKeyDownCapture={onTabKeyDownCapture}
-      >
-        <DockviewReact components={components} defaultTabComponent={PreviewTab} onReady={onReady} />
-        {empty && (
-          <div className="pointer-events-none absolute inset-0">
-            <Watermark name={workspaceName} />
-          </div>
-        )}
+      <div className={"min-h-0 flex-1" + sidebarAnimClass}>
+        <Allotment
+          proportionalLayout={false}
+          defaultSizes={getWsState<number[] | undefined>(SPLIT_KEY, workspaceId, undefined)}
+          onChange={(sizes) => setWsState(SPLIT_KEY, workspaceId, sizes)}
+          onVisibleChange={(index, visible) => {
+            if (index === 0) syncSidebarFromDrag(visible);
+          }}
+        >
+          <Allotment.Pane minSize={200} preferredSize={280} visible={sidebarVisible}>
+            {/* 文件预览配套文件树用起来才顺手；这里没有终端，故隐去「在集成终端打开」 */}
+            <div className="h-full bg-[var(--surface)]">
+              <FilePanel root={workspacePath} workspaceId={workspaceId} canOpenTerminal={false} />
+            </div>
+          </Allotment.Pane>
+          <Allotment.Pane minSize={360}>
+            <div
+              className="dockview-theme-light relative h-full w-full"
+              onKeyDownCapture={onTabKeyDownCapture}
+            >
+              <DockviewReact components={components} defaultTabComponent={PreviewTab} onReady={onReady} />
+              {empty && (
+                <div className="pointer-events-none absolute inset-0">
+                  <Watermark name={workspaceName} />
+                </div>
+              )}
+            </div>
+          </Allotment.Pane>
+        </Allotment>
       </div>
 
       {quickOpen && (

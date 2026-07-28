@@ -18,6 +18,7 @@ export default function FileContextMenu({
   isTopLevel,
   favorited,
   count,
+  canOpenTerminal = true,
   onAction,
   onClose,
 }: {
@@ -28,6 +29,8 @@ export default function FileContextMenu({
   isTopLevel: boolean;
   favorited: boolean;
   count: number;
+  /** 关掉「在集成终端打开」——内容预览窗口没有终端 */
+  canOpenTerminal?: boolean;
   onAction: (id: string) => void;
   onClose: () => void;
 }) {
@@ -83,7 +86,8 @@ export default function FileContextMenu({
   ];
   const head: (Item | typeof SEP)[] = node.isDir
     ? [
-        { id: "openTerminal", label: "在集成终端打开" },
+        // 内容预览窗口没有终端，隐去该项而不是留个点了没反应的菜单
+        ...(canOpenTerminal ? [{ id: "openTerminal", label: "在集成终端打开" } as Item] : []),
         { id: "toggleFav", label: favorited ? "取消收藏文件夹" : "收藏文件夹" },
         SEP,
       ]

@@ -12,7 +12,8 @@ import {
   revealInExplorer,
   type DirEntry,
 } from "../catalog";
-import { openEditor, openTerminalAt, registerActiveFileReveal, registerActiveFolderReveal } from "../dockBus";
+import { openTerminalAt, registerActiveFileReveal, registerActiveFolderReveal } from "../dockBus";
+import { openFileInScope } from "../fileOpenBus";
 import FileContextMenu from "./FileContextMenu";
 import FileIgnoreModal from "./FileIgnoreModal";
 import PromptModal from "./ui/PromptModal";
@@ -66,7 +67,16 @@ type Prompt = { title: string; initial: string; confirmText: string; run: (v: st
 type Confirm = { title: string; message: string; run: () => Promise<void> };
 
 /** 「File」页签：工作区文件树（懒加载）+ 右键菜单 + 拖入(OS复制/树内移动) + 点击开编辑器。 */
-export default function FilePanel({ root, workspaceId }: { root: string; workspaceId: string }) {
+export default function FilePanel({
+  root,
+  workspaceId,
+  canOpenTerminal = true,
+}: {
+  root: string;
+  workspaceId: string;
+  /** 内容预览窗口里没有终端 → 关掉「在集成终端打开」相关入口 */
+  canOpenTerminal?: boolean;
+}) {
   const [children, setChildren] = useState<Record<string, DirEntry[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(getWsState<string[]>(EXP_KEY, root, [])));
   const [loading, setLoading] = useState<Set<string>>(new Set());
@@ -388,7 +398,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
     const targets = selected.size ? [...selected] : [node.path];
     try {
       switch (id) {
-        case "openEditor": openEditor(workspaceId, node.path); break;
+        case "openEditor": openFileInScope(workspaceId, node.path); break;
         case "openTerminal": openTerminalAt(workspaceId, node.path); break;
         case "newFile":
           runPrompt("新建文件", "", "创建", async (v) => { await createEntry(dir, v, false); expand(dir); reloadDir(dir); });
@@ -464,14 +474,14 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
     setAnchor(path);
     if (s.fileClickMode === "open") {
       if (entry.isDir) toggle(path);
-      else openEditor(workspaceId, path);
+      else openFileInScope(workspaceId, path);
     }
   };
   // 双击：仅「单击选中」模式用——打开文件 / 展开目录（open 模式单击已处理，双击不再额外动作）
   const dblRow = (entry: DirEntry) => {
     if (s.fileClickMode !== "select") return;
     if (entry.isDir) toggle(entry.path);
-    else openEditor(workspaceId, entry.path);
+    else openFileInScope(workspaceId, entry.path);
   };
 
   const renderNode = (entry: DirEntry, depth: number) => {
@@ -775,6 +785,7 @@ export default function FilePanel({ root, workspaceId }: { root: string; workspa
       </div>
       {menu && (
         <FileContextMenu
+          canOpenTerminal={canOpenTerminal}
           x={menu.x}
           y={menu.y}
           node={menu.node}
