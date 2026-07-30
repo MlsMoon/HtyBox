@@ -20,6 +20,7 @@ import { writeTextFile } from "../catalog";
 import { useMaskDismiss } from "./ui/maskDismiss";
 import { useDoubleShift } from "./ui/useDoubleShift";
 import { SidebarToggleIcon, useSidebarToggle } from "./ui/SidebarToggle";
+import { NavHistoryButtons, useNavHistory } from "./ui/NavHistory";
 import QuickOpen from "./QuickOpen";
 import { getWsState, setWsState } from "../wsState";
 import { getSettings } from "../settings";
@@ -134,6 +135,10 @@ export default function PreviewApp({
     });
   }, [workspaceId, workspacePath]);
 
+  // 前进 / 后退：openPath 本身就是幂等的「打开或激活」——后退到已被关掉的 tab 时它会重新建面板，
+  // 正是所需语义，故直接把它交给历史 hook 当导航实现，不再另造一个 navigateTo。
+  const { canBack, canForward, record, back, forward, suppress, reset } = useNavHistory(openPath);
+
   // md 预览里的链接点开另一个文件 → 在本窗新开 Tab（主窗那侧由 TerminalDock 注册同名通道）
   useEffect(() => registerFileOpener(workspaceId, (p) => openPath(p)), [workspaceId, openPath]);
   // 本窗打开某文件时让左栏文件树揭示并定位它（与主窗同款链路）
@@ -157,10 +162,20 @@ export default function PreviewApp({
         setEmpty(e.api.panels.length === 0);
         persist();
       };
-      // 与主窗同一语义：标签不可选中时，激活后把焦点从标签移走（本窗没有终端，故只需 blur）
-      e.api.onDidActivePanelChange(() => {
+      // 激活变化是历史栈的唯一记录点：addPanel（新开文件）、setActive（点已开的 tab）、
+      // 用户点 Tab 都汇聚到这里，故不必在 openPath / 链接点击 / 文件树三处分别埋点。
+      e.api.onDidActivePanelChange((ev) => {
+        const activePath = (ev.panel?.params as EditorParams | undefined)?.editorPath;
+        if (activePath) record(activePath);
+        // 与主窗同一语义：标签不可选中时，激活后把焦点从标签移走（本窗没有终端，故只需 blur）
         if (getSettings().tabSelectable) return;
         requestAnimationFrame(() => (document.activeElement as HTMLElement | null)?.blur?.());
+      });
+      // 关闭 tab 时 dockview 会自动激活邻居，那是销毁的副产物、不是导航，不该进历史。
+      // mutation() 先 fire onWillMutateLayout 再执行移除（dockviewComponent.js:2876-2891），
+      // 故此处开的抑制窗口恰好覆盖随后那次激活变化。
+      e.api.onWillMutateLayout((ev) => {
+        if (ev.kind === "remove") suppress();
       });
       e.api.onDidAddPanel(sync);
       e.api.onDidRemovePanel((p) => {
@@ -170,10 +185,13 @@ export default function PreviewApp({
       // 复原上次关窗时开着的 Tab（迁移过来的重复项由 openPath 去重）
       for (const path of getWsState<string[]>(TABS_KEY, workspaceId, [])) openPath(path);
       sync();
+      // 复原一批 Tab 是「恢复现场」而非 N 次导航：压成当前停留的这一条，否则刚开窗就能
+      // 后退到复原列表里的其它文件，与「新窗口没有可后退处」的预期不符。
+      reset((e.api.activePanel?.params as EditorParams | undefined)?.editorPath);
       // 就绪后告知主窗：可以推送存量编辑器了（迁移流程见 Step 4）
       emitTo("main", EV_READY, { wsId: workspaceId }).catch(() => {});
     },
-    [workspaceId, openPath],
+    [workspaceId, openPath, record, suppress, reset],
   );
 
   // 主窗推来的「打开文件」/「接管这批编辑器」
@@ -182,6 +200,8 @@ export default function PreviewApp({
     listen<{ path: string }>(EV_OPEN_FILE, (e) => openPath(e.payload.path)).then((u) => un.push(u));
     listen<{ items: AdoptItem[] }>(EV_ADOPT, (e) => {
       for (const it of e.payload.items) openPath(it.path, it.content);
+      // 与复原同理：主窗一次性移交过来的一批编辑器是被摆好的现场，不是本窗的导航轨迹
+      reset((apiRef.current?.activePanel?.params as EditorParams | undefined)?.editorPath);
     }).then((u) => un.push(u));
     // 主窗改了设置 / 主题 / 字体 → 本窗重读同一份 localStorage 并重应用
     listen(SETTINGS_CHANGED, () => {
@@ -190,7 +210,7 @@ export default function PreviewApp({
       initFont();
     }).then((u) => un.push(u));
     return () => un.forEach((u) => u());
-  }, [openPath]);
+  }, [openPath, reset]);
 
   useEffect(() => {
     getCurrentWindow()
@@ -211,6 +231,22 @@ export default function PreviewApp({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // 前进 / 后退快捷键。单独一个监听、走【捕获阶段】+ preventDefault：WebView2 把 Alt+方向键
+  // 当页面历史导航，真让它跑起来整个窗口可能被顶掉（同 2026-07-27 md 链接真导航把预览窗
+  // 变成第二个主窗那类事故）。不并入上面那个 Ctrl+P 监听，免得为此把它从冒泡改成捕获、
+  // 动到既有行为。Alt 组合与本窗既有键位（Ctrl+P / 双击 Shift / Delete 拦截）均不冲突。
+  useEffect(() => {
+    const onNavKey = (ev: KeyboardEvent) => {
+      if (!ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+      if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+      ev.preventDefault();
+      if (ev.key === "ArrowLeft") back();
+      else forward();
+    };
+    window.addEventListener("keydown", onNavKey, true);
+    return () => window.removeEventListener("keydown", onNavKey, true);
+  }, [back, forward]);
 
   // 防误触：默认不允许用 Delete/Backspace 关标签页（焦点常在标签上，本想删输入却关了面板）。
   // dockview 的 keydown 绑在 tabsList 上走冒泡，捕获阶段 stopPropagation 即可拦下。
@@ -278,6 +314,7 @@ export default function PreviewApp({
         >
           <SidebarToggleIcon open={sidebarVisible} />
         </button>
+        <NavHistoryButtons canBack={canBack} canForward={canForward} onBack={back} onForward={forward} />
         <div data-tauri-drag-region className="flex flex-1 items-center gap-2 px-3">
           <svg className="h-4 w-4 shrink-0 text-[var(--accent)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
             <rect x="1.5" y="3" width="14" height="11" rx="2.2" />

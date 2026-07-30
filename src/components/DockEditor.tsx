@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { IDockviewPanelProps } from "dockview-react";
 import { renderMarkdown } from "../mdRender";
 import { highlightToHtml, langForPath, onHighlighterReady } from "../highlighter";
@@ -58,6 +58,14 @@ export function collectEditorBuf(panelId: string): string | undefined {
 export function adoptEditorBuf(panelId: string, content: string): void {
   editorStore.set(panelId, { content, dirty: true, loaded: true, editable: true });
 }
+
+// 阅读位置记忆：切走的面板 DOM 被 dockview detach（`removeChild`，见 dockview-core 的
+// content.js:142），期间没有 layout box、scrollTop 归零，切回来会从文档顶部开始——长文档
+// 里跳走再回来就得重新往下滚。按【文件路径】而非 panelId 存：后退到已被关掉的 tab 时面板
+// 是新建的、panelId 变了，按 path 才能连位置一起复原，故 disposeEditorBuf 不清本表。
+const scrollStore = new Map<string, number>();
+/** 判定「已滚到目标」的像素容差：缩放比下 scrollTop 可能是小数，严格相等判不出到位。 */
+const SCROLL_HIT_TOLERANCE = 2;
 
 const basename = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
@@ -137,6 +145,53 @@ export default function DockEditor(
   useEffect(() => {
     setImgFailed(false);
   }, [buf.content]);
+
+  // 阅读位置：滚动容器随视图分支变化（md 预览 / 代码预览 / 编辑区），用回调 ref 抓当前那一个。
+  const scrollRef = useRef<HTMLElement | null>(null);
+  const scrollRafRef = useRef(0);
+  /** 是否还等着把位置定回去。内容异步渲染完容器才够高，故一次定不到位要留着重试。 */
+  const pendingRestoreRef = useRef(false);
+
+  const onScroll = () => {
+    if (scrollRafRef.current) return; // 每帧最多记一次，滚动过程不做无谓写入
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = 0;
+      const el = scrollRef.current;
+      if (el) scrollStore.set(path, el.scrollTop);
+    });
+  };
+
+  /** 把滚动位置定回去。目标每次从 store 现读——这样恢复动作自身的回声、以及用户中途手动
+   *  滚动写进 store 的新位置，都不会把人拽回一个过期的旧目标。 */
+  const tryRestoreScroll = useCallback(() => {
+    if (!pendingRestoreRef.current) return;
+    const el = scrollRef.current;
+    const target = scrollStore.get(path);
+    if (!el || !target) {
+      pendingRestoreRef.current = false; // 没记录过 / 记的就是顶部 → 无需恢复
+      return;
+    }
+    el.scrollTop = target;
+    // 内容尚未渲染够高时只能滚到当前 scrollHeight 上限，留着标志等下一次内容变化再试
+    if (Math.abs(el.scrollTop - target) < SCROLL_HIT_TOLERANCE) pendingRestoreRef.current = false;
+  }, [path]);
+
+  // 面板被激活（打开 / 点 Tab / 前进后退）：dockview 此刻才把 DOM attach 回文档，
+  // 等一帧让 layout 就绪再定位。
+  useEffect(() => {
+    if (props.api.isActive) pendingRestoreRef.current = true;
+    const d = props.api.onDidActiveChange((e) => {
+      if (!e.isActive) return;
+      pendingRestoreRef.current = true;
+      requestAnimationFrame(tryRestoreScroll);
+    });
+    return () => d.dispose();
+  }, [props.api, tryRestoreScroll]);
+
+  // 内容异步就绪会改变容器高度（读盘完成、md 渲染、shiki 语言按需加载）→ 再试一次定位。
+  useEffect(() => {
+    tryRestoreScroll();
+  }, [buf.loaded, html, codeHtml, tryRestoreScroll]);
 
   // 图片：读 base64 data URL（跳过文本加载，避免落到「二进制不支持编辑」）。
   useEffect(() => {
@@ -512,11 +567,19 @@ export default function DockEditor(
           )
         ) : isCode ? (
           <div
+            ref={(el) => {
+              scrollRef.current = el;
+            }}
+            onScroll={onScroll}
             className="code-preview min-h-0 flex-1 overflow-auto"
             dangerouslySetInnerHTML={{ __html: codeHtml }}
           />
         ) : (
           <div
+            ref={(el) => {
+              scrollRef.current = el;
+            }}
+            onScroll={onScroll}
             className="md-preview min-h-0 flex-1 overflow-y-auto p-4 text-[13px] text-[var(--text)]"
             onClick={onPreviewClick}
             dangerouslySetInnerHTML={{ __html: html }}
@@ -524,6 +587,10 @@ export default function DockEditor(
         )
       ) : (
         <textarea
+          ref={(el) => {
+            scrollRef.current = el;
+          }}
+          onScroll={onScroll}
           value={buf.content}
           onChange={(e) => update(e.target.value)}
           onKeyDown={onKeyDown}
