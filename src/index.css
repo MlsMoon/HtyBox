@@ -338,7 +338,10 @@ html.dark .kimi-glyph .kimi-k {
 html.dark .md-preview .shiki,
 html.dark .md-preview .shiki span,
 html.dark .code-preview .shiki,
-html.dark .code-preview .shiki span {
+html.dark .code-preview .shiki span,
+html.dark .code-preview .line,
+html.dark .code-preview .line span {
+  /* 后两条选择器覆盖 plan-3 虚拟化路径：行不再有 pre.shiki 外壳，token 的 --shiki-dark 变量仍须被接管 */
   color: var(--shiki-dark) !important;
   font-style: var(--shiki-dark-font-style) !important;
   font-weight: var(--shiki-dark-font-weight) !important;
@@ -382,6 +385,12 @@ html.dark .code-preview .shiki span {
    与 md 预览的代码块共用 --md-code-bg 与上面的 html.dark token 规则，两处观感一致。 */
 .code-preview {
   background: var(--md-code-bg);
+  /* plan-3 虚拟化路径没有 <pre> 外壳：文本属性上移到容器供行直接继承；
+     全量路径的 pre 规则显式设同值，观感不变 */
+  font-family: var(--app-font);
+  font-size: 12.5px;
+  line-height: 1.45;
+  tab-size: 4;
 }
 .code-preview pre {
   margin: 0;
@@ -399,27 +408,27 @@ html.dark .code-preview .shiki span {
 }
 .code-preview code {
   display: block;
-  counter-reset: ln;
   background: transparent;
   border: 0;
   padding: 0;
   font: inherit;
   color: inherit;
 }
-/* shiki 与兜底路径都逐行输出 <span class="line">，行号因此对两条路径通用 */
+/* shiki 与兜底路径都逐行输出 <span class="line" data-ln="N">，行号因此对两条路径通用。
+   plan-2：行号由 data-ln 属性驱动（虚拟化后 DOM 只剩视口内的行，CSS counter 会从 1 重数）。
+   列宽经 --ln-w 覆盖（虚拟化路径按总行数位数设置；缺省 44px 维持既有观感）。 */
 .code-preview .line {
   display: block;
   position: relative;
-  counter-increment: ln;
-  padding: 0 16px 0 62px;
+  padding: 0 16px 0 calc(var(--ln-w, 44px) + 18px);
   white-space: pre; /* 行内保留缩进；不折行 → 长行横向滚动，行号永不错位 */
   min-height: 1.45em; /* 空行也占一行高 */
 }
 .code-preview .line::before {
-  content: counter(ln);
+  content: attr(data-ln);
   position: absolute;
   left: 0;
-  width: 44px;
+  width: var(--ln-w, 44px);
   padding-right: 9px;
   text-align: right;
   color: var(--text-3);

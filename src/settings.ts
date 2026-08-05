@@ -24,10 +24,16 @@ export interface Settings {
   openFileFromSearch: boolean;
   /** 编辑器可打开的文件大小上限（MB）；过大文件编辑可能卡顿。默认 10 */
   maxEditMB: number;
+  /** 只读预览可打开上限（MB）：超出编辑上限的文件走分片只读虚拟预览，超出本上限则拒绝打开。默认 512 */
+  maxOpenMB: number;
+  /** 纯文本（.txt/.log 等）打开默认进编辑态（旧习惯，默认开）；关闭后与代码/Markdown 一致默认只读预览 */
+  plainTextDefaultEdit: boolean;
   /** 终端底部工作流面板总开关：关闭后所有终端不显示面板（绑定与进度数据保留）。默认开 */
   showWorkflowPanel: boolean;
   /** 终端中键自动滚动：按下鼠标中键出滚轮锚点、移动即按距离自动滚动（仿浏览器）。默认开 */
   middleClickScroll: boolean;
+  /** 全局截图快捷键 Ctrl+Shift+A：开=注册全局热键框选截图到剪贴板；关=注销（可让给飞书等）。默认开 */
+  screenshotHotkey: boolean;
   /** 标签页可选中：开=点击标签会选中它（可按 Delete/Backspace 关闭）；
    *  关(默认)=点击只切换并把焦点直接交给终端输入，标签不吃焦点，删除键自然落不到标签上 */
   tabSelectable: boolean;
@@ -65,8 +71,11 @@ const DEFAULTS: Settings = {
   fileClickMode: "open",
   openFileFromSearch: false,
   maxEditMB: 10,
+  maxOpenMB: 512,
+  plainTextDefaultEdit: true,
   showWorkflowPanel: true,
   middleClickScroll: true,
+  screenshotHotkey: true,
   tabSelectable: false,
   sidebarTabIconOnly: false,
   skillRootEntries: DEFAULT_ENTRIES.map((e) => ({ ...e })),

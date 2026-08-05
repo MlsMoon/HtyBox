@@ -1494,16 +1494,31 @@ pub fn capture_session_ids(agent: &str, cwd: &str, since_ms: i64) -> Vec<String>
     }
 }
 
+/// PTY shell → sessionId 映射（与 `terminal_pty_pid` 对齐）。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PtySessionMap {
+    pub pty_pid: u32,
+    pub session_id: String,
+}
+
+#[derive(Clone)]
+struct ClaudeSessionProc {
+    id: String,
+    pid: u32,
+    started_at: i64,
+}
+
 /// claude：读 ~/.claude/sessions/<pid>.json（运行中会话状态，含 sessionId/cwd/startedAt/kind），
-/// 取 cwd 匹配、startedAt>=since、interactive 的 sessionId，按 startedAt 升序。
-fn capture_claude_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+/// 取 cwd 匹配、startedAt>=since、interactive 的条目，按 startedAt 升序。
+fn scan_claude_session_procs(cwd: &str, since_ms: i64) -> Vec<ClaudeSessionProc> {
     let Some(h) = home() else {
         return Vec::new();
     };
     let Ok(rd) = std::fs::read_dir(h.join(".claude").join("sessions")) else {
         return Vec::new();
     };
-    let mut hits: Vec<(i64, String)> = Vec::new();
+    let mut hits: Vec<ClaudeSessionProc> = Vec::new();
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("json") {
@@ -1529,17 +1544,105 @@ fn capture_claude_ids(cwd: &str, since_ms: i64) -> Vec<String> {
         if v.get("kind").and_then(|k| k.as_str()) != Some("interactive") {
             continue; // 排除 print/exec 等一次性会话
         }
-        if let Some(id) = v.get("sessionId").and_then(|s| s.as_str()) {
-            hits.push((started, id.to_string()));
-        }
+        let Some(id) = v.get("sessionId").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        // 优先 JSON 内 pid，回退文件名 stem（sessions/<pid>.json）
+        let pid = v
+            .get("pid")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as u32)
+            .or_else(|| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse().ok())
+            });
+        let Some(pid) = pid else {
+            continue;
+        };
+        hits.push(ClaudeSessionProc {
+            id: id.to_string(),
+            pid,
+            started_at: started,
+        });
     }
-    hits.sort_by_key(|(t, _)| *t);
-    hits.into_iter().map(|(_, id)| id).collect()
+    hits.sort_by_key(|h| h.started_at);
+    hits
 }
 
-/// codex：扫 ~/.codex/sessions rollout，取 session_meta.payload.cwd 匹配、文件 mtime>=since 的 id，按 mtime 升序。
-/// 调用方（前端 captureSessionId）应认领返回列表中【最后一个】未占用 id（= 最新），避免绑到窗口内更早的僵尸会话。
-fn capture_codex_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+fn capture_claude_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+    scan_claude_session_procs(cwd, since_ms)
+        .into_iter()
+        .map(|h| h.id)
+        .collect()
+}
+
+/// 将各 PTY shell pid 映射到对应 agent 的 sessionId。
+/// - claude：`sessions/<pid>.json` 的 pid 落在 PTY 进程树内（精确）
+/// - cursor/codex/kimi：优先解析子树进程命令行里的 `--resume`/`resume`/`--session`；
+///   否则用**主进程**（index.js / codex.js / kimi.exe，非 worker）创建时间 ↔ 会话 createdAt 最近邻
+pub fn map_agent_sessions_by_pty(
+    agent: &str,
+    cwd: &str,
+    since_ms: i64,
+    pty_pids: &[u32],
+) -> Vec<PtySessionMap> {
+    match agent {
+        "claude" => map_claude_sessions_by_pty(cwd, since_ms, pty_pids),
+        "codex" | "cursor" | "kimi" => {
+            map_sessions_by_agent_process(agent, cwd, since_ms, pty_pids)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 兼容旧命令名。
+pub fn map_claude_sessions_by_pty(
+    cwd: &str,
+    since_ms: i64,
+    pty_pids: &[u32],
+) -> Vec<PtySessionMap> {
+    if pty_pids.is_empty() {
+        return Vec::new();
+    }
+    let want: HashSet<u32> = pty_pids.iter().copied().filter(|&p| p != 0).collect();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let snap = process_snapshot();
+    let mut out = Vec::new();
+    let mut used_sessions = HashSet::new();
+    let mut used_pty = HashSet::new();
+    for hit in scan_claude_session_procs(cwd, since_ms) {
+        if used_sessions.contains(&hit.id) {
+            continue;
+        }
+        let Some(pty) = find_ancestor_in(hit.pid, &want, &snap.parents) else {
+            continue;
+        };
+        if !used_pty.insert(pty) {
+            continue;
+        }
+        used_sessions.insert(hit.id.clone());
+        out.push(PtySessionMap {
+            pty_pid: pty,
+            session_id: hit.id,
+        });
+    }
+    out
+}
+
+/// 会话侧 (id, created_ms)，按时间升序。
+fn scan_session_times(agent: &str, cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
+    match agent {
+        "codex" => scan_codex_session_times(cwd, since_ms),
+        "cursor" => scan_cursor_session_times(cwd, since_ms),
+        "kimi" => scan_kimi_session_times(cwd, since_ms),
+        _ => Vec::new(),
+    }
+}
+
+fn scan_codex_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
     let Some(h) = home() else {
         return Vec::new();
     };
@@ -1547,7 +1650,7 @@ fn capture_codex_ids(cwd: &str, since_ms: i64) -> Vec<String> {
     if !root.is_dir() {
         return Vec::new();
     }
-    let mut hits: Vec<(i64, String)> = Vec::new();
+    let mut hits: Vec<(String, i64)> = Vec::new();
     for entry in WalkDir::new(&root)
         .max_depth(5)
         .into_iter()
@@ -1586,17 +1689,25 @@ fn capture_codex_ids(cwd: &str, since_ms: i64) -> Vec<String> {
         {
             continue;
         }
-        if let Some(id) = payload.and_then(|pl| pl.get("id")).and_then(|i| i.as_str()) {
-            hits.push((mt, id.to_string()));
+        let Some(id) = payload.and_then(|pl| pl.get("id")).and_then(|i| i.as_str()) else {
+            continue;
+        };
+        let created = payload
+            .and_then(|pl| pl.get("timestamp"))
+            .and_then(|t| t.as_str())
+            .map(rfc3339_ms)
+            .filter(|&t| t > 0)
+            .unwrap_or(mt);
+        if created < since_ms {
+            continue;
         }
+        hits.push((id.to_string(), created));
     }
-    hits.sort_by_key(|(t, _)| *t);
-    hits.into_iter().map(|(_, id)| id).collect()
+    hits.sort_by_key(|(_, t)| *t);
+    hits
 }
 
-/// cursor：扫 ~/.cursor/chats 的 meta.json，取 cwd 匹配、createdAtMs>=since 的 chat-id，按 createdAtMs 升序。
-/// 注意：这里不按 hasConversation 过滤——刚启动、还没来得及说第一句话的会话正是本函数要捕获的目标。
-fn capture_cursor_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+fn scan_cursor_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
     let Some(h) = home() else {
         return Vec::new();
     };
@@ -1604,7 +1715,7 @@ fn capture_cursor_ids(cwd: &str, since_ms: i64) -> Vec<String> {
     if !root.is_dir() {
         return Vec::new();
     }
-    let mut hits: Vec<(i64, String)> = Vec::new();
+    let mut hits: Vec<(String, i64)> = Vec::new();
     for entry in WalkDir::new(&root)
         .max_depth(4)
         .into_iter()
@@ -1635,16 +1746,14 @@ fn capture_cursor_ids(cwd: &str, since_ms: i64) -> Vec<String> {
             continue;
         };
         if let Some(id) = chat_dir.file_name().and_then(|n| n.to_str()) {
-            hits.push((created, id.to_string()));
+            hits.push((id.to_string(), created));
         }
     }
-    hits.sort_by_key(|(t, _)| *t);
-    hits.into_iter().map(|(_, id)| id).collect()
+    hits.sort_by_key(|(_, t)| *t);
+    hits
 }
 
-/// kimi：扫 <数据根>/sessions 的 state.json，取 workDir 匹配、createdAt>=since 的 session id，按 createdAt 升序。
-/// 不按 title/空会话过滤——刚启动还没来得及说话的会话正是本函数要捕获的目标（state.json 启动即创建，已实测）。
-fn capture_kimi_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+fn scan_kimi_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
     let Some(data_root) = kimi_data_root() else {
         return Vec::new();
     };
@@ -1652,7 +1761,7 @@ fn capture_kimi_ids(cwd: &str, since_ms: i64) -> Vec<String> {
     if !root.is_dir() {
         return Vec::new();
     }
-    let mut hits: Vec<(i64, String)> = Vec::new();
+    let mut hits: Vec<(String, i64)> = Vec::new();
     for entry in WalkDir::new(&root)
         .max_depth(3)
         .into_iter()
@@ -1687,11 +1796,518 @@ fn capture_kimi_ids(cwd: &str, since_ms: i64) -> Vec<String> {
             continue;
         };
         if let Some(id) = session_dir.file_name().and_then(|n| n.to_str()) {
-            hits.push((created, id.to_string()));
+            hits.push((id.to_string(), created));
         }
     }
-    hits.sort_by_key(|(t, _)| *t);
-    hits.into_iter().map(|(_, id)| id).collect()
+    hits.sort_by_key(|(_, t)| *t);
+    hits
+}
+
+/// cursor/codex/kimi：命令行 session id 优先，否则主进程创建时间最近邻（|Δt|<120s）。
+fn map_sessions_by_agent_process(
+    agent: &str,
+    cwd: &str,
+    since_ms: i64,
+    pty_pids: &[u32],
+) -> Vec<PtySessionMap> {
+    if pty_pids.is_empty() {
+        return Vec::new();
+    }
+    let sessions = scan_session_times(agent, cwd, since_ms);
+    if sessions.is_empty() {
+        return Vec::new();
+    }
+    let valid: HashSet<String> = sessions.iter().map(|(id, _)| id.clone()).collect();
+    let snap = process_snapshot();
+    let mut used_sid = HashSet::new();
+    let mut used_pty = HashSet::new();
+    let mut out = Vec::new();
+
+    // Pass 1：命令行里已有 --resume / resume / --session → 精确
+    for &pty in pty_pids {
+        if pty == 0 || used_pty.contains(&pty) {
+            continue;
+        }
+        let Some(sid) = session_id_from_pty_cmdline(agent, pty, &snap, &valid) else {
+            continue;
+        };
+        if !used_sid.insert(sid.clone()) {
+            continue;
+        }
+        used_pty.insert(pty);
+        out.push(PtySessionMap {
+            pty_pid: pty,
+            session_id: sid,
+        });
+    }
+
+    // Pass 2：剩余 PTY 用主进程创建时间最近邻（避开 cursor worker node）
+    let mut cands: Vec<(u32, i64)> = Vec::new();
+    for &pty in pty_pids {
+        if pty == 0 || used_pty.contains(&pty) {
+            continue;
+        }
+        let Some(agent_pid) = pick_agent_main_pid(agent, pty, &snap) else {
+            continue;
+        };
+        let Some(start) = process_creation_ms(agent_pid) else {
+            continue;
+        };
+        cands.push((pty, start));
+    }
+    cands.sort_by_key(|(_, t)| *t);
+    const MAX_DELTA_MS: i64 = 120_000;
+    for (pty, start) in cands {
+        let mut best: Option<(usize, i64)> = None;
+        for (i, (sid, created)) in sessions.iter().enumerate() {
+            if used_sid.contains(sid) {
+                continue;
+            }
+            let delta = (created - start).abs();
+            if delta > MAX_DELTA_MS {
+                continue;
+            }
+            if best.map(|(_, d)| delta < d).unwrap_or(true) {
+                best = Some((i, delta));
+            }
+        }
+        let Some((i, _)) = best else {
+            continue;
+        };
+        let sid = sessions[i].0.clone();
+        used_sid.insert(sid.clone());
+        used_pty.insert(pty);
+        out.push(PtySessionMap {
+            pty_pid: pty,
+            session_id: sid,
+        });
+    }
+    out
+}
+
+/// 在 PTY 子树进程命令行中找已出现在 `valid` 里的 session id。
+fn session_id_from_pty_cmdline(
+    agent: &str,
+    pty_pid: u32,
+    snap: &ProcSnap,
+    valid: &HashSet<String>,
+) -> Option<String> {
+    for pid in descendant_pids(pty_pid, &snap.parents) {
+        let Some(cmd) = process_command_line(pid) else {
+            continue;
+        };
+        if let Some(id) = extract_session_id_from_cmdline(agent, &cmd) {
+            if let Some(canon) = valid.iter().find(|v| v.eq_ignore_ascii_case(&id)) {
+                return Some(canon.clone());
+            }
+        }
+    }
+    None
+}
+
+/// 从 agent 进程命令行解析 session id（cursor `--resume`、codex `resume`、kimi `--session`）。
+fn extract_session_id_from_cmdline(agent: &str, cmd: &str) -> Option<String> {
+    let lower = cmd.to_ascii_lowercase();
+    match agent {
+        "cursor" => {
+            // ... index.js --resume <uuid>
+            extract_flag_value(&lower, &["--resume", "-r"]).and_then(normalize_uuid)
+        }
+        "codex" => {
+            // `codex resume <uuid>` 或 flag 形态
+            extract_flag_value(&lower, &["--resume", "-r"])
+                .or_else(|| extract_subcommand_value(&lower, "resume"))
+                .and_then(normalize_uuid)
+        }
+        "kimi" => {
+            // `kimi --session session_<uuid>`
+            let raw = extract_flag_value(&lower, &["--session", "-s"])?;
+            if raw.starts_with("session_") {
+                Some(raw.to_string())
+            } else {
+                normalize_uuid(raw).map(|u| format!("session_{u}"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn normalize_uuid(s: &str) -> Option<String> {
+    let s = s.trim().trim_matches(|c| c == '"' || c == '\'');
+    let ok = s.len() == 36
+        && s.as_bytes().iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        });
+    ok.then(|| s.to_ascii_lowercase())
+}
+
+fn extract_flag_value<'a>(cmd: &'a str, flags: &[&str]) -> Option<&'a str> {
+    for flag in flags {
+        // `--resume <id>` / `--resume=<id>`
+        if let Some(rest) = cmd.split(flag).nth(1) {
+            let rest = rest.trim_start();
+            if let Some(v) = rest.strip_prefix('=') {
+                return v.split_whitespace().next();
+            }
+            if rest.starts_with('-') {
+                continue; // 下一个 flag，无值
+            }
+            return rest.split_whitespace().next();
+        }
+    }
+    None
+}
+
+fn extract_subcommand_value<'a>(cmd: &'a str, sub: &str) -> Option<&'a str> {
+    // `codex.exe ... resume <uuid>`：sub 作为独立 token
+    let mut parts = cmd.split_whitespace();
+    while let Some(p) = parts.next() {
+        if p == sub {
+            return parts.next();
+        }
+    }
+    None
+}
+
+struct ProcSnap {
+    parents: HashMap<u32, u32>,
+    names: HashMap<u32, String>, // lowercase exe
+}
+
+fn process_snapshot() -> ProcSnap {
+    #[cfg(windows)]
+    {
+        win_process_snapshot()
+    }
+    #[cfg(not(windows))]
+    {
+        ProcSnap {
+            parents: HashMap::new(),
+            names: HashMap::new(),
+        }
+    }
+}
+
+/// 从 pid 沿父链向上，若命中 `want` 中任一祖先则返回该祖先 pid。
+fn find_ancestor_in(pid: u32, want: &HashSet<u32>, parents: &HashMap<u32, u32>) -> Option<u32> {
+    let mut cur = pid;
+    for _ in 0..64 {
+        if want.contains(&cur) {
+            return Some(cur);
+        }
+        cur = *parents.get(&cur)?;
+        if cur == 0 {
+            break;
+        }
+    }
+    None
+}
+
+fn descendant_pids(root: u32, parents: &HashMap<u32, u32>) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&pid, &ppid) in parents {
+        children.entry(ppid).or_default().push(pid);
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(p) = stack.pop() {
+        if let Some(chs) = children.get(&p) {
+            for &c in chs {
+                out.push(c);
+                stack.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// 选 PTY 子树中的**主** agent 进程（排除 cursor/codex 的 worker node）。
+fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32> {
+    let desc = descendant_pids(pty_pid, &snap.parents);
+    if desc.is_empty() {
+        return None;
+    }
+    match agent {
+        "kimi" => {
+            let hits: Vec<u32> = desc
+                .iter()
+                .copied()
+                .filter(|pid| snap.names.get(pid).map(|n| n.as_str()) == Some("kimi.exe"))
+                .collect();
+            pick_earliest_pid(&hits)
+        }
+        "cursor" => {
+            // 主入口：node ...\index.js；绝不能用创建最晚的 worker node
+            let mut mains = Vec::new();
+            for pid in &desc {
+                if snap.names.get(pid).map(|n| n.as_str()) != Some("node.exe") {
+                    continue;
+                }
+                let Some(cmd) = process_command_line(*pid) else {
+                    continue;
+                };
+                let c = cmd.to_ascii_lowercase();
+                if c.contains("index.js") && c.contains("cursor-agent") {
+                    mains.push(*pid);
+                }
+            }
+            if let Some(p) = pick_earliest_pid(&mains) {
+                return Some(p);
+            }
+            // 无 cmdline 时：取创建最早的 node（主进程先于 worker）
+            let nodes: Vec<u32> = desc
+                .iter()
+                .copied()
+                .filter(|pid| snap.names.get(pid).map(|n| n.as_str()) == Some("node.exe"))
+                .collect();
+            pick_earliest_pid(&nodes)
+        }
+        "codex" => {
+            let mut mains = Vec::new();
+            for pid in &desc {
+                let name = snap.names.get(pid).map(|n| n.as_str()).unwrap_or("");
+                if name == "codex.exe" {
+                    mains.push(*pid);
+                    continue;
+                }
+                if name != "node.exe" {
+                    continue;
+                }
+                let Some(cmd) = process_command_line(*pid) else {
+                    continue;
+                };
+                let c = cmd.to_ascii_lowercase();
+                if c.contains("codex.js") || c.contains("@openai\\codex") || c.contains("@openai/codex")
+                {
+                    mains.push(*pid);
+                }
+            }
+            if let Some(p) = pick_earliest_pid(&mains) {
+                return Some(p);
+            }
+            let nodes: Vec<u32> = desc
+                .iter()
+                .copied()
+                .filter(|pid| snap.names.get(pid).map(|n| n.as_str()) == Some("node.exe"))
+                .collect();
+            pick_earliest_pid(&nodes)
+        }
+        _ => None,
+    }
+}
+
+fn pick_earliest_pid(pids: &[u32]) -> Option<u32> {
+    pids.iter()
+        .copied()
+        .min_by_key(|pid| process_creation_ms(*pid).unwrap_or(i64::MAX))
+}
+
+fn process_command_line(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        win_process_command_line(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn process_creation_ms(pid: u32) -> Option<i64> {
+    #[cfg(windows)]
+    {
+        win_process_creation_ms(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn win_process_creation_ms(pid: u32) -> Option<i64> {
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn GetProcessTimes(
+            handle: isize,
+            creation: *mut i64,
+            exit: *mut i64,
+            kernel: *mut i64,
+            user: *mut i64,
+        ) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return None;
+        }
+        let mut creation = 0i64;
+        let mut exit = 0i64;
+        let mut kernel = 0i64;
+        let mut user = 0i64;
+        let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        // FILETIME：100ns since 1601-01-01 → Unix ms
+        Some(creation / 10_000 - 11_644_473_600_000)
+    }
+}
+
+/// Win10+：`NtQueryInformationProcess(ProcessCommandLineInformation=60)` 读命令行。
+#[cfg(windows)]
+fn win_process_command_line(pid: u32) -> Option<String> {
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *const u16,
+    }
+
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+        fn NtQueryInformationProcess(
+            handle: isize,
+            info_class: u32,
+            info: *mut u8,
+            info_len: u32,
+            return_len: *mut u32,
+        ) -> i32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
+
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return None;
+        }
+        let mut need = 0u32;
+        let st = NtQueryInformationProcess(
+            h,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut need,
+        );
+        if st != STATUS_INFO_LENGTH_MISMATCH || need == 0 {
+            // 有的系统仍返回 0 长度；给一个合理兜底再试
+            need = 65536;
+        }
+        let mut buf = vec![0u8; need as usize];
+        let mut ret_len = 0u32;
+        let st = NtQueryInformationProcess(
+            h,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            buf.as_mut_ptr(),
+            need,
+            &mut ret_len,
+        );
+        CloseHandle(h);
+        if st != 0 {
+            return None;
+        }
+        if buf.len() < std::mem::size_of::<UnicodeString>() {
+            return None;
+        }
+        let uni = &*(buf.as_ptr() as *const UnicodeString);
+        if uni.buffer.is_null() || uni.length == 0 {
+            return None;
+        }
+        let nchars = (uni.length as usize) / 2;
+        let slice = std::slice::from_raw_parts(uni.buffer, nchars);
+        Some(String::from_utf16_lossy(slice))
+    }
+}
+
+#[cfg(windows)]
+fn win_process_snapshot() -> ProcSnap {
+    use std::mem::{size_of, zeroed};
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
+        fn Process32FirstW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+
+    let mut parents = HashMap::new();
+    let mut names = HashMap::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE || snap == 0 {
+            return ProcSnap { parents, names };
+        }
+        let mut entry: ProcessEntry32W = zeroed();
+        entry.dw_size = size_of::<ProcessEntry32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                parents.insert(entry.th32_process_id, entry.th32_parent_process_id);
+                let len = entry
+                    .sz_exe_file
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.sz_exe_file.len());
+                let name = String::from_utf16_lossy(&entry.sz_exe_file[..len]).to_lowercase();
+                names.insert(entry.th32_process_id, name);
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    ProcSnap { parents, names }
+}
+
+/// codex：扫 rollout，cwd 匹配、created>=since 的 id（升序）。认领请走 `map_agent_sessions_by_pty`。
+fn capture_codex_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+    scan_codex_session_times(cwd, since_ms)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// cursor：扫 meta.json，不按 hasConversation 过滤（空壳正是捕获目标）。
+fn capture_cursor_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+    scan_cursor_session_times(cwd, since_ms)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// kimi：扫 state.json，不按 title 过滤（启动即创建，已实测）。
+fn capture_kimi_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+    scan_kimi_session_times(cwd, since_ms)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
 }
 
 #[cfg(test)]

@@ -5,7 +5,8 @@
 //   的 `createHighlighterCore` + **显式 loader 映射**，每种语言各自成 chunk、首次遇到才加载。
 // - 用显式映射而非 import(`shiki/langs/${x}.mjs`) 变量路径，避免 Vite glob 出 200+ chunk。
 // - 实例就绪后 `codeToHtml` 是同步的 → 调用方（marked 覆写 / 代码预览）都能同步拿到 HTML。
-import { createHighlighterCore } from "shiki/core";
+import { createHighlighterCore, getTokenStyleObject, stringifyTokenStyle } from "shiki/core";
+import type { GrammarState, ShikiTransformer } from "shiki/core";
 import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
 import lightPlus from "shiki/themes/light-plus.mjs";
 import darkPlus from "shiki/themes/dark-plus.mjs";
@@ -178,6 +179,14 @@ function requestLang(id: string): void {
 /** 该语言此刻能否同步高亮（highlighter 与语法都已就绪）。 */
 const ready = (langId: string) => !!hl && loadedLangs.has(langId);
 
+/** 给每行 `<span class="line">` 注入 data-ln 显式行号（plan-2：虚拟化后 DOM 只剩视口内的行，
+ *  CSS counter 会从 1 重数，行号改由属性驱动；startLine=块首全文行号偏移，全量渲染传 0）。 */
+const lineNoTransformer = (startLine: number): ShikiTransformer => ({
+  line(node, line) {
+    node.properties["data-ln"] = String(startLine + line); // line 为 1-based（shiki 类型注释）
+  },
+});
+
 /**
  * 把一段源码渲染为高亮 HTML。
  * 语法未就绪时先触发按需加载并返回**已转义**的无高亮 `<pre>`，就绪后由 onHighlighterReady 通知重渲染。
@@ -185,7 +194,12 @@ const ready = (langId: string) => !!hl && loadedLangs.has(langId);
  */
 export function highlightToHtml(code: string, langId: string | null): string {
   if (langId && ready(langId)) {
-    return hl!.codeToHtml(code, { lang: langId, themes: THEMES, defaultColor: "light" });
+    return hl!.codeToHtml(code, {
+      lang: langId,
+      themes: THEMES,
+      defaultColor: "light",
+      transformers: [lineNoTransformer(0)],
+    });
   }
   if (langId) requestLang(langId);
   return plainToHtml(code);
@@ -195,7 +209,7 @@ export function highlightToHtml(code: string, langId: string | null): string {
 function plainToHtml(code: string): string {
   const lines = escapeHtml(code)
     .split("\n")
-    .map((l) => `<span class="line">${l}</span>`)
+    .map((l, i) => `<span class="line" data-ln="${i + 1}">${l}</span>`)
     .join("\n");
   return `<pre><code>${lines}</code></pre>`;
 }
@@ -204,4 +218,50 @@ function plainToHtml(code: string): string {
 export function onHighlighterReady(cb: () => void): () => void {
   listeners.add(cb);
   return () => listeners.delete(cb);
+}
+
+// ---- plan-3：分块高亮底座（虚拟化预览按视口分块计算，消除同步全量高亮的主线程冻结） ----
+
+export interface ChunkHighlightResult {
+  /** 每行完整 HTML：`<span class="line" data-ln="N">…tokens…</span>`（行号已含 startLine 偏移）。 */
+  lines: string[];
+  /** 块末语法状态：下一块顺序推进用（undefined = 引擎未提供，链断由 contextCode 兜底）。 */
+  endState?: GrammarState;
+}
+
+/**
+ * 高亮一个行块（一遍 tokenize：`codeToTokens` 自带末态，行 HTML 用官方导出的
+ * `stringifyTokenStyle`/`getTokenStyleObject` 拼装，与 `codeToHtml` 的 token 渲染逐字符等价；
+ * token 的 `htmlAttrs` 仅由 transformer/decorations 注入，本管线没有，故无需处理）。
+ * @param ctx grammarState 优先（顺序推进精确串联）；无则 contextCode（跳转块用前文推断，
+ *            只参与语法推断不进输出——shiki `grammarContextCode` 语义）
+ * @returns 语法未就绪返回 null（已触发按需加载，onHighlighterReady 通知后重算）
+ */
+export function highlightChunk(
+  code: string,
+  langId: string,
+  startLine: number,
+  ctx: { grammarState?: GrammarState; contextCode?: string },
+): ChunkHighlightResult | null {
+  if (!ready(langId)) {
+    requestLang(langId);
+    return null;
+  }
+  const result = hl!.codeToTokens(code, {
+    lang: langId,
+    themes: THEMES,
+    defaultColor: "light",
+    grammarState: ctx.grammarState,
+    grammarContextCode: ctx.grammarState ? undefined : ctx.contextCode,
+  });
+  const lines = result.tokens.map((line, i) => {
+    const spans = line
+      .map((t) => {
+        const style = stringifyTokenStyle(t.htmlStyle || getTokenStyleObject(t));
+        return `<span${style ? ` style="${escapeHtml(style)}"` : ""}>${escapeHtml(t.content)}</span>`;
+      })
+      .join("");
+    return `<span class="line" data-ln="${startLine + i + 1}">${spans}</span>`;
+  });
+  return { lines, endState: result.grammarState };
 }

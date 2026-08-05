@@ -26,7 +26,7 @@ import { useMaskDismiss } from "./components/ui/maskDismiss";
 import { useDoubleShift } from "./components/ui/useDoubleShift";
 import { SidebarToggleIcon, useSidebarToggle } from "./components/ui/SidebarToggle";
 import DashboardShell from "./components/htyenv/DashboardShell";
-import { setSetting, useSettings } from "./settings";
+import { getSettings, setSetting, useSettings } from "./settings";
 import * as previewWin from "./previewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -224,6 +224,13 @@ export default function App() {
       /* ignore */
     }
   }, [recents]);
+
+  // 按设置同步全局截图热键（默认开；关则不注册，避免与飞书等抢 Ctrl+Shift+A）
+  useEffect(() => {
+    void invoke("set_screenshot_hotkey_enabled", {
+      enabled: getSettings().screenshotHotkey,
+    }).catch(() => {});
+  }, []);
 
   // 持久化已打开的工作区 + 活动工作区（退出重进复原标签栏）
   useEffect(() => {

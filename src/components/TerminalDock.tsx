@@ -59,7 +59,14 @@ import { registerFileOpener, registerFileRevealer } from "../fileOpenBus";
 import * as previewWin from "../previewWindow";
 import { EV_READY } from "../previewProtocol";
 import { getSettings } from "../settings";
-import { captureSessionIds, listClaudeSessions, listCodexSessions, listCursorSessions, listKimiSessions } from "../catalog";
+import {
+  listClaudeSessions,
+  listCodexSessions,
+  listCursorSessions,
+  listKimiSessions,
+  mapAgentSessionsByPty,
+  terminalPtyPid,
+} from "../catalog";
 import { getSessionTitle, setSessionTitle, onSessionTitlesChange, splitStatusPrefix } from "../sessionTitles";
 import {
   getNativeSessionLabel,
@@ -139,8 +146,8 @@ const saveSN = () => {
   }
 };
 
-// 每个 claude 终端记住它的 session id（=HtyBox 新建时用 `--session-id` 指定的自管 UUID），持久化。
-// 复原时 `claude --resume <id>` 按 id 精确复原 —— 不依赖 OSC 标题、不受标题里 claude 状态符号(✳)影响。
+// 每个 agent 终端记住捕获到的真实 session id（新建发裸命令、启动后捕获；不预分配），持久化。
+// 复原时按 id 精确复原（claude --resume / codex resume / …）—— 不依赖 OSC 标题、不受状态符号(✳)影响。
 const SID_KEY = "htybox.sessionIds.v1";
 const SESSION_IDS: Record<string, string> = (() => {
   try {
@@ -156,18 +163,27 @@ const saveSI = () => {
     /* ignore */
   }
 };
-// 已被某终端认领的 session id（含复原沿用的），避免并发新建时多个终端抢同一个捕获结果。
+// 已被某终端认领的 session id（含复原沿用的）。
 const CLAIMED_SIDS = new Set<string>(Object.values(SESSION_IDS));
 // 捕获任务按 termId 常驻：勿在 DockTerminal effect 清理时 abort（props.api 变化会重跑 effect，
 // 反复 abort → 永远认领失败 → Tab 停在 OSC 工作区名、重命名只写 CUSTOM_TITLES）。
 // 只在面板真正关闭时 abortSessionCapture。
 const CAPTURE_CTRL: Record<string, AbortController> = {};
 const CAPTURE_SINCE: Record<string, number> = {};
+type CaptureMeta = {
+  agentKind: AgentKind;
+  cwd: string;
+  onClaimed?: (sessionId: string) => void;
+};
+const CAPTURE_META: Record<string, CaptureMeta> = {};
+// 认领临界区串行化：禁止多终端各自「抢最新」导致 SESSION_IDS 对调。
+let captureAssignTail: Promise<void> = Promise.resolve();
 
 function abortSessionCapture(termId: string): void {
   CAPTURE_CTRL[termId]?.abort();
   delete CAPTURE_CTRL[termId];
   delete CAPTURE_SINCE[termId];
+  delete CAPTURE_META[termId];
 }
 
 /** kimi 无位置 prompt 参数：团队简报改为终端 PTY 就绪后注入。
@@ -207,16 +223,97 @@ async function refreshNativeLabels(agentKind: AgentKind, cwd: string): Promise<v
   }
 }
 
-// 新建 agent 终端后：轮询后端捕获该 cwd 下、启动后新生成的真实 session id，认领未占用者存入 SESSION_IDS。
-// claude/codex 都不便预分配 id（保持新建命令行干净），故新建发裸命令、此处捕获真实 id 供日后精确复原。
-// 认领窗口内【最新】未占用 id（mtime 升序列表取末个），避免绑到同 cwd 刚失败留下的僵尸会话。
+/** 同 agent+cwd 下尚未认领、捕获未中止的终端，按 CAPTURE_SINCE 升序（= 启动顺序）。 */
+function listCaptureWaiters(agentKind: AgentKind, cwd: string): string[] {
+  return Object.keys(CAPTURE_META)
+    .filter((tid) => {
+      const m = CAPTURE_META[tid];
+      if (!m || m.agentKind !== agentKind || m.cwd !== cwd) return false;
+      if (SESSION_IDS[tid]) return false;
+      const ac = CAPTURE_CTRL[tid];
+      return !!ac && !ac.signal.aborted;
+    })
+    .sort((a, b) => (CAPTURE_SINCE[a] ?? 0) - (CAPTURE_SINCE[b] ?? 0));
+}
+
+/** 把 sid 绑到 termId（同步写 CLAIMED/SESSION_IDS + 迁 CUSTOM_TITLES）。 */
+function bindSessionId(termId: string, agentKind: AgentKind, sid: string): void {
+  CLAIMED_SIDS.add(sid);
+  SESSION_IDS[termId] = sid;
+  const pending = CUSTOM_TITLES[termId];
+  if (pending) {
+    setSessionTitle(agentKind, sid, pending);
+    delete CUSTOM_TITLES[termId];
+    saveCT();
+  }
+}
+
+/**
+ * 集中认领（串行化）：四 agent 一律按 PTY 映射 sessionId
+ * - claude：sessions/<pid>.json 落在 PTY 进程树
+ * - codex/cursor/kimi：PTY 子树 agent 进程创建时间 ↔ 会话 createdAt 最近邻
+ */
+async function assignCapturedSessions(agentKind: AgentKind, cwd: string): Promise<void> {
+  let release!: () => void;
+  const prev = captureAssignTail;
+  captureAssignTail = new Promise<void>((r) => {
+    release = r;
+  });
+  await prev;
+  try {
+    const waiters = listCaptureWaiters(agentKind, cwd);
+    if (!waiters.length) return;
+    const since = Math.min(...waiters.map((t) => CAPTURE_SINCE[t] ?? Date.now()));
+    const ptyByTerm = new Map<string, number>();
+    await Promise.all(
+      waiters.map(async (tid) => {
+        try {
+          const pid = await terminalPtyPid(tid);
+          if (pid != null && pid > 0) ptyByTerm.set(tid, pid);
+        } catch {
+          /* ignore */
+        }
+      }),
+    );
+    const ptyPids = [...new Set(ptyByTerm.values())];
+    if (!ptyPids.length) return;
+    let mapped: Array<{ ptyPid: number; sessionId: string }> = [];
+    try {
+      mapped = await mapAgentSessionsByPty(agentKind, cwd, since, ptyPids);
+    } catch {
+      return;
+    }
+    const live = listCaptureWaiters(agentKind, cwd);
+    const sidByPty = new Map(mapped.map((m) => [m.ptyPid, m.sessionId]));
+    const assigned: string[] = [];
+    for (const tid of live) {
+      if (SESSION_IDS[tid]) continue;
+      const pty = ptyByTerm.get(tid);
+      if (pty == null) continue;
+      const sid = sidByPty.get(pty);
+      if (!sid || CLAIMED_SIDS.has(sid)) continue;
+      bindSessionId(tid, agentKind, sid);
+      assigned.push(tid);
+    }
+    if (!assigned.length) return;
+    saveSI();
+    await refreshNativeLabels(agentKind, cwd);
+    for (const tid of assigned) {
+      const sid = SESSION_IDS[tid];
+      if (!sid) continue;
+      CAPTURE_META[tid]?.onClaimed?.(sid);
+    }
+  } finally {
+    release();
+  }
+}
+
+// 新建 agent 终端后：轮询后端捕获该 cwd 下新生成的真实 session id；认领由 assignCapturedSessions 集中调度。
 async function captureSessionId(
   termId: string,
   agentKind: AgentKind,
   cwd: string,
-  since: number,
   signal: AbortSignal,
-  onClaimed?: (sessionId: string) => void,
 ): Promise<void> {
   // 约 45s：Codex 冷启动 + 首条消息落盘可能慢于旧的 12s 窗口
   for (let i = 0; i < 30; i++) {
@@ -235,38 +332,9 @@ async function captureSessionId(
       signal.addEventListener("abort", onAbort, { once: true });
     });
     if (signal.aborted) return;
-    if (SESSION_IDS[termId]) return; // 已被设置则停
-    let ids: string[] = [];
-    try {
-      ids = await captureSessionIds(agentKind, cwd, since);
-    } catch {
-      /* ignore */
-    }
-    if (signal.aborted) return;
-    // 升序 → 从尾部找第一个未占用 = 最新
-    let fresh: string | undefined;
-    for (let j = ids.length - 1; j >= 0; j--) {
-      if (!CLAIMED_SIDS.has(ids[j])) {
-        fresh = ids[j];
-        break;
-      }
-    }
-    if (!fresh) continue;
-    if (signal.aborted) return;
-    CLAIMED_SIDS.add(fresh);
-    SESSION_IDS[termId] = fresh;
-    saveSI();
-    // 捕获前若用户已用终端级名重命名 → 迁入会话自定义名，与 Session 列表联动
-    const pending = CUSTOM_TITLES[termId];
-    if (pending) {
-      setSessionTitle(agentKind, fresh, pending);
-      delete CUSTOM_TITLES[termId];
-      saveCT();
-    }
-    await refreshNativeLabels(agentKind, cwd);
-    if (signal.aborted) return;
-    onClaimed?.(fresh);
-    return;
+    if (SESSION_IDS[termId]) return;
+    await assignCapturedSessions(agentKind, cwd);
+    if (SESSION_IDS[termId]) return;
   }
 }
 
@@ -279,19 +347,19 @@ function ensureSessionCapture(
 ): void {
   if (SESSION_IDS[termId]) return;
   const existing = CAPTURE_CTRL[termId];
-  if (existing && !existing.signal.aborted) return;
+  if (existing && !existing.signal.aborted) {
+    // effect 重跑可能带新 onClaimed：更新回调，不重启 since/轮询
+    const meta = CAPTURE_META[termId];
+    if (meta) meta.onClaimed = onClaimed;
+    return;
+  }
   const ac = new AbortController();
   CAPTURE_CTRL[termId] = ac;
   CAPTURE_SINCE[termId] ??= Date.now() - 3000;
-  void captureSessionId(
-    termId,
-    agentKind,
-    cwd,
-    CAPTURE_SINCE[termId],
-    ac.signal,
-    onClaimed,
-  ).finally(() => {
+  CAPTURE_META[termId] = { agentKind, cwd, onClaimed };
+  void captureSessionId(termId, agentKind, cwd, ac.signal).finally(() => {
     if (CAPTURE_CTRL[termId] === ac) delete CAPTURE_CTRL[termId];
+    if (!CAPTURE_CTRL[termId]) delete CAPTURE_META[termId];
   });
 }
 // 每个终端最近一次 OSC 原始标题(含状态前缀)，供"会话改名"事件刷新 Tab 时复用前缀。

@@ -10,3 +10,6 @@ export const CODE_RE =
 
 export const MD_RE = /\.(md|markdown)$/i;
 export const SVG_RE = /\.svg$/i;
+
+/** 纯文本（plan-3：日志/数据类，走无高亮的等高行只读虚拟预览；与 CODE_RE 互斥）。 */
+export const TEXT_RE = /\.(txt|log|csv|tsv|jsonl|out|err)$/i;

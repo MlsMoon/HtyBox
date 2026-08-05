@@ -4,6 +4,7 @@ mod catalog;
 mod fs_tree;
 mod host_identity;
 pub mod htyenv; // hty环境引擎:pub 供独立测试 harness/后续命令层消费(阶段构建期亦免 dead_code 噪声)
+pub mod large_text; // plan-1:大文本分片读(pub 供独立验证 bin 调用)
 mod memory_transfer;
 mod portable_archive;
 mod pty;
@@ -35,6 +36,7 @@ struct AppState {
     relay_cfg: Arc<Mutex<RelayCfg>>, // L4：relay 反连配置（endpoint/use_tls/enabled）
     relay_online: Arc<AtomicBool>, // L4：relay 控制连在线状态（relay_client 维护，UI 轮询）
     relay_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>, // L4：反连任务句柄（改配置时 abort 重启）
+    large_docs: Arc<large_text::DocRegistry>, // plan-1：大文本分片读文档句柄注册表（LRU 兜底）
 }
 
 /// L4：relay 反连运行配置（持久化在 host-config.json）。
@@ -294,6 +296,12 @@ fn resize_terminal(
 #[tauri::command]
 fn close_terminal(state: State<'_, AppState>, id: String) -> Result<(), String> {
     state.terminal.close(&id)
+}
+
+/// PTY 直接子进程 pid（Windows 上多为 powershell；供 Claude 按进程树认领 session）。
+#[tauri::command]
+fn terminal_pty_pid(state: State<'_, AppState>, id: String) -> Option<u32> {
+    state.terminal.pty_pid(&id)
 }
 
 #[tauri::command]
@@ -862,14 +870,53 @@ fn list_dir(path: String) -> Result<Vec<fs_tree::DirEntry>, String> {
 }
 
 /// M9：读文本文件（目录 → Err；超上限/二进制 → editable=false；文本白名单/强制 → 有损打开）。
-/// force_lossy / max_bytes 可选（invoke 侧 forceLossy / maxBytes），缺省 = 不强制 / 默认 10MB。
+/// force_lossy / max_bytes / max_open_bytes 可选（invoke 侧 forceLossy / maxBytes / maxOpenBytes），
+/// 缺省 = 不强制 / 编辑上限 10MB / 可打开上限 512MB（超编辑上限但可打开 → viewable=true 供分流）。
 #[tauri::command]
 fn read_text_file(
     path: String,
     force_lossy: Option<bool>,
     max_bytes: Option<u64>,
+    max_open_bytes: Option<u64>,
 ) -> Result<fs_tree::ReadTextResult, String> {
-    fs_tree::read_text_file(&path, force_lossy.unwrap_or(false), max_bytes)
+    fs_tree::read_text_file(&path, force_lossy.unwrap_or(false), max_bytes, max_open_bytes)
+}
+
+/// plan-1：打开大文本文档（流式建行索引，不整读入内存）→ 句柄 + 元信息 + 首屏行。
+/// 只服务只读虚拟预览；扫描耗时与体积线性（50MB 数百 ms 级），走 spawn_blocking 不占 IPC 线程。
+#[tauri::command]
+async fn open_text_document(
+    state: State<'_, AppState>,
+    path: String,
+    force_lossy: Option<bool>,
+    max_open_bytes: Option<u64>,
+) -> Result<large_text::OpenResult, String> {
+    let reg = state.large_docs.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        large_text::open_doc(&reg, &path, force_lossy.unwrap_or(false), max_open_bytes)
+    })
+    .await
+    .map_err(|error| format!("大文件打开任务失败：{error}"))?
+}
+
+/// plan-1：按行范围读取（虚拟滚动数据源）。句柄失效返回 "doc-invalid: " 前缀错误供前端识别重开。
+#[tauri::command]
+async fn read_text_lines(
+    state: State<'_, AppState>,
+    doc_id: u64,
+    start_line: u64,
+    count: u64,
+) -> Result<large_text::ReadLinesResult, String> {
+    let reg = state.large_docs.clone();
+    tauri::async_runtime::spawn_blocking(move || reg.read_lines(doc_id, start_line, count))
+        .await
+        .map_err(|error| format!("大文件取行任务失败：{error}"))?
+}
+
+/// plan-1：释放文档句柄（前端面板卸载时调用；漏调由 Rust 侧 LRU 上限兜底）。
+#[tauri::command]
+fn close_text_document(state: State<'_, AppState>, doc_id: u64) {
+    state.large_docs.close(doc_id);
 }
 
 /// md 预览里的相对链接解析用：判断某路径是否为已存在的文件（目录不算）。
@@ -966,6 +1013,20 @@ async fn save_clipboard_image(
     .map_err(|error| format!("剪贴板图片落盘任务失败：{error}"))?
 }
 
+/// 设置「全局截图快捷键」开关：开=注册 Ctrl+Shift+A，关=注销（释放给飞书等）。
+#[tauri::command]
+fn set_screenshot_hotkey_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    match screenshot::set_hotkey_enabled(&app, enabled) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if enabled {
+                let _ = app.emit("screenshot-hotkey-failed", ());
+            }
+            Err(e)
+        }
+    }
+}
+
 /// M9：编辑器打开文件时开始监听其外部变化（变化后 emit "file-changed"）。
 #[tauri::command]
 fn watch_file(path: String) -> Result<(), String> {
@@ -1051,6 +1112,27 @@ fn delete_kimi_session(path: String) -> Result<(), String> {
 #[tauri::command]
 fn capture_session_ids(agent: String, cwd: String, since_ms: i64) -> Vec<String> {
     sessions::capture_session_ids(&agent, &cwd, since_ms)
+}
+
+/// 按 PTY 精确认领 session：claude 走 sessions/<pid>.json；codex/cursor/kimi 走子树进程创建时间↔会话 createdAt。
+#[tauri::command]
+fn map_agent_sessions_by_pty(
+    agent: String,
+    cwd: String,
+    since_ms: i64,
+    pty_pids: Vec<u32>,
+) -> Vec<sessions::PtySessionMap> {
+    sessions::map_agent_sessions_by_pty(&agent, &cwd, since_ms, &pty_pids)
+}
+
+/// 兼容旧前端：等同 `map_agent_sessions_by_pty("claude", …)`。
+#[tauri::command]
+fn map_claude_sessions_by_pty(
+    cwd: String,
+    since_ms: i64,
+    pty_pids: Vec<u32>,
+) -> Vec<sessions::PtySessionMap> {
+    sessions::map_claude_sessions_by_pty(&cwd, since_ms, &pty_pids)
 }
 
 /// M7-A：返回本地 MCP broker 的端点 URL（agent 的 .mcp.json 指向它）。
@@ -1310,6 +1392,7 @@ pub fn run() {
             relay_cfg,
             relay_online,
             relay_task,
+            large_docs: Arc::new(large_text::DocRegistry::default()),
         })
         .setup(move |app| {
             watcher::start(app.handle().clone());
@@ -1327,9 +1410,9 @@ pub fn run() {
                 &identity_for_relay,
                 &workspaces_for_relay,
             );
-            // 全局框选截图：Ctrl+Shift+A → 系统 Screen Snipping → 剪贴板（注册失败不阻断启动）
+            // 全局框选截图：只挂插件+handler；是否 register 由前端设置同步（见 set_screenshot_hotkey_enabled）
             {
-                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+                use tauri_plugin_global_shortcut::ShortcutState;
                 if let Err(e) = app.handle().plugin(
                     tauri_plugin_global_shortcut::Builder::new()
                         .with_handler(|app, _shortcut, event| {
@@ -1341,11 +1424,6 @@ pub fn run() {
                 ) {
                     eprintln!("[screenshot] global-shortcut plugin init failed: {e}");
                     let _ = app.emit("screenshot-hotkey-failed", ());
-                } else if let Err(e) = app.global_shortcut().register("ctrl+shift+a") {
-                    eprintln!("[screenshot] Ctrl+Shift+A register failed: {e}");
-                    let _ = app.emit("screenshot-hotkey-failed", ());
-                } else {
-                    eprintln!("[screenshot] Ctrl+Shift+A registered");
                 }
             }
             Ok(())
@@ -1355,6 +1433,7 @@ pub fn run() {
             write_terminal,
             resize_terminal,
             close_terminal,
+            terminal_pty_pid,
             ws_port,
             pairing_offer,
             lan_enabled,
@@ -1406,6 +1485,9 @@ pub fn run() {
             apply_skill_template,
             list_dir,
             read_text_file,
+            open_text_document,
+            read_text_lines,
+            close_text_document,
             write_text_file,
             file_exists,
             read_image_data_url,
@@ -1419,6 +1501,7 @@ pub fn run() {
             import_dropped_entry,
             reveal_in_explorer,
             save_clipboard_image,
+            set_screenshot_hotkey_enabled,
             watch_file,
             unwatch_file,
             list_all_files,
@@ -1432,6 +1515,8 @@ pub fn run() {
             delete_cursor_session,
             delete_kimi_session,
             capture_session_ids,
+            map_agent_sessions_by_pty,
+            map_claude_sessions_by_pty,
             detect_agents,
             install_agent,
             update_agent,

@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { IDockviewPanelProps } from "dockview-react";
 import { renderMarkdown } from "../mdRender";
-import { highlightToHtml, langForPath, onHighlighterReady } from "../highlighter";
-import { CODE_RE, IMAGE_RE, MD_RE, SVG_RE } from "../fileKinds";
+import { langForPath, onHighlighterReady } from "../highlighter";
+import { CODE_RE, IMAGE_RE, MD_RE, SVG_RE, TEXT_RE } from "../fileKinds";
+import LinePreview from "./LinePreview";
+import MdBlockPreview, { type MdBlockPreviewHandle } from "./MdBlockPreview";
+import ConfirmModal from "./ui/ConfirmModal";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { readTextFile, writeTextFile, readImageDataUrl, watchFile, unwatchFile, fileExists } from "../catalog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -32,6 +35,12 @@ interface Buf {
   warning?: string;
   /** 用户点过「仍以文本方式打开」——外部变化重载时沿用，避免弹回占位 */
   forcedLossy?: boolean;
+  /** plan-3：超出编辑上限但未超可打开上限——content 为空，走分片只读虚拟预览而非占位 */
+  viewable?: boolean;
+  /** 文件字节数（决定是否提供「仍要编辑」入口） */
+  sizeBytes?: number;
+  /** plan-5：用户已显式确认「仍要编辑」——外部变化重载时沿用放宽上限，避免弹回只读（同 forcedLossy 语义） */
+  editAnyway?: boolean;
 }
 const editorStore = new Map<string, Buf>();
 // 图片预览缓存（与 editorStore 同样为跨重挂保活；data URL 较大，避免重复读盘）。
@@ -63,15 +72,28 @@ export function adoptEditorBuf(panelId: string, content: string): void {
 // content.js:142），期间没有 layout box、scrollTop 归零，切回来会从文档顶部开始——长文档
 // 里跳走再回来就得重新往下滚。按【文件路径】而非 panelId 存：后退到已被关掉的 tab 时面板
 // 是新建的、panelId 变了，按 path 才能连位置一起复原，故 disposeEditorBuf 不清本表。
-const scrollStore = new Map<string, number>();
+// plan-2（决策 4 = C）：值由 number 扩展为 { top, line? }——非虚拟化路径（md/textarea/全量代码
+// 预览）只写读 top，语义与 v1.12.3 完全一致；虚拟化路径（plan-3 接入）额外记首个可见行号，
+// 恢复时行号优先（换字体行高变化后仍回到同一行）。
+const scrollStore = new Map<string, { top: number; line?: number }>();
 /** 判定「已滚到目标」的像素容差：缩放比下 scrollTop 可能是小数，严格相等判不出到位。 */
 const SCROLL_HIT_TOLERANCE = 2;
 
 const basename = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
-// 代码预览的高亮上限：shiki 是同步 API，超大文件硬上会卡住整个窗口。
-// 按字符数近似（纯 ASCII 源码 1 字符≈1 字节；含中文时更保守），超限则只给无高亮的行号预览。
-const CODE_HL_MAX_CHARS = 512 * 1024;
+/** readTextFile 的体积上限参数（全局设置）：编辑上限 + 只读预览可打开上限（plan-3 双阈值）。 */
+const sizeOpts = () => ({
+  maxBytes: getSettings().maxEditMB * 1024 * 1024,
+  maxOpenBytes: getSettings().maxOpenMB * 1024 * 1024,
+});
+
+// plan-4：md 三档分流阈值。小文档走既有全量渲染（零回归）；中大走分段渲染；
+// 超上限降级为纯文本只读虚拟预览（md 不定高虚拟化的成本只为常规大文档花，极端输入行为确定）。
+const MD_BLOCK_MIN_BYTES = 512 * 1024;
+const MD_MAX_BYTES = 16 * 1024 * 1024;
+// plan-5 决策 1：「仍要编辑」入口的体积上限——超过则不提供入口（不让用户确认后卡死窗口），
+// 只读虚拟预览仍然可用。
+const EDIT_ANYWAY_MAX_BYTES = 100 * 1024 * 1024;
 
 /** M9：简易文本编辑器面板（textarea，无语法高亮）。Ctrl+S 保存；脏标在面板内。 */
 export default function DockEditor(
@@ -91,33 +113,40 @@ export default function DockEditor(
   const isMd = MD_RE.test(path);
   const isSvg = SVG_RE.test(path);
   const isCode = !isMd && !isSvg && CODE_RE.test(path);
-  const previewable = isMd || isSvg || isCode;
-  // 可预览的文件一律默认进预览态（用户 2026-07-27 拍板；此前只有 svg 默认预览）
-  const [view, setView] = useState<"edit" | "preview">("preview");
+  const isText = !isMd && !isSvg && !isCode && TEXT_RE.test(path); // plan-3：纯文本类别
+  const previewable = isMd || isSvg || isCode || isText;
+  // 超编辑上限但可打开（viewable）：等高行类型（plan-3）与 md（plan-4，降级纯文本分片预览）
+  // 都跳过占位直接进只读虚拟预览；svg 大文件不支持，仍走占位。
+  const canVirtualPreview = (isCode || isText || isMd) && !!buf.viewable;
+  // plan-4 md 三档分流：full=既有全量（零回归）/ block=分段渲染 / degrade=降级纯文本预览
+  const mdMode = !isMd
+    ? null
+    : buf.viewable || buf.content.length > MD_MAX_BYTES
+      ? "degrade"
+      : buf.content.length >= MD_BLOCK_MIN_BYTES
+        ? "block"
+        : "full";
+  const mdBlockRef = useRef<MdBlockPreviewHandle | null>(null);
+  // 可预览的文件一律默认进预览态（用户 2026-07-27 拍板；此前只有 svg 默认预览）。
+  // plan-5 决策 2 = C：纯文本（txt/log）是本次新纳入的可预览类型，默认保留旧习惯（编辑态），
+  // 设置 plainTextDefaultEdit 可切到与其他类型一致的统一预览；大文件由 canVirtualPreview 恒预览。
+  const [view, setView] = useState<"edit" | "preview">(() =>
+    TEXT_RE.test(path) && getSettings().plainTextDefaultEdit ? "edit" : "preview",
+  );
+  // plan-5 决策 1 = A：超编辑上限的显式编辑入口（提示条按钮 → 自定义确认弹窗）
+  const [editAnywayAsk, setEditAnywayAsk] = useState(false);
   const [imgFailed, setImgFailed] = useState(false); // SVG <img> 渲染失败(onError)安全网标志
-  // 代码块语法按需加载：某语法就绪后 tick+1 触发重渲染，把先前的无高亮代码块换成着色版。
+  // md 内代码块语法按需加载：某语法就绪后 tick+1 触发重渲染，把无高亮代码块换成着色版。
+  // （代码文件预览与 md 分段路径的语法就绪通知各自内部管理，本 tick 只服务全量 md）
   const [hlTick, setHlTick] = useState(0);
   useEffect(() => {
-    if (!isMd && !isCode) return;
+    if (mdMode !== "full") return;
     return onHighlighterReady(() => setHlTick((n) => n + 1));
-  }, [isMd, isCode]);
-  // 预览产物仅在预览视图计算：上限放宽后大文件在编辑视图打字，避免每键全量 parse/encode。
+  }, [mdMode]);
+  // 预览产物仅在全量 md 且预览视图时计算（分段/降级路径绝不全量 parse）。
   const html = useMemo(
-    () => (isMd && view === "preview" ? renderMarkdown(buf.content) : ""),
-    [isMd, view, buf.content, hlTick],
-  );
-  // 代码文件只读预览：同一个 shiki 实例，行结构与 md 代码块同构（每行 <span class="line">）；
-  // 超过上限则传 null 语言 → 走同构的无高亮兜底，行号照旧，窗口不卡。
-  const codeTooBig = isCode && buf.content.length > CODE_HL_MAX_CHARS;
-  const codeHtml = useMemo(
-    () =>
-      isCode && view === "preview" && buf.loaded
-        ? highlightToHtml(
-            buf.content,
-            buf.content.length > CODE_HL_MAX_CHARS ? null : langForPath(path),
-          )
-        : "",
-    [isCode, view, buf.loaded, buf.content, path, hlTick],
+    () => (mdMode === "full" && view === "preview" ? renderMarkdown(buf.content) : ""),
+    [mdMode, view, buf.content, hlTick],
   );
   // SVG 预览：良构性校验（DOMParser 失败时 Chromium 插入 <parsererror>，取明细作诊断）+ 容错重试。
   // 解析失败时把「孤立 &」（后面不是合法实体）转义为 &amp; 再试一次——损坏/AI 生成的 mockup 常见
@@ -157,7 +186,7 @@ export default function DockEditor(
     scrollRafRef.current = requestAnimationFrame(() => {
       scrollRafRef.current = 0;
       const el = scrollRef.current;
-      if (el) scrollStore.set(path, el.scrollTop);
+      if (el) scrollStore.set(path, { top: el.scrollTop });
     });
   };
 
@@ -167,13 +196,14 @@ export default function DockEditor(
     if (!pendingRestoreRef.current) return;
     const el = scrollRef.current;
     const target = scrollStore.get(path);
-    if (!el || !target) {
+    if (!el || !target?.top) {
       pendingRestoreRef.current = false; // 没记录过 / 记的就是顶部 → 无需恢复
       return;
     }
-    el.scrollTop = target;
+    el.scrollTop = target.top;
     // 内容尚未渲染够高时只能滚到当前 scrollHeight 上限，留着标志等下一次内容变化再试
-    if (Math.abs(el.scrollTop - target) < SCROLL_HIT_TOLERANCE) pendingRestoreRef.current = false;
+    if (Math.abs(el.scrollTop - target.top) < SCROLL_HIT_TOLERANCE)
+      pendingRestoreRef.current = false;
   }, [path]);
 
   // 面板被激活（打开 / 点 Tab / 前进后退）：dockview 此刻才把 DOM attach 回文档，
@@ -188,10 +218,11 @@ export default function DockEditor(
     return () => d.dispose();
   }, [props.api, tryRestoreScroll]);
 
-  // 内容异步就绪会改变容器高度（读盘完成、md 渲染、shiki 语言按需加载）→ 再试一次定位。
+  // 内容异步就绪会改变容器高度（读盘完成、md 渲染）→ 再试一次定位。
+  // （虚拟化路径的定位由 VirtualLines 自理：spacer 总高一开始就正确，无需重试链）
   useEffect(() => {
     tryRestoreScroll();
-  }, [buf.loaded, html, codeHtml, tryRestoreScroll]);
+  }, [buf.loaded, html, tryRestoreScroll]);
 
   // 图片：读 base64 data URL（跳过文本加载，避免落到「二进制不支持编辑」）。
   useEffect(() => {
@@ -226,9 +257,9 @@ export default function DockEditor(
       return;
     }
     let alive = true;
-    readTextFile(path, { maxBytes: getSettings().maxEditMB * 1024 * 1024 })
+    readTextFile(path, sizeOpts())
       .then((r) => {
-        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning };
+        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, viewable: r.viewable, sizeBytes: r.sizeBytes };
         editorStore.set(panelId, b);
         if (alive) setBuf(b);
       })
@@ -255,10 +286,15 @@ export default function DockEditor(
 
   // 从磁盘重新载入（放弃本地未保存内容）。供外部变化同步 / 冲突时手动重载。
   const reloadFromDisk = () => {
-    const forced = editorStore.get(panelId)?.forcedLossy ?? false;
-    readTextFile(path, { forceLossy: forced, maxBytes: getSettings().maxEditMB * 1024 * 1024 })
+    const prev = editorStore.get(panelId);
+    const forced = prev?.forcedLossy ?? false;
+    const anyway = prev?.editAnyway ?? false;
+    const opts = sizeOpts();
+    // 用户已显式确认过「仍要编辑」→ 重载沿用放宽的编辑上限，不弹回只读预览
+    if (anyway) opts.maxBytes = Math.max(opts.maxBytes, EDIT_ANYWAY_MAX_BYTES);
+    readTextFile(path, { forceLossy: forced, ...opts })
       .then((r) => {
-        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, forcedLossy: forced };
+        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, forcedLossy: forced, viewable: r.viewable, sizeBytes: r.sizeBytes, editAnyway: anyway && r.editable };
         editorStore.set(panelId, b);
         setBuf(b);
         setExternalChanged(false);
@@ -269,11 +305,26 @@ export default function DockEditor(
 
   // 疑似二进制的逃生门：用户在占位 UI 显式确认后，以 U+FFFD 有损替换打开。
   const forceOpen = () => {
-    readTextFile(path, { forceLossy: true, maxBytes: getSettings().maxEditMB * 1024 * 1024 })
+    readTextFile(path, { forceLossy: true, ...sizeOpts() })
       .then((r) => {
-        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, forcedLossy: true };
+        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, forcedLossy: true, viewable: r.viewable, sizeBytes: r.sizeBytes };
         editorStore.set(panelId, b);
         setBuf(b);
+      })
+      .catch((e) => setErr(String(e)));
+  };
+
+  // plan-5 决策 1 = A：确认弹窗通过后，以放宽的编辑上限全量加载进 textarea（代价已如实告知）。
+  const forceEditAnyway = () => {
+    const forced = editorStore.get(panelId)?.forcedLossy ?? false;
+    const opts = sizeOpts();
+    opts.maxBytes = Math.max(opts.maxBytes, EDIT_ANYWAY_MAX_BYTES);
+    readTextFile(path, { forceLossy: forced, ...opts })
+      .then((r) => {
+        const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, forcedLossy: forced, viewable: r.viewable, sizeBytes: r.sizeBytes, editAnyway: r.editable };
+        editorStore.set(panelId, b);
+        setBuf(b);
+        if (r.editable) setView("edit");
       })
       .catch((e) => setErr(String(e)));
   };
@@ -351,6 +402,8 @@ export default function DockEditor(
     if (raw.startsWith("#")) {
       const id = decodeURIComponent(raw.slice(1));
       if (!id) return;
+      // plan-4 分段路径：先走块索引（覆盖未挂载块）；全量路径维持现状 querySelector
+      if (mdBlockRef.current?.scrollToAnchor(id)) return;
       const el = e.currentTarget.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
       el?.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
@@ -443,7 +496,8 @@ export default function DockEditor(
     );
   }
 
-  if (buf.loaded && !buf.editable) {
+  // plan-3：等高行类型（代码/纯文本）超编辑上限但可打开 → 不再占位，落到下方分片只读虚拟预览
+  if (buf.loaded && !buf.editable && !canVirtualPreview) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 bg-[var(--bg)] p-6 text-center">
         <div className="text-[13px] font-semibold text-[var(--text-2)]">{basename(path)}</div>
@@ -468,7 +522,9 @@ export default function DockEditor(
           {buf.dirty && <span className="mr-1 text-[var(--accent)]">●</span>}
           {basename(path)}
         </span>
-        {previewable && (
+        {previewable && !canVirtualPreview && (
+          /* canVirtualPreview（超编辑上限的分片只读）没有可编辑内容可切，切换组隐藏；
+             显式「仍要编辑」入口由 plan-5 收口 */
           <div className="flex shrink-0 overflow-hidden rounded-md border border-[var(--border)] text-[10.5px]">
             <button
               onClick={() => setView("edit")}
@@ -499,18 +555,36 @@ export default function DockEditor(
           保存
         </button>
       </div>
-      {codeTooBig && view === "preview" && (
-        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-3 py-1.5">
-          <span className="min-w-0 flex-1 text-[10.5px] text-[var(--accent-text)]">
-            文件较大（{(buf.content.length / 1024 / 1024).toFixed(1)} MB，超过 512 KB），已关闭语法高亮以保证流畅；阅读与编辑不受影响
-          </span>
-        </div>
-      )}
       {buf.lossy && (
         <div className="flex shrink-0 items-center gap-2 border-b border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-3 py-1.5">
           <span className="min-w-0 flex-1 text-[10.5px] text-[var(--accent-text)]">
             {buf.warning ?? "内容经有损转换，保存将写回转换后的内容"}
           </span>
+        </div>
+      )}
+      {mdMode === "degrade" && !buf.viewable && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-3 py-1.5">
+          <span className="min-w-0 flex-1 text-[10.5px] text-[var(--accent-text)]">
+            Markdown 文档过大（超出 {MD_MAX_BYTES / 1024 / 1024} MB 渲染上限），已降级为纯文本只读预览
+          </span>
+        </div>
+      )}
+      {buf.viewable && (
+        /* plan-5：超编辑上限 → 只读虚拟预览提示条 + 显式编辑入口（决策 1 = A）；
+           极端体积不给入口（不让用户确认后卡死），只读预览仍可用 */
+        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-3 py-1.5">
+          <span className="min-w-0 flex-1 text-[10.5px] text-[var(--accent-text)]">
+            {buf.reason ?? "文件较大，超出编辑上限"}，已进入只读虚拟预览
+            {isMd ? "（Markdown 排版随降级关闭）" : ""}
+          </span>
+          {(buf.sizeBytes ?? Infinity) <= EDIT_ANYWAY_MAX_BYTES && (
+            <button
+              onClick={() => setEditAnywayAsk(true)}
+              className="shrink-0 rounded-md border border-[var(--accent-border-soft)] px-2 py-0.5 text-[10.5px] text-[var(--accent-text)] hover:bg-[var(--accent)] hover:text-white"
+            >
+              仍要编辑
+            </button>
+          )}
         </div>
       )}
       {externalChanged && (
@@ -530,7 +604,8 @@ export default function DockEditor(
           </button>
         </div>
       )}
-      {previewable && view === "preview" ? (
+      {(previewable && view === "preview") || canVirtualPreview ? (
+        /* canVirtualPreview 无可编辑内容，无视 view 恒走只读虚拟预览 */
         isSvg ? (
           !svgView.url ? (
             <div
@@ -565,24 +640,45 @@ export default function DockEditor(
               ) : null}
             </div>
           )
-        ) : isCode ? (
-          <div
-            ref={(el) => {
-              scrollRef.current = el;
-            }}
-            onScroll={onScroll}
-            className="code-preview min-h-0 flex-1 overflow-auto"
-            dangerouslySetInnerHTML={{ __html: codeHtml }}
-          />
+        ) : isMd ? (
+          mdMode === "degrade" ? (
+            /* 超 md 渲染上限：降级纯文本只读虚拟预览（等高行管线；viewable 走分片） */
+            <LinePreview
+              path={path}
+              content={buf.viewable ? undefined : buf.content}
+              lang={null}
+              initial={scrollStore.get(path)}
+              onScrollState={(top, line) => scrollStore.set(path, { top, line })}
+            />
+          ) : mdMode === "block" ? (
+            /* 中大 md：分段渲染（只挂载视口内的 token 块） */
+            <MdBlockPreview
+              ref={mdBlockRef}
+              content={buf.content}
+              onClick={onPreviewClick}
+              initial={scrollStore.get(path)}
+              onScrollState={(top) => scrollStore.set(path, { top })}
+            />
+          ) : (
+            <div
+              ref={(el) => {
+                scrollRef.current = el;
+              }}
+              onScroll={onScroll}
+              className="md-preview min-h-0 flex-1 overflow-y-auto p-4 text-[13px] text-[var(--text)]"
+              onClick={onPreviewClick}
+              dangerouslySetInnerHTML={{ __html: html }}
+            />
+          )
         ) : (
-          <div
-            ref={(el) => {
-              scrollRef.current = el;
-            }}
-            onScroll={onScroll}
-            className="md-preview min-h-0 flex-1 overflow-y-auto p-4 text-[13px] text-[var(--text)]"
-            onClick={onPreviewClick}
-            dangerouslySetInnerHTML={{ __html: html }}
+          /* plan-3：代码 / 纯文本共用等高行虚拟预览（content 在内存给内存源；
+             viewable 大文件给 undefined 走分片句柄）。位置记忆走决策 4 = C 双语义 */
+          <LinePreview
+            path={path}
+            content={buf.viewable ? undefined : buf.content}
+            lang={isCode ? langForPath(path) : null}
+            initial={scrollStore.get(path)}
+            onScrollState={(top, line) => scrollStore.set(path, { top, line })}
           />
         )
       ) : (
@@ -597,6 +693,15 @@ export default function DockEditor(
           spellCheck={false}
           style={{ fontFamily: "var(--app-font)" }}
           className="min-h-0 flex-1 resize-none border-0 bg-[var(--bg)] p-3 text-[13px] leading-relaxed text-[var(--text)] outline-none"
+        />
+      )}
+      {editAnywayAsk && (
+        <ConfirmModal
+          title="以编辑模式加载大文件？"
+          message={`此文件约 ${(((buf.sizeBytes ?? 0) / 1024 / 1024) || 0).toFixed(1)} MB，超出编辑上限（${getSettings().maxEditMB} MB）。全量载入编辑器后输入与保存可能明显卡顿；确认后将退出只读虚拟预览。`}
+          confirmText="仍要编辑"
+          onConfirm={forceEditAnyway}
+          onClose={() => setEditAnywayAsk(false)}
         />
       )}
     </div>

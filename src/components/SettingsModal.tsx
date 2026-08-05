@@ -7,6 +7,7 @@ import { countWorkspaceFiles } from "../catalog";
 import ConnectionSettings from "./ConnectionSettings";
 import AgentSettings from "./AgentSettings";
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import { checkForUpdateDetailed, type Update } from "../updater";
 import { useMaskDismiss } from "./ui/maskDismiss";
 import {
@@ -306,6 +307,18 @@ export default function SettingsModal({
     }
   };
 
+  // plan-5：只读预览可打开上限（与编辑上限语义拆分，双阈值各自可调）
+  const [openMbDraft, setOpenMbDraft] = useState(String(s.maxOpenMB));
+  const commitOpenMb = () => {
+    const n = Math.round(Number(openMbDraft));
+    if (Number.isFinite(n) && n >= 16) {
+      setSetting("maxOpenMB", n);
+      setOpenMbDraft(String(n));
+    } else {
+      setOpenMbDraft(String(s.maxOpenMB)); // 非法输入回退到当前值
+    }
+  };
+
   // Skill 候选：统一有序列表（预设+自定义）拖拽排序 = 优先级；勾选=参与 fallback
   const [entries, setEntries] = useState<SkillRootEntry[]>(() => loadSkillRootEntries(root));
   const [customDraft, setCustomDraft] = useState("");
@@ -481,6 +494,17 @@ export default function SettingsModal({
                   on={s.autoRelay}
                   onChange={(v) => setSetting("autoRelay", v)}
                 />
+                <ToggleRow
+                  title="全局截图快捷键"
+                  desc="开启后可用 Ctrl+Shift+A 框选截图到剪贴板；关闭则注销该热键（与飞书等软件的同键冲突时可关掉让出）"
+                  on={s.screenshotHotkey}
+                  onChange={(v) => {
+                    setSetting("screenshotHotkey", v);
+                    void invoke("set_screenshot_hotkey_enabled", { enabled: v }).catch(() => {
+                      /* 失败时后端会 emit screenshot-hotkey-failed；开关状态仍按用户选择持久化 */
+                    });
+                  }}
+                />
                 <ActionRow
                   title="检查更新"
                   desc={appVer ? `当前版本 v${appVer} · 手动向更新源查询新版本` : "手动向更新源查询新版本"}
@@ -572,13 +596,29 @@ export default function SettingsModal({
                 />
                 <NumberField
                   title="文件编辑大小上限"
-                  desc="编辑器可打开的最大文件体积（MB）；过大文件编辑可能卡顿，建议 ≤ 20。默认 10"
+                  desc="以编辑模式直接打开的最大文件体积（MB）；超出后自动转为只读虚拟预览，可从预览提示条显式进入编辑。默认 10"
                   min={1}
                   step={1}
                   draft={editMbDraft}
                   setDraft={setEditMbDraft}
                   commit={commitEditMb}
                   hint="MB · 对新打开的文件生效"
+                />
+                <NumberField
+                  title="只读预览可打开上限"
+                  desc="只读虚拟预览可打开的最大文件体积（MB）；超出则拒绝打开。上限主要受行索引内存约束（约 8 字节/行）。默认 512"
+                  min={16}
+                  step={16}
+                  draft={openMbDraft}
+                  setDraft={setOpenMbDraft}
+                  commit={commitOpenMb}
+                  hint="MB · 对新打开的文件生效"
+                />
+                <ToggleRow
+                  title="纯文本默认编辑态"
+                  desc="开（默认）：.txt / .log 等纯文本打开直接可编辑（旧行为）；关：与代码、Markdown 一致默认进只读预览"
+                  on={s.plainTextDefaultEdit}
+                  onChange={(v) => setSetting("plainTextDefaultEdit", v)}
                 />
               </div>
             )}

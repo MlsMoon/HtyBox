@@ -201,6 +201,12 @@ impl TerminalCore {
         Ok(())
     }
 
+    /// PTY 直接子进程 pid（Windows 上一般为 powershell.exe；其下再挂 claude.exe）。
+    pub fn pty_pid(&self, id: &str) -> Option<u32> {
+        let map = self.sessions.lock().ok()?;
+        map.get(id)?.child.process_id()
+    }
+
     /// 重命名（更新 meta.title）。
     pub fn rename(&self, id: &str, title: String) -> Result<(), String> {
         let map = self.sessions.lock().unwrap();

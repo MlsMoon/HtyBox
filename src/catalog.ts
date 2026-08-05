@@ -197,6 +197,24 @@ export const importMemoryArchive = (
 export const captureSessionIds = (agent: string, cwd: string, sinceMs: number) =>
   invoke<string[]>("capture_session_ids", { agent, cwd, sinceMs });
 
+/** 终端 PTY 直接子进程 pid（Windows 上多为 powershell）。 */
+export const terminalPtyPid = (id: string) =>
+  invoke<number | null>("terminal_pty_pid", { id });
+
+/** 按 PTY 精确认领：claude=sessions/<pid>.json；codex/cursor/kimi=子树进程创建时间↔会话 createdAt。 */
+export const mapAgentSessionsByPty = (
+  agent: string,
+  cwd: string,
+  sinceMs: number,
+  ptyPids: number[],
+) =>
+  invoke<Array<{ ptyPid: number; sessionId: string }>>("map_agent_sessions_by_pty", {
+    agent,
+    cwd,
+    sinceMs,
+    ptyPids,
+  });
+
 export const listProjects = () => invoke<ProjectRef[]>("list_projects");
 
 // ---- M8：Skill 上架/下架管理（工作区级） ----
@@ -264,14 +282,64 @@ export interface ReadTextResult {
   lossy: boolean;
   /** lossy 时供编辑器警告条显示的文案 */
   warning?: string;
+  /** 超出编辑上限但未超可打开上限：可走大文件只读虚拟预览（前端据此分流，不再死挡占位） */
+  viewable: boolean;
+  /** 文件字节数（前端据此决定是否提供「仍要编辑」入口） */
+  sizeBytes: number;
 }
-/** 读文本文件；forceLossy=疑似二进制时仍有损打开，maxBytes=编辑大小上限（缺省走后端默认 10MB）。 */
-export const readTextFile = (path: string, opts?: { forceLossy?: boolean; maxBytes?: number }) =>
+/** 读文本文件；forceLossy=疑似二进制时仍有损打开，maxBytes=编辑大小上限（缺省走后端默认 10MB），
+ *  maxOpenBytes=只读预览可打开上限（缺省 512MB，决定超编辑上限时 viewable 与否）。 */
+export const readTextFile = (
+  path: string,
+  opts?: { forceLossy?: boolean; maxBytes?: number; maxOpenBytes?: number },
+) =>
   invoke<ReadTextResult>("read_text_file", {
     path,
     forceLossy: opts?.forceLossy,
     maxBytes: opts?.maxBytes,
+    maxOpenBytes: opts?.maxOpenBytes,
   });
+
+// ---- plan-1：大文本分片读（流式行索引 + 按行范围取；只服务只读虚拟预览） ----
+export interface OpenTextDocResult {
+  /** false = 拒绝打开（reason 说明原因，canForce 表示可否强制有损重试） */
+  ok: boolean;
+  docId: number;
+  totalLines: number;
+  totalBytes: number;
+  lossy: boolean;
+  /** lossy 时供警告条显示的文案 */
+  warning?: string;
+  reason?: string;
+  canForce: boolean;
+  /** 首屏行（0 起，最多 200 行，省一次往返） */
+  headLines: string[];
+}
+export const openTextDocument = (
+  path: string,
+  opts?: { forceLossy?: boolean; maxOpenBytes?: number },
+) =>
+  invoke<OpenTextDocResult>("open_text_document", {
+    path,
+    forceLossy: opts?.forceLossy,
+    maxOpenBytes: opts?.maxOpenBytes,
+  });
+
+export interface ReadLinesResult {
+  lines: string[];
+  startLine: number;
+  /** 本次返回已含最后一行 */
+  eof: boolean;
+}
+export const readTextLines = (docId: number, startLine: number, count: number) =>
+  invoke<ReadLinesResult>("read_text_lines", { docId, startLine, count });
+
+/** 释放文档句柄（面板卸载时调用；漏调由 Rust 侧 LRU 上限兜底）。 */
+export const closeTextDocument = (docId: number) =>
+  invoke<void>("close_text_document", { docId });
+
+/** 句柄失效错误判定（Rust DOC_INVALID_PREFIX 对应物）：外部修改/句柄被回收 → 调用方应重新 open。 */
+export const isDocInvalidError = (e: unknown) => String(e).startsWith("doc-invalid: ");
 export const writeTextFile = (path: string, content: string) =>
   invoke<void>("write_text_file", { path, content });
 /** md 预览的相对链接解析：判断路径是否为已存在的文件（目录返回 false）。 */

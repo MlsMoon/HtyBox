@@ -1,6 +1,6 @@
 // 按扩展名给出的文件类型徽章图标（实心彩色圆角方块 + 白色符号）。
 // 主窗终端 dock 的 Tab 与内容预览窗口的 Tab 共用同一套，避免两处各画一份导致风格漂移。
-import { CODE_RE, IMAGE_RE, MD_RE, SVG_RE } from "../../fileKinds";
+import { CODE_RE, IMAGE_RE, MD_RE, SVG_RE, TEXT_RE } from "../../fileKinds";
 
 export default function FileTypeIcon({ path, className }: { path: string; className?: string }) {
   const cls = className ?? "h-[15px] w-[15px] shrink-0";
@@ -37,6 +37,16 @@ export default function FileTypeIcon({ path, className }: { path: string; classN
         <polyline points="9 8.5 6 12 9 15.5" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
         <polyline points="15 8.5 18 12 15 15.5" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
         <line x1="13.2" y1="7.6" x2="10.8" y2="16.4" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" />
+      </svg>
+    );
+  // 纯文本（txt/log/csv…，plan-3 新增类别）：茶棕底 + 文档行，与灰色「未知类型」兜底区分
+  if (TEXT_RE.test(path))
+    return (
+      <svg className={cls} viewBox="0 0 24 24">
+        <rect x="2" y="3.5" width="20" height="17" rx="5" fill="#b0803c" />
+        <line x1="6.5" y1="8.8" x2="17.5" y2="8.8" stroke="#fff" strokeWidth="1.6" strokeLinecap="round" />
+        <line x1="6.5" y1="12" x2="17.5" y2="12" stroke="#fff" strokeWidth="1.6" strokeLinecap="round" />
+        <line x1="6.5" y1="15.2" x2="12.5" y2="15.2" stroke="#fff" strokeWidth="1.6" strokeLinecap="round" />
       </svg>
     );
   return (

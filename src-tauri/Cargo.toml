@@ -1,9 +1,11 @@
 [package]
 name = "htybox-app"
-version = "1.12.4"
+version = "1.13.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
+# plan-1 新增独立验证 bin（large_text_probe）后 cargo run 需要显式默认二进制
+default-run = "htybox-app"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
