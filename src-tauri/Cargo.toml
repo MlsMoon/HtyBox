@@ -1,6 +1,6 @@
 [package]
 name = "htybox-app"
-version = "1.12.3"
+version = "1.12.4"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -45,6 +45,7 @@ futures-util = "0.3.32"
 htybox-link = { path = "../../HtyBox_link/crates/htybox-link" }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 tokio-tungstenite = "0.29" # L4: relay 反连客户端（控制+数据 socket）；默认特性 connect+handshake（ws://），rustls 留部署(决策4修正)
+tauri-plugin-global-shortcut = "2.3.2"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"

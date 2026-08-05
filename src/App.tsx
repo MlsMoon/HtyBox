@@ -8,6 +8,7 @@ import SettingsModal from "./components/SettingsModal";
 import CollabModal from "./components/CollabModal";
 import WakeToasts from "./components/WakeToasts";
 import PasteBusyToast from "./components/PasteBusyToast";
+import ScreenshotToast from "./components/ScreenshotToast";
 import QuickOpen from "./components/QuickOpen";
 import WindowControls from "./components/WindowControls";
 import BookmarkBar from "./components/BookmarkBar";
@@ -685,6 +686,7 @@ export default function App() {
       {/* M7-B 半自动唤醒提示（全局监听 broker 的 agent-wake） */}
       <WakeToasts />
       <PasteBusyToast />
+      <ScreenshotToast />
     </div>
   );
 }

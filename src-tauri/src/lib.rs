@@ -10,6 +10,7 @@ mod pty;
 mod relay_client;
 mod session_import;
 mod session_transfer;
+mod screenshot;
 mod sessions;
 mod terminal_core;
 mod watcher;
@@ -1070,17 +1071,42 @@ fn agent_exited(state: State<'_, AppState>, token: String) {
     state.broker.unregister(&token);
 }
 
+/// 读 JSON 配置对象：文件不存在 → 空对象；**存在但解析失败 → 改名 `.bak` 后重建**。
+///
+/// 绝不把解析失败当空对象直接重建 —— 这些配置是**跨 agent 共享文件**，同一份 `.mcp.json`
+/// 还有别的自动写入者（Unity 侧 EditorMcpKit 写 `hty-unity-mcp-kit`、Hephaestus BugFixDaemon
+/// 写 `unity-editor`），用户也可能手写其它 server。静默重建会连带抹掉这些条目且无从恢复；
+/// 改名保留原文件，至少可人工找回。
+fn load_json_object_or_backup(path: &std::path::Path) -> serde_json::Value {
+    let text = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return serde_json::json!({}), // 不存在 = 正常首次创建
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) if v.is_object() => v,
+        _ => {
+            let _ = std::fs::rename(path, path.with_extension("bak"));
+            serde_json::json!({})
+        }
+    }
+}
+
+/// 原子落盘：先写同目录 `.tmp`，再 rename 覆盖目标（Windows 上 rename 覆盖是原子的）。
+///
+/// 直接 `fs::write` 会留下「文件已截断、内容只写了一半」的时间窗；这些配置被多方并发读写，
+/// 他方恰在此刻读到就会判定损坏并重建，从而丢掉全部条目。rename 保证读者要么看到旧版、
+/// 要么看到新版，不存在中间态。
+fn write_atomic(path: &std::path::Path, content: &str) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
 /// 把 htybox 这个 MCP server **合并**进 `<cwd>/.mcp.json`（保留用户已有的 server，如 unity-mcp）。
 /// 用 `${HTYBOX_MCP_TOKEN}` 占位，token 由每个终端进程的环境变量提供 → 一份配置可区分多 agent。
 fn write_mcp_json(cwd: &str, url: &str) -> Result<(), String> {
     let path = std::path::Path::new(cwd).join(".mcp.json");
-    let mut root: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
+    let mut root = load_json_object_or_backup(&path);
     let obj = root.as_object_mut().unwrap();
     let servers = obj
         .entry("mcpServers")
@@ -1097,7 +1123,7 @@ fn write_mcp_json(cwd: &str, url: &str) -> Result<(), String> {
         }),
     );
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    std::fs::write(&path, pretty).map_err(|e| e.to_string())
+    write_atomic(&path, &pretty)
 }
 
 /// 把 htybox 这个 MCP server **合并**进 `<cwd>/.codex/config.toml`（保留用户已有配置）。
@@ -1106,10 +1132,17 @@ fn write_mcp_json(cwd: &str, url: &str) -> Result<(), String> {
 fn write_codex_config(cwd: &str, url: &str) -> Result<(), String> {
     let dir = std::path::Path::new(cwd).join(".codex");
     let path = dir.join("config.toml");
-    let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
-        .unwrap_or_default();
+    // 同 load_json_object_or_backup 的理由：解析失败改名 .bak 保留原文件，不静默重建
+    let mut doc: toml_edit::DocumentMut = match std::fs::read_to_string(&path) {
+        Ok(s) => match s.parse::<toml_edit::DocumentMut>() {
+            Ok(d) => d,
+            Err(_) => {
+                let _ = std::fs::rename(&path, path.with_extension("bak"));
+                toml_edit::DocumentMut::default()
+            }
+        },
+        Err(_) => toml_edit::DocumentMut::default(),
+    };
 
     let root = doc.as_table_mut();
     if !root.contains_key("mcp_servers") {
@@ -1127,7 +1160,7 @@ fn write_codex_config(cwd: &str, url: &str) -> Result<(), String> {
     servers.insert("htybox", toml_edit::Item::Table(htybox));
 
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(&path, doc.to_string()).map_err(|e| e.to_string())
+    write_atomic(&path, &doc.to_string())
 }
 
 /// 把 htybox 这个 MCP server **合并**进 `<cwd>/.cursor/mcp.json`（保留用户已有配置）。
@@ -1139,13 +1172,7 @@ fn write_codex_config(cwd: &str, url: &str) -> Result<(), String> {
 fn write_cursor_config(cwd: &str, url: &str) -> Result<(), String> {
     let dir = std::path::Path::new(cwd).join(".cursor");
     let path = dir.join("mcp.json");
-    let mut root: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
+    let mut root = load_json_object_or_backup(&path);
     let obj = root.as_object_mut().unwrap();
     let servers = obj
         .entry("mcpServers")
@@ -1162,7 +1189,7 @@ fn write_cursor_config(cwd: &str, url: &str) -> Result<(), String> {
     );
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    std::fs::write(&path, pretty).map_err(|e| e.to_string())
+    write_atomic(&path, &pretty)
 }
 
 /// 把 htybox 这个 MCP server **合并**进 `<cwd>/.kimi-code/mcp.json`（保留用户已有配置）。
@@ -1171,13 +1198,7 @@ fn write_cursor_config(cwd: &str, url: &str) -> Result<(), String> {
 fn write_kimi_config(cwd: &str, url: &str) -> Result<(), String> {
     let dir = std::path::Path::new(cwd).join(".kimi-code");
     let path = dir.join("mcp.json");
-    let mut root: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
+    let mut root = load_json_object_or_backup(&path);
     let obj = root.as_object_mut().unwrap();
     let servers = obj
         .entry("mcpServers")
@@ -1194,7 +1215,7 @@ fn write_kimi_config(cwd: &str, url: &str) -> Result<(), String> {
     );
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    std::fs::write(&path, pretty).map_err(|e| e.to_string())
+    write_atomic(&path, &pretty)
 }
 
 /// M7-A：注册一个 agent（token→身份）并把 htybox 合并进该 cwd 的 .mcp.json。
@@ -1306,6 +1327,27 @@ pub fn run() {
                 &identity_for_relay,
                 &workspaces_for_relay,
             );
+            // 全局框选截图：Ctrl+Shift+A → 系统 Screen Snipping → 剪贴板（注册失败不阻断启动）
+            {
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+                if let Err(e) = app.handle().plugin(
+                    tauri_plugin_global_shortcut::Builder::new()
+                        .with_handler(|app, _shortcut, event| {
+                            if event.state == ShortcutState::Pressed {
+                                screenshot::on_hotkey(app);
+                            }
+                        })
+                        .build(),
+                ) {
+                    eprintln!("[screenshot] global-shortcut plugin init failed: {e}");
+                    let _ = app.emit("screenshot-hotkey-failed", ());
+                } else if let Err(e) = app.global_shortcut().register("ctrl+shift+a") {
+                    eprintln!("[screenshot] Ctrl+Shift+A register failed: {e}");
+                    let _ = app.emit("screenshot-hotkey-failed", ());
+                } else {
+                    eprintln!("[screenshot] Ctrl+Shift+A registered");
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
