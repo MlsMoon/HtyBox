@@ -80,6 +80,7 @@ import type { RunConfig } from "../runConfigs";
 import WorkflowBar from "./WorkflowBar";
 import WorkflowPicker from "./WorkflowPicker";
 import ConfirmModal from "./ui/ConfirmModal";
+import { clearFreeInput, emitTermInputHotkey } from "./termInput/freeInputState";
 import { MENU_SEP, type MenuItem } from "./ui/ContextMenu";
 import {
   clearRun,
@@ -684,6 +685,16 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     const actSub = apiRef.current.onDidActiveChange(grabFocus);
     const visFocusSub = apiRef.current.onDidVisibilityChange(grabFocus);
 
+    // Ctrl+Shift+I：仅当前活动终端面板唤起内置输入（自由输入切换 / 工作流输入展开）
+    const onHotkey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey && e.shiftKey && !e.altKey && (e.key === "I" || e.key === "i"))) return;
+      if (!apiRef.current.isActive || !apiRef.current.isVisible) return;
+      e.preventDefault();
+      e.stopPropagation();
+      emitTermInputHotkey(termId);
+    };
+    window.addEventListener("keydown", onHotkey, true);
+
     // 程序设置终端标题(OSC)时：记下原始标题(含状态前缀)并刷新 Tab。
     setEngineTitleHandler(termId, (t) => {
       const raw = t.trim();
@@ -769,6 +780,7 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
       c.removeEventListener("dragover", onDragOver);
       c.removeEventListener("dragleave", onDragLeave);
       c.removeEventListener("drop", onDrop);
+      window.removeEventListener("keydown", onHotkey, true);
       dimSub.dispose();
       visSub.dispose();
       actSub.dispose();
@@ -958,6 +970,7 @@ export default function TerminalDock({
         }
         markTerminalClosed(termId); // M7-H：主动关闭 → 其 PTY 退出事件不当崩溃
         clearTerm(termId); // 清运行状态总线（agentStatus 三态）
+        clearFreeInput(termId); // 清无工作流自由输入展开态
         abortSessionCapture(termId);
         // 工作区关闭中：引擎已由 disposeByPrefix 统一结束，且要保留布局/自定义名供复原 → 跳过
         if (CLOSING.has(workspaceId)) return;

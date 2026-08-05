@@ -146,10 +146,6 @@ export default function FlowPanel({
           <div className="px-1 py-3 text-center text-[11px] text-[var(--text-3)]">还没有工作流</div>
         )}
       </div>
-      <div className="px-1 pt-2 text-[9.5px] text-[var(--text-3)]">
-        拖拽卡片到终端即可应用 ↗ · 终端 Tab 右键、工具栏 flow ▾ 也可
-      </div>
-
       {/* 进行中（本工作区实例总览） */}
       {runEntries.length > 0 && (
         <>

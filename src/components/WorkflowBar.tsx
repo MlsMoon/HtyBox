@@ -23,13 +23,41 @@ import {
   beginClipboardPasteBusy,
   endClipboardPasteBusy,
 } from "../clipboardPasteBusy";
+import TermInputShell, { DRAG_MIME } from "./termInput/TermInputShell";
+import SlashSkillMenu from "./termInput/SlashSkillMenu";
+import { useSlashSkills } from "./termInput/useSlashSkills";
+import {
+  isFreeInputOpen,
+  onFreeInputChange,
+  onTermInputHotkey,
+  setFreeInputOpen,
+  toggleFreeInput,
+} from "./termInput/freeInputState";
+import {
+  handleInputStashKey,
+  takeStash,
+  useLeftCtrlHeld,
+  type StashMap,
+} from "./termInput/inputStash";
 
-// 终端底部工作流面板：进度 strip（常驻）+ 大输入框（人工阶段自动展开 / ✎ 手动开关）+
-// 收起态右下角浮标。配色用终端暗区固定值（面板随终端底 #1f1e1d，不随奶油/暗主题切换）。
-// 注入/发送均走 write_terminal 立即写入（计划决策 3=A，与拖拽注入同路径）。
+// 终端底部：工作流进度 strip + CLI 双线输入（人工阶段 / ✎ / 无工作流自由输入）+ 斜杠 Skill 补全。
+// 配色用终端暗区固定值。注入/发送走 injectAndSubmit。
 
-const OK_GREEN = "#2fa35e"; // 项目既有徽标绿（user 来源徽标同款）
-const DRAG_MIME = "application/x-htybox-item"; // 与终端/各左栏拖拽源同款载荷键
+const OK_GREEN = "#2fa35e";
+const FIELD_DRAFT = "draft";
+
+function applyCaret(
+  setText: (t: string) => void,
+  ta: HTMLTextAreaElement | null | undefined,
+  next: { text: string; cursor: number },
+) {
+  setText(next.text);
+  requestAnimationFrame(() => {
+    if (!ta) return;
+    ta.focus();
+    ta.setSelectionRange(next.cursor, next.cursor);
+  });
+}
 
 function FlowGlyph({ className }: { className?: string }) {
   return (
@@ -42,7 +70,6 @@ function FlowGlyph({ className }: { className?: string }) {
   );
 }
 
-/** stepper 单点：done ✓ / active 圈 / skipped 灰圈斜杠 / pending 灰点。pulse=自动执行中当前点脉冲。 */
 function StageDot({ state, title, green, pulse }: { state: string; title: string; green: boolean; pulse?: boolean }) {
   const accent = green ? OK_GREEN : "var(--accent)";
   if (state === "done")
@@ -83,85 +110,253 @@ export default function WorkflowBar({
 }: {
   termId: string;
   cwd?: string;
-  agentKind?: AgentKind; // 目标终端 agent 类型：拖拽注入按它算引用形态（skill=/名 或 @路径）
+  agentKind?: AgentKind;
 }) {
   const run = useRun(termId);
   const settings = useSettings();
+  const slash = useSlashSkills(cwd, agentKind);
   const [running, setRunning] = useState(() => isTermRunning(termId));
-  const [inputOverride, setInputOverride] = useState<boolean | null>(null); // null=跟随阶段类型
+  const [inputOverride, setInputOverride] = useState<boolean | null>(null);
   const [draft, setDraft] = useState("");
-  const [dragOver, setDragOver] = useState(false); // 左栏项拖到输入框上方时的高亮
-  // 图片附件（真实模型）：粘贴的截图先存 temp png 暂存在此、不进终端；Enter 发送时才与文字
-  // 一起注入。附件状态完全归 HtyBox 所有——可见可删（删=真删临时文件），不存在"终端里删了
-  // 但提示不同步"的脱钩（此前"立即注入+本地计数"方案的缺陷，用户打回）。
+  const [dragOver, setDragOver] = useState(false);
   const [attachments, setAttachments] = useState<string[]>([]);
-  // 多段人工阶段：每个人工片段各自的输入（文字 + 粘贴的截图附件），键=片段 id。瞬态（决策 3-A）。
   const [segInputs, setSegInputs] = useState<Record<string, { text: string; atts: string[] }>>({});
-  const [dragSeg, setDragSeg] = useState<string | null>(null); // 内联填空：拖拽悬停的目标人工片段 id（落点高亮）
+  const [dragSeg, setDragSeg] = useState<string | null>(null);
   const [confirmUnbind, setConfirmUnbind] = useState(false);
+  const [freeOpen, setFreeOpen] = useState(() => isFreeInputOpen(termId));
+  const [caret, setCaret] = useState(0);
+  const [activeSeg, setActiveSeg] = useState<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
-  const ranThisStage = useRef(false); // 本阶段注入后 agent 是否跑起来过（区分"未开跑"与"已静默"）
-  const autoExecRef = useRef(-1); // 自动模式：已自动执行过的阶段下标（防重复注入）
-  const autoAdvRef = useRef(-1); // 自动模式：已自动推进过的阶段下标（防重复推进）
+  const ranThisStage = useRef(false);
+  const autoExecRef = useRef(-1);
+  const autoAdvRef = useRef(-1);
+  const stashRef = useRef<StashMap>({});
+  const leftCtrl = useLeftCtrlHeld();
+  const [, setStashRev] = useState(0); // 暂存槽变化时重渲（徽标）
+  const touchStash = () => setStashRev((n) => n + 1);
+  const isStashed = (fieldId: string) => fieldId in stashRef.current;
+  const onStashKey = (
+    e: React.KeyboardEvent,
+    fieldId: string,
+    text: string,
+    setText: (t: string) => void,
+  ) => {
+    if (handleInputStashKey(e, leftCtrl.current, fieldId, text, stashRef.current, setText)) {
+      touchStash();
+      return true;
+    }
+    return false;
+  };
 
   useEffect(() => {
     setRunning(isTermRunning(termId));
     return onAgentStatusChange(() => setRunning(isTermRunning(termId)));
   }, [termId]);
 
-  const cursor = run?.cursor ?? -1;
-  // 进入新阶段：输入框回到自动逻辑、清"跑过"标记 + 清自动 guard（附件同 draft：属"待发送内容"，不随阶段清）
+  useEffect(() => {
+    setFreeOpen(isFreeInputOpen(termId));
+    return onFreeInputChange(() => setFreeOpen(isFreeInputOpen(termId)));
+  }, [termId]);
+
+  // 自由输入展开后聚焦（等 TermInputShell 挂载）
+  useEffect(() => {
+    if (!run && freeOpen) requestAnimationFrame(() => taRef.current?.focus());
+  }, [run, freeOpen]);
+
+  // 快捷键：无 run → 切换自由输入；有 run → 展开输入并聚焦
+  useEffect(() => {
+    return onTermInputHotkey((id) => {
+      if (id !== termId) return;
+      if (!run) {
+        toggleFreeInput(termId);
+        return;
+      }
+      setInputOverride(true);
+      requestAnimationFrame(() => taRef.current?.focus());
+    });
+  }, [termId, run]);
+
+  const stageCursor = run?.cursor ?? -1;
   useEffect(() => {
     setInputOverride(null);
     ranThisStage.current = false;
     autoExecRef.current = -1;
     autoAdvRef.current = -1;
-    setSegInputs({}); // 进新阶段清各人工片段输入（瞬态）
-  }, [cursor, termId]);
+    setSegInputs({});
+    stashRef.current = {}; // 换阶段/终端：丢弃未消费的暂存
+    setStashRev((n) => n + 1);
+  }, [stageCursor, termId]);
   useEffect(() => {
     if (running) ranThisStage.current = true;
   }, [running]);
 
-  // 自动执行 driver：注入阶段跑完静默即自动推进下一阶段；遇人工阶段不自动执行（自然暂停）。
-  // 复用现有回合结束判据（injected && !running && ranThisStage，见"已静默可确认"）；guard 按阶段下标防重入。
   useEffect(() => {
     if (!run || !run.auto) return;
     const idx = run.cursor;
-    if (idx >= run.stages.length) return; // 已完成
+    if (idx >= run.stages.length) return;
     const st = run.states[idx];
     const s = run.stages[idx];
     if (st === "active" && !hasManual(s)) {
-      // 纯注入阶段（无人工片段）才自动执行；含人工片段=暂停点，等用户填写发送
-      if (autoExecRef.current === idx) return; // 本阶段已自动执行
+      if (autoExecRef.current === idx) return;
       autoExecRef.current = idx;
       const t = window.setTimeout(() => {
         injectAndSubmit(termId, injectOnlyText(s), !!s.pressEnter);
         focusEngine(termId);
         markInjected(termId);
-      }, 120); // 小延时让上一阶段静默/终端就绪，避免抖动
+      }, 120);
       return () => window.clearTimeout(t);
     }
     if (st === "injected" && !running && ranThisStage.current) {
-      if (autoAdvRef.current === idx) return; // 本阶段已自动推进
+      if (autoAdvRef.current === idx) return;
       autoAdvRef.current = idx;
       advanceRun(termId);
     }
   }, [run, running, termId]);
 
-  if (!run || !settings.showWorkflowPanel) return null;
+  const syncCaret = (text: string, el: HTMLTextAreaElement, segId: string | null) => {
+    const c = el.selectionStart ?? text.length;
+    setCaret(c);
+    setActiveSeg(segId);
+    slash.onCursor(text, c);
+  };
+
+  const slashMenu = (text: string, onApply: (next: { text: string; cursor: number }) => void) => {
+    const st = slash.menuFor(text, caret);
+    if (!st) return null;
+    return (
+      <SlashSkillMenu
+        skills={st.list}
+        selected={st.selected}
+        onSelect={slash.setSel}
+        onPick={(s) => onApply(slash.applyComplete(text, caret, s))}
+      />
+    );
+  };
+
+  // ── 无工作流：自由输入（不受 showWorkflowPanel 约束）──
+  if (!run) {
+    const sendFree = () => {
+      const t = draft.replace(/\r?\n/g, " ").trim();
+      if (!t && attachments.length === 0) return;
+      const refs = attachments.map((p) => "@" + p).join(" ");
+      injectAndSubmit(termId, [refs, t].filter(Boolean).join(" "), true);
+      setAttachments([]);
+      const restored = takeStash(stashRef.current, FIELD_DRAFT);
+      setDraft(restored ?? "");
+      touchStash();
+      taRef.current?.focus();
+    };
+    const pasteImageProbe = () => {
+      if (!cwd) return;
+      const fwd = () => {
+        beginClipboardPasteBusy();
+        invoke<string>("save_clipboard_image", { workspaceDir: cwd })
+          .then((p) => setAttachments((a) => [...a, p]))
+          .catch(() => {})
+          .finally(() => endClipboardPasteBusy());
+      };
+      navigator.clipboard
+        ?.readText()
+        .then((raw) => {
+          if (!raw) fwd();
+        })
+        .catch(fwd);
+    };
+    const onInputDrop = (e: React.DragEvent) => {
+      const raw = e.dataTransfer.getData(DRAG_MIME);
+      if (!raw) return;
+      e.preventDefault();
+      try {
+        const item = JSON.parse(raw) as DragItem;
+        if (item.kind === "workflow") return;
+        const ref = injectText(item, agentKind ?? "shell");
+        if (!ref) return;
+        setDraft((d) => (!d ? ref : /\s$/.test(d) ? d + ref : d + " " + ref));
+        taRef.current?.focus();
+      } catch {
+        /* ignore */
+      }
+    };
+    if (!freeOpen) {
+      return (
+        <button
+          type="button"
+          onClick={() => {
+            setFreeInputOpen(termId, true);
+            requestAnimationFrame(() => taRef.current?.focus());
+          }}
+          title="打开内置输入（Ctrl+Shift+I）"
+          className="absolute bottom-3 right-4 z-10 flex items-center gap-1.5 border border-[#3a3631] bg-[#292623]/95 px-3 py-1 text-[10px] font-bold text-[var(--accent)] shadow-lg hover:border-[var(--accent)]"
+        >
+          ✎ 输入
+        </button>
+      );
+    }
+
+    return (
+      <div className="relative z-10 shrink-0 border-t border-[#3a3631] bg-[#292623]">
+        <TermInputShell
+          title="自由输入"
+          stashed={isStashed(FIELD_DRAFT)}
+          value={draft}
+          onChange={setDraft}
+          onCaret={(v, el) => syncCaret(v, el, null)}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (onStashKey(e, FIELD_DRAFT, draft, setDraft)) return;
+            const r = slash.handleKey(e, draft);
+            if (r.handled) {
+              if (r.next) applyCaret(setDraft, taRef.current, r.next);
+              return;
+            }
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              sendFree();
+              return;
+            }
+            if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
+          }}
+          placeholder="向 AI 描述本轮需求 / 问题背景…"
+          dragOver={dragOver}
+          setDragOver={setDragOver}
+          textareaRef={taRef}
+          attachments={attachments}
+          onRemoveAttachment={(p) => {
+            setAttachments((a) => a.filter((x) => x !== p));
+            deleteEntry(p).catch(() => {});
+          }}
+          onDropItem={onInputDrop}
+          menu={slashMenu(draft, (next) => applyCaret(setDraft, taRef.current, next))}
+        />
+        <div className="flex h-[28px] items-center justify-end gap-2 bg-[#24211e] px-3">
+          <button
+            type="button"
+            onClick={() => setFreeInputOpen(termId, false)}
+            title="收起输入框"
+            className="flex h-6 w-6 items-center justify-center border border-[#3a3631] text-[#8c8a82] hover:text-[#e5e2dc]"
+          >
+            <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // 有工作流但不显示面板 → 整组件隐藏（自由输入与此解耦，上面已 return）
+  if (!settings.showWorkflowPanel) return null;
 
   const total = run.stages.length;
   const done = isRunDone(run);
   const cur = done ? undefined : run.stages[run.cursor];
   const curState = done ? undefined : run.states[run.cursor];
   const stepNo = Math.min(run.cursor + 1, total);
-  const autoOn = !!run.auto; // 自动执行模式开
-  const autoPaused = autoOn && !done && !!cur && hasManual(cur); // 自动开但停在含人工片段的阶段
-  const autoRunning = autoOn && !done && !autoPaused; // 自动开且正在自动接续（非暂停）
-  // 纯人工单片段=无拼接：退化为普通输入框，不显示"多段拼接"标签与拼接预览
+  const autoOn = !!run.auto;
+  const autoPaused = autoOn && !done && !!cur && hasManual(cur);
+  const autoRunning = autoOn && !done && !autoPaused;
   const plainManual = !!cur && cur.segments.length === 1 && cur.segments[0].kind === "manual";
 
-  // ── 收起态：右下角迷你浮标（absolute 于 DockTerminal 外层 relative 容器，不占 flex 高度）──
   if (run.collapsed) {
     return (
       <button
@@ -170,9 +365,7 @@ export default function WorkflowBar({
         className="absolute bottom-3 right-4 z-10 flex items-center gap-1.5 rounded-full border border-[#3a3631] bg-[#292623]/95 px-3 py-1 text-[10px] font-bold text-[var(--accent)] shadow-lg hover:border-[var(--accent)]"
       >
         <FlowGlyph className="h-3 w-3" />
-        <span style={done ? { color: OK_GREEN } : undefined}>
-          {done ? "✓" : `${stepNo}/${total}`}
-        </span>
+        <span style={done ? { color: OK_GREEN } : undefined}>{done ? "✓" : `${stepNo}/${total}`}</span>
         {running && (
           <span className="h-2.5 w-2.5 animate-spin rounded-full border-[1.5px] border-[var(--accent)] border-t-transparent" />
         )}
@@ -180,10 +373,8 @@ export default function WorkflowBar({
     );
   }
 
-  // ── 动作 ──
   const execStage = () => {
     if (!cur || curState !== "active" || hasManual(cur)) return;
-    // 纯注入阶段：全部注入片段按序拼接后一次提交（跨 agent 一致，见 injectAndSubmit）
     injectAndSubmit(termId, injectOnlyText(cur), !!cur.pressEnter);
     focusEngine(termId);
     markInjected(termId);
@@ -191,18 +382,15 @@ export default function WorkflowBar({
   const send = () => {
     const t = draft.replace(/\r?\n/g, " ").trim();
     if (!t && attachments.length === 0) return;
-    // 附件以 @路径 引用注入（与拖文件进终端同一语义），与文字拼一条消息提交
     const refs = attachments.map((p) => "@" + p).join(" ");
     injectAndSubmit(termId, [refs, t].filter(Boolean).join(" "), true);
-    // 自动模式：人工阶段发送后标记为已注入 → 其 agent 跑完静默即由 driver 自动推进续跑
     if (run.auto) markInjected(termId);
-    setDraft("");
     setAttachments([]);
-    taRef.current?.focus(); // 支持多轮往返，焦点留在输入框
+    const restored = takeStash(stashRef.current, FIELD_DRAFT);
+    setDraft(restored ?? "");
+    touchStash();
+    taRef.current?.focus();
   };
-  // 左栏 file/skill/memory/书签 拖进输入框：按目标 agent 算引用（skill=/名 或 @路径），
-  // 追加到 draft 末尾（空格分隔、不覆盖，遵 feedback_free_text_skill_append 与 appendInvokes 同款约定），
-  // 只"打出"不自动发送（撰写态，发送权交回用户）。workflow 项=绑定语义，撰写框不接。
   const onInputDrop = (e: React.DragEvent) => {
     setDragOver(false);
     const raw = e.dataTransfer.getData(DRAG_MIME);
@@ -219,18 +407,13 @@ export default function WorkflowBar({
       /* ignore */
     }
   };
-
-  // 粘贴图片/截图：后端把剪贴板位图存到 <工作区>/.htybox/tmp/clip-<ts>.png（真存储，48h 自动
-  // 清理），先作为附件暂存在输入框（可见可删），Enter 发送时才以 @路径 注入终端。
-  // readText 有文本 → 走 textarea 默认粘贴（不拦截）；空/异常（剪贴板为图片）→ 按图片处理。
-  // 注：0x16/win32 键盘注入均无法触发 claude 的原生粘图（ConPTY 探针实证），勿再走该路线。
   const pasteImageProbe = () => {
     if (!cwd) return;
     const fwd = () => {
       beginClipboardPasteBusy();
       invoke<string>("save_clipboard_image", { workspaceDir: cwd })
         .then((p) => setAttachments((a) => [...a, p]))
-        .catch(() => {}) // 剪贴板无图 → 静默
+        .catch(() => {})
         .finally(() => endClipboardPasteBusy());
     };
     navigator.clipboard
@@ -242,11 +425,9 @@ export default function WorkflowBar({
   };
   const removeAttachment = (p: string) => {
     setAttachments((a) => a.filter((x) => x !== p));
-    deleteEntry(p).catch(() => {}); // 真删临时文件；失败静默（48h 清理兜底）
+    deleteEntry(p).catch(() => {});
   };
-  const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
-  // ── 多段人工阶段：每个人工片段独立输入（文字 + 粘图），发送时按序拼接 ──
   const segVal = (id: string) => segInputs[id] ?? { text: "", atts: [] as string[] };
   const setSegText = (id: string, text: string) =>
     setSegInputs((m) => ({ ...m, [id]: { text, atts: m[id]?.atts ?? [] } }));
@@ -260,9 +441,8 @@ export default function WorkflowBar({
     setSegInputs((m) => ({ ...m, [id]: { text: m[id]?.text ?? "", atts: [...(m[id]?.atts ?? []), p] } }));
   const removeSegAtt = (id: string, p: string) => {
     setSegInputs((m) => ({ ...m, [id]: { text: m[id]?.text ?? "", atts: (m[id]?.atts ?? []).filter((x) => x !== p) } }));
-    deleteEntry(p).catch(() => {}); // 真删临时图片文件
+    deleteEntry(p).catch(() => {});
   };
-  // 按序拼接：inject 片段=固定文本；manual 片段=文字（压单行）+ 各图片 @路径（决策 2-A：文字→图片）
   const composeStage = (st: WorkflowStage): string =>
     st.segments
       .map((seg) =>
@@ -279,12 +459,18 @@ export default function WorkflowBar({
     const msg = composeStage(cur);
     if (!msg) return;
     injectAndSubmit(termId, msg, true);
-    if (run.auto) markInjected(termId); // 自动模式：发送后进 injected → 跑完静默由 driver 续跑
-    setSegInputs((m) => {
-      const n = { ...m };
-      cur.segments.forEach((seg) => delete n[seg.id]); // 清本阶段输入（图已交终端引用，不删文件）
+    if (run.auto) markInjected(termId);
+    // 发送后清片段；若片段有 LeftCtrl+S 暂存则还原文字
+    setSegInputs(() => {
+      const n: Record<string, { text: string; atts: string[] }> = {};
+      cur.segments.forEach((seg) => {
+        if (seg.kind !== "manual") return;
+        const restored = takeStash(stashRef.current, seg.id);
+        if (restored != null) n[seg.id] = { text: restored, atts: [] };
+      });
       return n;
     });
+    touchStash();
     focusEngine(termId);
   };
   const pasteImageToSeg = (id: string) => {
@@ -317,106 +503,86 @@ export default function WorkflowBar({
     }
   };
 
-  // 输入框显隐：手动覆盖优先，否则含人工片段的阶段自动展开
   const showInput = !done && (inputOverride ?? (!!cur && hasManual(cur)));
-
-  // 全部操作独立按钮直出（用户拍板：本面板不用弹出菜单）；小文字按钮统一灰系描边风格
   const ghostBtn =
     "shrink-0 rounded-md border border-[#3a3631] px-2 py-1 text-[10px] text-[#8c8a82] hover:border-[#8c8a82] hover:text-[#e5e2dc]";
 
+  const plainSegId = plainManual && cur ? cur.segments[0].id : null;
+  const plainText = plainSegId ? segVal(plainSegId).text : draft;
+  const setPlainText = (v: string) => {
+    if (plainSegId) setSegText(plainSegId, v);
+    else setDraft(v);
+  };
+
   return (
     <div className="relative z-10 shrink-0 border-t border-[#3a3631] bg-[#292623]">
-      {/* 自动执行中：顶边流光条（陶土渐变流动，读作"自动接续在流动"） */}
       {autoRunning && (
         <div className="htybox-auto-flow pointer-events-none absolute inset-x-0 top-0 z-20 h-[3px]" />
       )}
-      {/* ── 大输入框区（人工阶段自动展开 / ✎ 手动开关） ── */}
+
       {showInput && cur && (
-        <div className="px-3 pb-2 pt-2">
+        <>
           {autoPaused && (
-            <div className="mb-2 flex items-center gap-1.5 rounded-lg border border-[#6b4d38] bg-[#2e241d] px-2.5 py-1.5 text-[10px]">
+            <div className="mx-3 mt-2 flex items-center gap-1.5 border border-[#6b4d38] bg-[#2e241d] px-2.5 py-1.5 text-[10px]">
               <span className="shrink-0 font-bold text-[var(--accent)]">⏸ 自动已暂停</span>
               <span className="truncate text-[#e5e2dc]">当前人工阶段，填写后发送 —— 自动将继续接续后续阶段</span>
             </div>
           )}
-          <div className="flex items-center gap-1.5 pb-1.5 text-[10px] text-[#8c8a82]">
-            <span>✎</span>
-            <span className="shrink-0 font-semibold text-[#e5e2dc]">{cur.name}</span>
-            {hasManual(cur) && !plainManual && (
-              <span className="shrink-0 rounded-full bg-[#3a2a22] px-1.5 py-0.5 text-[9px] font-bold text-[var(--accent)]">多段拼接</span>
-            )}
-            <span className="ml-auto shrink-0">输入将发送到该终端</span>
-          </div>
+
           {hasManual(cur) ? (
-            plainManual ? (
-              /* 纯人工·单片段（无拼接）：普通输入框，不显示拼接预览 */
-              <>
-                <div
-                  className="relative"
-                  onDragOver={(e) => {
-                    if (!e.dataTransfer.types.includes(DRAG_MIME)) return;
+            plainManual && plainSegId ? (
+              <TermInputShell
+                title={cur.name}
+                stashed={isStashed(plainSegId)}
+                value={plainText}
+                onChange={setPlainText}
+                onCaret={(v, el) => syncCaret(v, el, plainSegId)}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (onStashKey(e, plainSegId, plainText, (t) => setSegText(plainSegId, t))) return;
+                  const r = slash.handleKey(e, plainText);
+                  if (r.handled) {
+                    if (r.next) applyCaret((t) => setSegText(plainSegId, t), taRef.current, r.next);
+                    return;
+                  }
+                  if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    e.dataTransfer.dropEffect = "copy";
-                    if (!dragOver) setDragOver(true);
-                  }}
-                  onDragLeave={(e) => {
-                    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false);
-                  }}
-                  onDrop={(e) => {
-                    setDragOver(false);
-                    onSegDrop(cur.segments[0].id, e);
-                  }}
-                >
-                  <textarea
-                    value={segVal(cur.segments[0].id).text}
-                    rows={3}
-                    onChange={(e) => setSegText(cur.segments[0].id, e.target.value)}
-                    onKeyDown={(e) => {
-                      e.stopPropagation();
-                      if (e.key === "Enter" && !e.shiftKey) {
-                        e.preventDefault();
-                        sendStage();
-                        return;
-                      }
-                      if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageToSeg(cur.segments[0].id);
-                    }}
-                    placeholder={cur.segments[0].text || "输入内容，Enter 发送到终端…"}
-                    className={
-                      "w-full resize-none rounded-xl border bg-[#1f1e1d] px-3 py-2 pr-12 text-[12px] leading-relaxed text-[#e5e2dc] outline-none transition-colors placeholder:text-[#8c8a82]/60 " +
-                      (dragOver ? "border-[var(--accent)] ring-2 ring-[var(--accent)]/40" : "border-[var(--accent)]/60 focus:border-[var(--accent)]")
-                    }
-                  />
-                  <button
-                    onClick={sendStage}
-                    title="发送到终端（Enter）"
-                    className="absolute bottom-3 right-2.5 flex h-7 w-7 items-center justify-center rounded-full bg-[var(--accent)] text-[13px] font-bold text-white transition-opacity hover:opacity-85"
-                  >
-                    ↑
-                  </button>
-                </div>
-                {segVal(cur.segments[0].id).atts.length > 0 && (
-                  <div className="flex flex-wrap items-center gap-1.5 pt-1.5">
-                    {segVal(cur.segments[0].id).atts.map((p) => (
-                      <span key={p} title={p} className="flex items-center gap-1 rounded-full bg-[#3a3631] px-2 py-0.5 text-[9.5px] font-semibold text-[var(--accent)]">
-                        📷 {baseName(p)}
-                        <button
-                          onClick={() => removeSegAtt(cur.segments[0].id, p)}
-                          title="移除并删除该临时图片文件"
-                          className="ml-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full text-[9px] leading-none text-[#8c8a82] hover:bg-[#4a453e] hover:text-[#e5e2dc]"
-                        >
-                          ✕
-                        </button>
-                      </span>
-                    ))}
-                  </div>
+                    sendStage();
+                    return;
+                  }
+                  if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageToSeg(plainSegId);
+                }}
+                placeholder={cur.segments[0].text || "输入内容，Enter 发送…"}
+                dragOver={dragOver}
+                setDragOver={setDragOver}
+                textareaRef={taRef}
+                attachments={segVal(plainSegId).atts}
+                onRemoveAttachment={(p) => removeSegAtt(plainSegId, p)}
+                onDropItem={(e) => onSegDrop(plainSegId, e)}
+                menu={slashMenu(plainText, (next) =>
+                  applyCaret((t) => setSegText(plainSegId, t), taRef.current, next),
                 )}
-                <div className="pt-1 text-[9px] text-[#8c8a82]/80">Enter 发送 · Shift+Enter 换行 · 截图/图片 Ctrl+V 附加 · 左栏 Skill/文件/记忆可拖入</div>
-              </>
+              />
             ) : (
-              /* 内联填空式：注入=橙 token 只读、人工=下划线可填、图片内联；框本身即最终发送（无独立预览） */
-              <>
+              /* 多段内联：去圆角卡片，保留片段编排 + 斜杠 */
+              <div className="px-3 pb-2 pt-2">
+                <div className="flex items-center gap-1.5 pb-1.5 text-[10px] text-[#8c8a82]">
+                  <span className="text-[var(--accent)]">✎</span>
+                  <span className="shrink-0 font-semibold text-[#e5e2dc]">{cur.name}</span>
+                  <span className="shrink-0 bg-[#3a2a22] px-1.5 py-0.5 text-[9px] font-bold text-[var(--accent)]">多段拼接</span>
+                  {cur.segments.some((s) => s.kind === "manual" && isStashed(s.id)) && (
+                    <span
+                      title="有片段已暂存 · Left Ctrl+S 恢复"
+                      className="shrink-0 border border-[#6b4d38] bg-[#3a2a22] px-1.5 py-0.5 text-[9px] font-bold text-[var(--accent)]"
+                    >
+                      暂存中
+                    </span>
+                  )}
+                  <span className="ml-auto shrink-0">输入将发送到该终端</span>
+                </div>
+                <div className="h-px w-full bg-[var(--accent)]" />
                 <div
-                  className="flex flex-wrap items-center gap-x-1 gap-y-2 rounded-xl border border-[var(--accent)]/50 bg-[#1f1e1d] px-3 py-2.5"
+                  className="flex flex-wrap items-center gap-x-1 gap-y-2 px-1 py-2.5"
                   onDragLeave={(e) => {
                     if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragSeg(null);
                   }}
@@ -426,7 +592,7 @@ export default function WorkflowBar({
                       <span
                         key={seg.id}
                         title="注入片段（固定，自动跟随）"
-                        className="shrink-0 rounded-md border border-[#6b4d38] bg-[#3a2a22] px-1.5 py-0.5 font-mono text-[11px] text-[var(--accent)]"
+                        className="shrink-0 border border-[#6b4d38] bg-[#3a2a22] px-1.5 py-0.5 font-mono text-[11px] text-[var(--accent)]"
                       >
                         {seg.text}
                       </span>
@@ -435,9 +601,28 @@ export default function WorkflowBar({
                         <textarea
                           value={segVal(seg.id).text}
                           rows={1}
-                          onChange={(e) => setSegText(seg.id, e.target.value)}
+                          onChange={(e) => {
+                            setSegText(seg.id, e.target.value);
+                            syncCaret(e.target.value, e.target, seg.id);
+                          }}
+                          onSelect={(e) => syncCaret(segVal(seg.id).text, e.currentTarget, seg.id)}
+                          onKeyUp={(e) => syncCaret(segVal(seg.id).text, e.currentTarget, seg.id)}
                           onKeyDown={(e) => {
                             e.stopPropagation();
+                            const text = segVal(seg.id).text;
+                            if (onStashKey(e, seg.id, text, (t) => setSegText(seg.id, t))) return;
+                            const r = slash.handleKey(e, text);
+                            if (r.handled) {
+                              if (r.next) {
+                                setSegText(seg.id, r.next.text);
+                                requestAnimationFrame(() => {
+                                  const el = e.currentTarget;
+                                  el.setSelectionRange(r.next!.cursor, r.next!.cursor);
+                                  setCaret(r.next!.cursor);
+                                });
+                              }
+                              return;
+                            }
                             if (e.key === "Enter" && !e.shiftKey) {
                               e.preventDefault();
                               sendStage();
@@ -457,7 +642,7 @@ export default function WorkflowBar({
                           }}
                           placeholder={seg.text || "填写…"}
                           className={
-                            "htybox-seg-field resize-none rounded border-b border-dashed bg-transparent px-1 py-0.5 align-bottom text-[12px] leading-snug text-[#e5e2dc] outline-none placeholder:text-[#8c8a82]/70 " +
+                            "htybox-seg-field resize-none border-b border-dashed bg-transparent px-1 py-0.5 align-bottom text-[12px] leading-snug text-[#e5e2dc] outline-none placeholder:text-[#8c8a82]/70 " +
                             (dragSeg === seg.id
                               ? "border-solid border-[var(--accent)] bg-[var(--accent)]/15 ring-1 ring-[var(--accent)]"
                               : "border-[var(--accent)]/50 focus:border-solid focus:border-[var(--accent)]")
@@ -467,95 +652,61 @@ export default function WorkflowBar({
                           <span
                             key={p}
                             title={p}
-                            className="inline-flex items-center gap-0.5 rounded-full bg-[#3a3631] px-1.5 py-0.5 text-[9.5px] font-semibold text-[var(--accent)]"
+                            className="inline-flex items-center gap-0.5 bg-[#3a3631] px-1.5 py-0.5 text-[9.5px] font-semibold text-[var(--accent)]"
                           >
-                            📷{baseName(p)}
-                            <button onClick={() => removeSegAtt(seg.id, p)} title="移除并删除该临时图片文件" className="ml-0.5 text-[#8c8a82] hover:text-[#e5e2dc]">✕</button>
+                            📷{p.split(/[\\/]/).filter(Boolean).pop()}
+                            <button onClick={() => removeSegAtt(seg.id, p)} title="移除并删除该临时图片文件" className="ml-0.5 text-[#8c8a82] hover:text-[#e5e2dc]">
+                              ✕
+                            </button>
                           </span>
                         ))}
                       </span>
                     ),
                   )}
-                  <button
-                    onClick={sendStage}
-                    title="发送到终端（Enter）"
-                    className="ml-auto flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[13px] font-bold text-white hover:opacity-85"
-                  >
-                    ↑
-                  </button>
                 </div>
-                <div className="pt-1 text-[9px] text-[#8c8a82]/80">橙色=注入固定片段（自动跟随）· 下划线处填人工内容 / Ctrl+V 粘图 / 可拖入引用 · 空片段发送时省略 · Enter 发送</div>
-              </>
+                {activeSeg &&
+                  slashMenu(segVal(activeSeg).text, (next) => {
+                    setSegText(activeSeg, next.text);
+                    setCaret(next.cursor);
+                  })}
+                <div className="h-px w-full bg-[var(--accent)]" />
+              </div>
             )
           ) : (
-            /* 纯注入阶段 ✎ 展开：自由输入一条 ad-hoc 消息发送到终端 */
-            <>
-              <div
-                className="relative"
-                onDragOver={(e) => {
-                  if (!e.dataTransfer.types.includes(DRAG_MIME)) return;
+            <TermInputShell
+              title={cur.name}
+              stashed={isStashed(FIELD_DRAFT)}
+              value={draft}
+              onChange={setDraft}
+              onCaret={(v, el) => syncCaret(v, el, null)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (onStashKey(e, FIELD_DRAFT, draft, setDraft)) return;
+                const r = slash.handleKey(e, draft);
+                if (r.handled) {
+                  if (r.next) applyCaret(setDraft, taRef.current, r.next);
+                  return;
+                }
+                if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
-                  e.dataTransfer.dropEffect = "copy";
-                  if (!dragOver) setDragOver(true);
-                }}
-                onDragLeave={(e) => {
-                  if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false);
-                }}
-                onDrop={onInputDrop}
-              >
-                <textarea
-                  ref={taRef}
-                  value={draft}
-                  rows={3}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    e.stopPropagation();
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      send();
-                      return;
-                    }
-                    if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
-                  }}
-                  placeholder="输入内容，Enter 发送到终端…"
-                  className={
-                    "w-full resize-none rounded-xl border bg-[#1f1e1d] px-3 py-2 pr-12 text-[12px] leading-relaxed text-[#e5e2dc] outline-none transition-colors placeholder:text-[#8c8a82]/60 " +
-                    (dragOver
-                      ? "border-[var(--accent)] ring-2 ring-[var(--accent)]/40"
-                      : "border-[var(--accent)]/60 focus:border-[var(--accent)]")
-                  }
-                />
-                <button
-                  onClick={send}
-                  title="发送到终端（Enter）"
-                  className="absolute bottom-3 right-2.5 flex h-7 w-7 items-center justify-center rounded-full bg-[var(--accent)] text-[13px] font-bold text-white transition-opacity hover:opacity-85"
-                >
-                  ↑
-                </button>
-              </div>
-              {attachments.length > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5 pt-1.5">
-                  {attachments.map((p) => (
-                    <span key={p} title={p} className="flex items-center gap-1 rounded-full bg-[#3a3631] px-2 py-0.5 text-[9.5px] font-semibold text-[var(--accent)]">
-                      📷 {baseName(p)}
-                      <button
-                        onClick={() => removeAttachment(p)}
-                        title="移除并删除该临时图片文件"
-                        className="ml-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full text-[9px] leading-none text-[#8c8a82] hover:bg-[#4a453e] hover:text-[#e5e2dc]"
-                      >
-                        ✕
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
-              <div className="pt-1 text-[9px] text-[#8c8a82]/80">
-                Enter 发送 · Shift+Enter 换行 · 截图/图片 Ctrl+V 附加 · 左栏 Skill/文件/记忆可拖入
-              </div>
-            </>
+                  send();
+                  return;
+                }
+                if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
+              }}
+              placeholder="输入内容，Enter 发送…"
+              dragOver={dragOver}
+              setDragOver={setDragOver}
+              textareaRef={taRef}
+              attachments={attachments}
+              onRemoveAttachment={removeAttachment}
+              onDropItem={onInputDrop}
+              menu={slashMenu(draft, (next) => applyCaret(setDraft, taRef.current, next))}
+            />
           )}
-        </div>
+        </>
       )}
+
       {/* ── 进度 strip（34px 常驻） ── */}
       <div className="flex h-[34px] items-center gap-2 bg-[#24211e] px-3">
         <FlowGlyph className={"h-3.5 w-3.5 shrink-0 " + (done ? "text-[#2fa35e]" : "text-[var(--accent)]") + (autoRunning ? " animate-pulse" : "")} />
@@ -568,7 +719,6 @@ export default function WorkflowBar({
         >
           {done ? `${total}/${total}` : `${stepNo}/${total}`}
         </span>
-        {/* stepper（自动执行中：当前点脉冲 + 流光点滑过） */}
         <div className="relative flex min-w-0 shrink items-center gap-1.5 overflow-hidden">
           {run.stages.map((s, i) => (
             <StageDot
@@ -586,7 +736,6 @@ export default function WorkflowBar({
             />
           )}
         </div>
-        {/* 当前阶段 / 完成文案 + 命令预览 / 运行徽记 */}
         <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
           {done ? (
             <span className="truncate text-[10.5px] font-semibold" style={{ color: OK_GREEN }}>
@@ -617,7 +766,6 @@ export default function WorkflowBar({
             </>
           )}
         </div>
-        {/* 自动执行开关（纯图标·三态 ▶停 / spinner 运行 / ⏸暂停；hover 出说明；「执行阶段」左侧） */}
         {!done && (
           <button
             onClick={() => setRunAuto(termId, !autoOn)}
@@ -648,7 +796,6 @@ export default function WorkflowBar({
             )}
           </button>
         )}
-        {/* 主按钮 */}
         {done ? (
           <button
             onClick={() => setConfirmUnbind(true)}
@@ -676,7 +823,6 @@ export default function WorkflowBar({
             ✓ 下一步
           </button>
         )}
-        {/* 流程操作（全部直出，无弹出菜单） */}
         {!done && (
           <button onClick={() => skipCurrent(termId)} title="跳过当前阶段并进入下一阶段" className={ghostBtn}>
             跳过
@@ -691,7 +837,6 @@ export default function WorkflowBar({
           重置
         </button>
         <div className="h-4 w-px shrink-0 bg-[#3a3631]" />
-        {/* ✎ 输入框开关 */}
         {!done && (
           <button
             onClick={() => setInputOverride(showInput ? false : true)}
@@ -706,7 +851,6 @@ export default function WorkflowBar({
             ✎
           </button>
         )}
-        {/* ⌄ 隐藏面板（收起为右下角浮标） */}
         <button
           onClick={() => setRunCollapsed(termId, true)}
           title="隐藏面板（收起为右下角浮标）"
@@ -716,7 +860,6 @@ export default function WorkflowBar({
             <path d="m6 9 6 6 6-6" />
           </svg>
         </button>
-        {/* 解绑（危险操作放最右端 + 确认弹窗防误触；done 态主按钮已是解绑，不重复出） */}
         {!done && (
           <button
             onClick={() => setConfirmUnbind(true)}

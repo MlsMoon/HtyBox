@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { useSettings, setSetting, type FileClickMode } from "../settings";
 import { FONTS, applyFont } from "../fonts";
 import { THEMES, applyTheme, watchSystemTheme } from "../theme";
@@ -229,7 +229,8 @@ type SectionKey =
   | "files"
   | "skill"
   | "htyenv"
-  | "connection";
+  | "connection"
+  | "help";
 const SECTIONS: { key: SectionKey; label: string }[] = [
   { key: "general", label: "通用" },
   { key: "appearance", label: "外观" },
@@ -239,7 +240,36 @@ const SECTIONS: { key: SectionKey; label: string }[] = [
   { key: "skill", label: "Skill" },
   { key: "htyenv", label: "hty环境" },
   { key: "connection", label: "连接" },
+  { key: "help", label: "帮助" },
 ];
+
+function HelpKbd({ children }: { children: string }) {
+  return (
+    <kbd className="rounded border border-[var(--border)] bg-[var(--surface)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--text)]">
+      {children}
+    </kbd>
+  );
+}
+
+function HelpRow({ keys, desc }: { keys: string; desc: string }) {
+  return (
+    <div className="flex items-start gap-3 py-1.5">
+      <div className="w-[168px] shrink-0 pt-0.5">
+        <HelpKbd>{keys}</HelpKbd>
+      </div>
+      <div className="min-w-0 flex-1 text-[12.5px] leading-relaxed text-[var(--text-2)]">{desc}</div>
+    </div>
+  );
+}
+
+function HelpBlock({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="mb-4 rounded-lg border border-[var(--border-soft)] px-3 py-2.5">
+      <div className="mb-1.5 text-[13px] font-semibold text-[var(--text)]">{title}</div>
+      <div className="divide-y divide-[var(--border-soft)]">{children}</div>
+    </div>
+  );
+}
 const SECTION_KEY = "htybox.settingsSection.v1";
 
 /** 全局设置弹窗：宽体 + 左侧分类导航。未来新设置项加进对应分类（或新增 SECTIONS 项）。 */
@@ -832,6 +862,28 @@ export default function SettingsModal({
             )}
             {section === "agents" && <AgentSettings />}
             {section === "connection" && <ConnectionSettings />}
+            {section === "help" && (
+              <div className="space-y-1 pb-2">
+                <p className="mb-3 px-1 text-[11.5px] leading-relaxed text-[var(--text-3)]">
+                  内置输入框与工作流的常用操作说明（界面上不再重复显示这些小字提示）。
+                </p>
+                <HelpBlock title="内置输入框">
+                  <HelpRow keys="Enter" desc="发送到当前终端（斜杠菜单打开时改为补全 Skill）" />
+                  <HelpRow keys="Shift+Enter" desc="换行" />
+                  <HelpRow keys="/" desc="唤出已上架 Skill 列表，↑↓ / Tab 选择，Enter 补全" />
+                  <HelpRow keys="Left Ctrl+S" desc="暂存当前输入并清空；再按一次恢复；发送临时内容后自动填回暂存" />
+                  <HelpRow keys="Left Ctrl+C" desc="清空当前输入（不影响已暂存内容）" />
+                  <HelpRow keys="Ctrl+V" desc="剪贴板为图片时附加为附件；有文本时正常粘贴" />
+                  <HelpRow keys="Ctrl+Shift+I" desc="开关内置输入框（无工作流时）/ 展开工作流输入（有工作流时）" />
+                  <HelpRow keys="拖入" desc="左栏 Skill / 文件 / 记忆 / 书签可拖入输入框末尾追加" />
+                </HelpBlock>
+                <HelpBlock title="工作流">
+                  <HelpRow keys="拖拽卡片" desc="把 Flow 页签里的工作流卡片拖到终端即可绑定应用" />
+                  <HelpRow keys="终端 Tab 右键" desc="可对终端绑定 / 更换 / 解绑工作流" />
+                  <HelpRow keys="工具栏 flow ▾" desc="从工具栏打开工作流选择器并应用" />
+                </HelpBlock>
+              </div>
+            )}
           </div>
         </div>
       </div>
