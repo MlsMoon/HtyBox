@@ -30,6 +30,8 @@ export interface Settings {
   plainTextDefaultEdit: boolean;
   /** 终端底部工作流面板总开关：关闭后所有终端不显示面板（绑定与进度数据保留）。默认开 */
   showWorkflowPanel: boolean;
+  /** 无工作流时内置输入框默认展开：开=所有终端默认打开 / 关=默认收起为浮标。浮标或 Ctrl+Shift+I 开关会写入本项并记住 */
+  termFreeInputOpen: boolean;
   /** 终端中键自动滚动：按下鼠标中键出滚轮锚点、移动即按距离自动滚动（仿浏览器）。默认开 */
   middleClickScroll: boolean;
   /** 全局截图快捷键 Ctrl+Shift+A：开=注册全局热键框选截图到剪贴板；关=注销（可让给飞书等）。默认开 */
@@ -74,6 +76,7 @@ const DEFAULTS: Settings = {
   maxOpenMB: 512,
   plainTextDefaultEdit: true,
   showWorkflowPanel: true,
+  termFreeInputOpen: false,
   middleClickScroll: true,
   screenshotHotkey: true,
   tabSelectable: false,

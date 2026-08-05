@@ -1,7 +1,9 @@
-// 无工作流时每终端「自由输入」展开态（模块级瞬态，不进 wsState）。
+// 无工作流时「自由输入」展开态：全局记忆开关（settings.termFreeInputOpen），
+// 打开/关闭后所有终端会话共用同一默认（持久化 localStorage）。
+import { getSettings, setSetting } from "../../settings";
+
 type Listener = () => void;
 const listeners = new Set<Listener>();
-const openByTerm = new Map<string, boolean>();
 
 function emit(): void {
   listeners.forEach((f) => f());
@@ -14,15 +16,15 @@ export function onFreeInputChange(fn: Listener): () => void {
   };
 }
 
-export function isFreeInputOpen(termId: string): boolean {
-  return openByTerm.get(termId) === true;
+/** 是否展开（全局记忆；termId 仅保留 API 兼容，不再按终端分叉）。 */
+export function isFreeInputOpen(_termId?: string): boolean {
+  return getSettings().termFreeInputOpen;
 }
 
-export function setFreeInputOpen(termId: string, open: boolean): void {
-  const prev = openByTerm.get(termId) === true;
-  if (prev === open) return;
-  if (open) openByTerm.set(termId, true);
-  else openByTerm.delete(termId);
+/** 开/关并写入全局设置（之后所有会话默认跟此值）。 */
+export function setFreeInputOpen(_termId: string, open: boolean): void {
+  if (getSettings().termFreeInputOpen === open) return;
+  setSetting("termFreeInputOpen", open);
   emit();
 }
 
@@ -32,11 +34,9 @@ export function toggleFreeInput(termId: string): boolean {
   return next;
 }
 
-/** 终端关闭时清态，避免 Map 泄漏。 */
-export function clearFreeInput(termId: string): void {
-  if (!openByTerm.has(termId)) return;
-  openByTerm.delete(termId);
-  emit();
+/** 终端关闭：全局记忆不随单终端清理（no-op，保留调用点兼容）。 */
+export function clearFreeInput(_termId: string): void {
+  /* 全局开关不按终端清 */
 }
 
 /** Ctrl+Shift+I：通知对应终端的 WorkflowBar 展开/聚焦内置输入。 */

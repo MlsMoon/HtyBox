@@ -81,6 +81,7 @@ import WorkflowBar from "./WorkflowBar";
 import WorkflowPicker from "./WorkflowPicker";
 import ConfirmModal from "./ui/ConfirmModal";
 import { clearFreeInput, emitTermInputHotkey } from "./termInput/freeInputState";
+import { clearTermInputMemory } from "./termInput/termInputMemory";
 import { MENU_SEP, type MenuItem } from "./ui/ContextMenu";
 import {
   clearRun,
@@ -970,10 +971,11 @@ export default function TerminalDock({
         }
         markTerminalClosed(termId); // M7-H：主动关闭 → 其 PTY 退出事件不当崩溃
         clearTerm(termId); // 清运行状态总线（agentStatus 三态）
-        clearFreeInput(termId); // 清无工作流自由输入展开态
+        clearFreeInput(termId); // 清无工作流自由输入展开态（全局开关：no-op）
         abortSessionCapture(termId);
-        // 工作区关闭中：引擎已由 disposeByPrefix 统一结束，且要保留布局/自定义名供复原 → 跳过
+        // 工作区关闭中：引擎已由 disposeByPrefix 统一结束，且要保留布局/自定义名/输入草稿供复原 → 跳过
         if (CLOSING.has(workspaceId)) return;
+        clearTermInputMemory(termId); // 用户关终端：清空该终端输入记忆
         disposeEngine(termId);
         // 工作流实例：agent 终端且已捕获会话 id → 归档到会话维度（Session 复原时找回，
         // 关闭终端 ≠ 丢进度）；shell / 未捕获 → 直接清理。须在下方 delete SESSION_IDS 之前读取。

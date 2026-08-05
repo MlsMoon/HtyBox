@@ -27,8 +27,6 @@ import TermInputShell, { DRAG_MIME } from "./termInput/TermInputShell";
 import SlashSkillMenu from "./termInput/SlashSkillMenu";
 import { useSlashSkills } from "./termInput/useSlashSkills";
 import {
-  isFreeInputOpen,
-  onFreeInputChange,
   onTermInputHotkey,
   setFreeInputOpen,
   toggleFreeInput,
@@ -39,6 +37,7 @@ import {
   useLeftCtrlHeld,
   type StashMap,
 } from "./termInput/inputStash";
+import { getTermInputMemory, setTermInputMemory } from "./termInput/termInputMemory";
 
 // 终端底部：工作流进度 strip + CLI 双线输入（人工阶段 / ✎ / 无工作流自由输入）+ 斜杠 Skill 补全。
 // 配色用终端暗区固定值。注入/发送走 injectAndSubmit。
@@ -117,22 +116,28 @@ export default function WorkflowBar({
   const slash = useSlashSkills(cwd, agentKind);
   const [running, setRunning] = useState(() => isTermRunning(termId));
   const [inputOverride, setInputOverride] = useState<boolean | null>(null);
-  const [draft, setDraft] = useState("");
+  const [bootMem] = useState(() => getTermInputMemory(termId));
+  const [draft, setDraft] = useState(bootMem.draft);
   const [dragOver, setDragOver] = useState(false);
-  const [attachments, setAttachments] = useState<string[]>([]);
-  const [segInputs, setSegInputs] = useState<Record<string, { text: string; atts: string[] }>>({});
+  const [attachments, setAttachments] = useState(bootMem.attachments);
+  const [segInputs, setSegInputs] = useState(bootMem.segInputs);
   const [dragSeg, setDragSeg] = useState<string | null>(null);
   const [confirmUnbind, setConfirmUnbind] = useState(false);
-  const [freeOpen, setFreeOpen] = useState(() => isFreeInputOpen(termId));
+  /** 无工作流内置输入：跟全局记忆开关（设置 · 终端） */
+  const freeOpen = settings.termFreeInputOpen;
+  /** 仅用户主动打开时聚焦，避免「记忆为开」切终端时抢焦点 */
+  const focusFreeRef = useRef(false);
   const [caret, setCaret] = useState(0);
   const [activeSeg, setActiveSeg] = useState<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const ranThisStage = useRef(false);
   const autoExecRef = useRef(-1);
   const autoAdvRef = useRef(-1);
-  const stashRef = useRef<StashMap>({});
+  const stashRef = useRef<StashMap>({ ...bootMem.stash });
+  /** 上一阶段游标；与当前相等则不清理（首挂载 / 换终端载入后对齐） */
+  const prevStageRef = useRef<number | null>(null);
   const leftCtrl = useLeftCtrlHeld();
-  const [, setStashRev] = useState(0); // 暂存槽变化时重渲（徽标）
+  const [stashRev, setStashRev] = useState(0); // 暂存槽变化时重渲（徽标）+ 触发草稿落盘
   const touchStash = () => setStashRev((n) => n + 1);
   const isStashed = (fieldId: string) => fieldId in stashRef.current;
   const onStashKey = (
@@ -148,27 +153,37 @@ export default function WorkflowBar({
     return false;
   };
 
+  const stageCursor = run?.cursor ?? -1;
+
   useEffect(() => {
     setRunning(isTermRunning(termId));
     return onAgentStatusChange(() => setRunning(isTermRunning(termId)));
   }, [termId]);
 
+  // 输入内容落盘：终端未关则跨应用重启复原；关终端时由 TerminalDock clear
   useEffect(() => {
-    setFreeOpen(isFreeInputOpen(termId));
-    return onFreeInputChange(() => setFreeOpen(isFreeInputOpen(termId)));
-  }, [termId]);
+    setTermInputMemory(termId, {
+      draft,
+      attachments,
+      segInputs,
+      stash: { ...stashRef.current },
+    });
+  }, [termId, draft, attachments, segInputs, stashRev]);
 
-  // 自由输入展开后聚焦（等 TermInputShell 挂载）
   useEffect(() => {
-    if (!run && freeOpen) requestAnimationFrame(() => taRef.current?.focus());
+    if (!run && freeOpen && focusFreeRef.current) {
+      focusFreeRef.current = false;
+      requestAnimationFrame(() => taRef.current?.focus());
+    }
   }, [run, freeOpen]);
 
-  // 快捷键：无 run → 切换自由输入；有 run → 展开输入并聚焦
+  // 快捷键：无 run → 切换自由输入；有 run → 展开工作流输入并聚焦
   useEffect(() => {
     return onTermInputHotkey((id) => {
       if (id !== termId) return;
       if (!run) {
-        toggleFreeInput(termId);
+        const next = toggleFreeInput(termId);
+        if (next) focusFreeRef.current = true;
         return;
       }
       setInputOverride(true);
@@ -176,16 +191,22 @@ export default function WorkflowBar({
     });
   }, [termId, run]);
 
-  const stageCursor = run?.cursor ?? -1;
+  // 换阶段：清分段输入与暂存（主输入 draft 保留，与原行为一致）
   useEffect(() => {
+    if (prevStageRef.current === null) {
+      prevStageRef.current = stageCursor;
+      return;
+    }
+    if (prevStageRef.current === stageCursor) return;
+    prevStageRef.current = stageCursor;
     setInputOverride(null);
     ranThisStage.current = false;
     autoExecRef.current = -1;
     autoAdvRef.current = -1;
     setSegInputs({});
-    stashRef.current = {}; // 换阶段/终端：丢弃未消费的暂存
+    stashRef.current = {};
     setStashRev((n) => n + 1);
-  }, [stageCursor, termId]);
+  }, [stageCursor]);
   useEffect(() => {
     if (running) ranThisStage.current = true;
   }, [running]);
@@ -282,10 +303,10 @@ export default function WorkflowBar({
         <button
           type="button"
           onClick={() => {
+            focusFreeRef.current = true;
             setFreeInputOpen(termId, true);
-            requestAnimationFrame(() => taRef.current?.focus());
           }}
-          title="打开内置输入（Ctrl+Shift+I）"
+          title="打开内置输入并记住为默认（Ctrl+Shift+I）"
           className="absolute bottom-3 right-4 z-10 flex items-center gap-1.5 border border-[#3a3631] bg-[#292623]/95 px-3 py-1 text-[10px] font-bold text-[var(--accent)] shadow-lg hover:border-[var(--accent)]"
         >
           ✎ 输入
@@ -332,7 +353,7 @@ export default function WorkflowBar({
           <button
             type="button"
             onClick={() => setFreeInputOpen(termId, false)}
-            title="收起输入框"
+            title="收起并记住为默认关闭"
             className="flex h-6 w-6 items-center justify-center border border-[#3a3631] text-[#8c8a82] hover:text-[#e5e2dc]"
           >
             <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">

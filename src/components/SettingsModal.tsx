@@ -595,6 +595,12 @@ export default function SettingsModal({
                   on={s.showWorkflowPanel}
                   onChange={(v) => setSetting("showWorkflowPanel", v)}
                 />
+                <ToggleRow
+                  title="内置输入框默认展开"
+                  desc="无工作流时是否默认打开内置输入；浮标或 Ctrl+Shift+I 开关会写入此项，之后所有终端会话共用"
+                  on={s.termFreeInputOpen}
+                  onChange={(v) => setSetting("termFreeInputOpen", v)}
+                />
               </div>
             )}
             {section === "files" && (
@@ -874,8 +880,9 @@ export default function SettingsModal({
                   <HelpRow keys="Left Ctrl+S" desc="暂存当前输入并清空；再按一次恢复；发送临时内容后自动填回暂存" />
                   <HelpRow keys="Left Ctrl+C" desc="清空当前输入（不影响已暂存内容）" />
                   <HelpRow keys="Ctrl+V" desc="剪贴板为图片时附加为附件；有文本时正常粘贴" />
-                  <HelpRow keys="Ctrl+Shift+I" desc="开关内置输入框（无工作流时）/ 展开工作流输入（有工作流时）" />
+                  <HelpRow keys="Ctrl+Shift+I" desc="开关内置输入框并记住为全局默认（无工作流时）/ 展开工作流输入（有工作流时）" />
                   <HelpRow keys="拖入" desc="左栏 Skill / 文件 / 记忆 / 书签可拖入输入框末尾追加" />
+                  <HelpRow keys="草稿记忆" desc="未关闭的终端会记住输入内容（含暂存）；关应用再开可复原；关掉该终端后清空" />
                 </HelpBlock>
                 <HelpBlock title="工作流">
                   <HelpRow keys="拖拽卡片" desc="把 Flow 页签里的工作流卡片拖到终端即可绑定应用" />
