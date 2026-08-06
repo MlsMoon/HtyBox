@@ -148,6 +148,8 @@ pub fn skill_dir(workspace: &Path, id: &str) -> Result<PathBuf, String> {
 }
 
 pub fn parse(text: &str) -> Result<WorkflowManifest, String> {
+    // PS 5.1 `Set-Content -Encoding utf8` 会写 UTF-8 BOM;serde_json 不认,先剥再解析。
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let manifest: WorkflowManifest =
         serde_json::from_str(text).map_err(|e| format!("workflow-manifest.json 解析失败: {e}"))?;
     if manifest.schema_version != SUPPORTED_SCHEMA_VERSION {
@@ -334,6 +336,14 @@ mod tests {
         let text = SAMPLE.replace("\"schemaVersion\": 1", "\"schemaVersion\": 2");
         let err = parse(&text).unwrap_err();
         assert!(err.contains("schemaVersion"), "错误应指明 schemaVersion: {err}");
+    }
+
+    #[test]
+    fn parse_tolerates_utf8_bom() {
+        let text = format!("\u{feff}{SAMPLE}");
+        let manifest = parse(&text).expect("带 BOM 的 manifest 应可解析");
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.skills.len(), 1);
     }
 
     #[test]

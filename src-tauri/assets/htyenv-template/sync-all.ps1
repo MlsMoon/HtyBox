@@ -43,7 +43,10 @@ foreach ($s in $m.skills) {
 }
 if ($refreshed.Count -gt 0) {
     $m.generatedUtc = (Get-Date).ToUniversalTime().ToString('o')
-    $m | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $w 'workflow-manifest.json') -Encoding utf8
+    # PS 5.1 `-Encoding utf8` 会写 BOM,Rust serde_json 不认 → Memory/Skill canonical 判定失败;无 BOM 落盘。
+    $manifestPath = Join-Path $w 'workflow-manifest.json'
+    $json = ($m | ConvertTo-Json -Depth 6) + "`n"
+    [System.IO.File]::WriteAllText($manifestPath, $json, (New-Object System.Text.UTF8Encoding $false))
     $R.Add("- manifest 登记刷新（canonical 有合法更新）: $($refreshed -join ', ')")
 }
 & (Join-Path $w 'tools\sync-adapters.ps1') *> $null

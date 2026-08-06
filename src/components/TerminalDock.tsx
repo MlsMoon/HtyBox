@@ -73,7 +73,7 @@ import {
   setNativeSessionLabels,
   onNativeSessionLabelsChange,
 } from "../sessionNativeLabels";
-import { pingAgentActivity, clearTerm } from "../agentStatus";
+import { pingAgentActivity, clearTerm, isTermRunning, isTermFinished, onAgentStatusChange } from "../agentStatus";
 import ContextMenu from "./ui/ContextMenu";
 import TagEditor from "./TagEditor";
 import type { RunConfig } from "../runConfigs";
@@ -461,6 +461,9 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
     const d = props.api.onDidTitleChange((e) => setTitle(e.title));
     return () => d.dispose();
   }, [props.api]);
+  // kimi/cursor tab 状态标记：订阅运行状态总线（running/finished 跳变才 emit，高频 ping 不触发重渲染）
+  const [, setStatusTick] = useState(0);
+  useEffect(() => onAgentStatusChange(() => setStatusTick((n) => n + 1)), []);
 
   const startRename = () => {
     const p = props.params as TermParams & { editorPath?: string };
@@ -534,6 +537,15 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
         splitStatusPrefix(title)[1] ||
         title
       : title;
+  // kimi/cursor 无 OSC 原生状态前缀 → 自研 tab 标记：双点摆(活跃) / 收束成点(跑完静默)；三态语义见 agentStatus.ts
+  const tabStatus =
+    p2.termId && (p2.agentKind === "kimi" || p2.agentKind === "cursor")
+      ? isTermRunning(p2.termId)
+        ? "running"
+        : isTermFinished(p2.termId)
+          ? "finished"
+          : null
+      : null;
   return (
     <>
     <div
@@ -547,6 +559,18 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
       className="flex h-full items-center gap-2 px-2 text-xs"
     >
       <TabTypeIcon params={props.params as TermParams & { editorPath?: string }} />
+      {tabStatus === "running" && p2.termId && (
+        <span
+          className="tab-swing"
+          // 多 tab 并跑相位错开：按 termId 字符码取模 0–0.9s
+          style={{ "--swing-delay": `${([...p2.termId].reduce((a, c) => a + c.charCodeAt(0), 0) % 10) / 10}s` } as React.CSSProperties}
+        >
+          <i /><i />
+        </span>
+      )}
+      {tabStatus === "finished" && (
+        <span className="tab-merge"><i className="m-a" /><i className="m-b" /><i className="m-dot" /><i className="m-halo" /></span>
+      )}
       <span className="max-w-[180px] truncate">{title}</span>
       <span
         // 点非激活 Tab 的 ✕：dockview 会在 pointerdown 阶段先 openPanel(切过去显示该 Tab)再 close → 视觉闪一下。

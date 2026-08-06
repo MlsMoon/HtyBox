@@ -31,6 +31,7 @@ const IDLE_MS = 2000; // PTY/标题静默超过此时长 → 判定完成/空闲
 const running = new Map<string, boolean>(); // termId → 是否运行中
 const idleTimers = new Map<string, number>(); // termId → idle 定时器句柄
 const doneUnseen = new Set<string>(); // 工作区 → 完成待查看
+const finished = new Set<string>(); // termId → 跑过且已静默（kimi/cursor tab 完成标记；再次活动/关闭即清）
 let activeWs: string | null = null; // 当前激活工作区
 
 // 终端 id 形如 "<wsId>::<...>"，反推工作区 id
@@ -48,6 +49,7 @@ export function pingAgentActivity(termId: string): void {
   const ws = wsOf(termId);
   const wasRunning = wsRunning(ws);
   const wasTermRunning = running.get(termId) === true;
+  const wasFinished = finished.delete(termId); // 新活动顶掉完成标记
   running.set(termId, true);
   const t = idleTimers.get(termId);
   if (t) window.clearTimeout(t);
@@ -55,9 +57,9 @@ export function pingAgentActivity(termId: string): void {
     termId,
     window.setTimeout(() => markIdle(termId), IDLE_MS),
   );
-  // 工作区聚合跳变（顶栏图标）或单终端跳变（WorkflowBar 徽记）都需要通知；
-  // 高频 ping 期间两者均已 true → 不 emit，无重渲染开销
-  if (!wasRunning || !wasTermRunning) emit();
+  // 工作区聚合跳变（顶栏图标）或单终端跳变（WorkflowBar 徽记 / tab 状态标记）都需要通知；
+  // 高频 ping 期间三者均已稳定 → 不 emit，无重渲染开销
+  if (!wasRunning || !wasTermRunning || wasFinished) emit();
 }
 
 function markIdle(termId: string): void {
@@ -65,6 +67,7 @@ function markIdle(termId: string): void {
   const ws = wsOf(termId);
   running.set(termId, false);
   idleTimers.delete(termId);
+  finished.add(termId); // 跑过且已静默 = 完成（常驻到再次活动）
   // 该工作区聚合 running 由 true→false 跳变：若此刻非当前激活工作区 → 标记"完成待查看"
   if (!wsRunning(ws) && ws !== activeWs) doneUnseen.add(ws);
   emit();
@@ -75,6 +78,7 @@ export function clearTerm(termId: string): void {
   const ws = wsOf(termId);
   const wasRunning = running.get(termId) === true;
   running.delete(termId);
+  finished.delete(termId);
   const t = idleTimers.get(termId);
   if (t) {
     window.clearTimeout(t);
@@ -88,6 +92,7 @@ export function clearWorkspace(ws: string): void {
   for (const tid of [...running.keys()]) {
     if (wsOf(tid) === ws) {
       running.delete(tid);
+      finished.delete(tid);
       const t = idleTimers.get(tid);
       if (t) window.clearTimeout(t);
       idleTimers.delete(tid);
@@ -110,7 +115,12 @@ export function workspaceStatus(ws: string): WsStatus {
   return "idle";
 }
 
-/** 单终端是否正在跑（WorkflowBar「执行中/已静默」徽记、FlowPanel 总览运行点用）。 */
+/** 单终端是否正在跑（WorkflowBar「执行中/已静默」徽记、FlowPanel 总览运行点、tab 双点摆标记用）。 */
 export function isTermRunning(termId: string): boolean {
   return running.get(termId) === true;
+}
+
+/** 单终端是否"跑过且已静默"（kimi/cursor tab 收束成点完成标记用；再次活动/关闭即清）。 */
+export function isTermFinished(termId: string): boolean {
+  return finished.has(termId);
 }
