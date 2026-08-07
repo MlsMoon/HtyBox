@@ -1162,7 +1162,7 @@ fn delete_cursor_session(path: String) -> Result<(), String> {
     sessions::delete_cursor_session(&path)
 }
 
-/// 列本工作区 kimi 会话（<KIMI_CODE_HOME|~/.kimi-code>/sessions 按 state.json.workDir）。
+/// 列本工作区 kimi 会话（<KIMI_CODE_HOME|~/.kimi-code>/sessions 按 state.json 的 workDir|cwd）。
 #[tauri::command]
 fn list_kimi_sessions(cwd: String) -> Vec<sessions::SessionRef> {
     sessions::list_kimi_sessions(&cwd)

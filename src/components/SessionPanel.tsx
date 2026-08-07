@@ -390,7 +390,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
             <div className="mt-0.5 text-[10px] text-[var(--text-3)]">
               {new Date(s.ts).toLocaleString()}
               <span className="ml-1.5 font-mono opacity-70" title={s.id}>
-                {s.id.slice(0, 8)}
+                {(s.id.startsWith("session_") ? s.id.slice("session_".length) : s.id).slice(0, 8)}
               </span>
             </div>
             {(() => {

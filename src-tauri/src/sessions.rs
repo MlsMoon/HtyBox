@@ -8,8 +8,9 @@
 //!   外层 hash 目录大概率是 cwd 哈希分桶，不逆向算法、直接扫全部子目录按 meta.json.cwd 过滤；
 //!   标题优先取原生 title，未命名(hasConversation:false)的空壳会话跳过展示，其余回退 prompt_history.json 首条用户输入；
 //!   复原 `cursor-agent --resume <chatId>`(flag 风格，与 claude 同构，已实测)；删除走删整个 chat 目录。
-//! - kimi：会话 <KIMI_CODE_HOME|~/.kimi-code>/sessions/<workDirKey>/<sessionId>/state.json（{createdAt,updatedAt,title,lastPrompt,workDir}，ISO 时间串）；
-//!   workDirKey 为 cwd 派生分桶，不逆向算法、直接扫全部 state.json 按 workDir 过滤；title 缺失回退 lastPrompt；
+//! - kimi：会话 <KIMI_CODE_HOME|~/.kimi-code>/sessions/<workDirKey>/<sessionId>/state.json；
+//!   **v1**（≤约 0.26）：`workDir` + RFC3339 时间串；**v2**（0.34+）：`cwd` 取代 workDir、`createdAt`/`updatedAt` 为 epoch 毫秒 number，可有 `archived`；
+//!   workDirKey 为 cwd 派生分桶，不逆向算法、直接扫全部 state.json，路径双读 workDir|cwd、时间双读 RFC3339|ms，跳过 archived；title 缺失回退 lastPrompt；
 //!   复原 `kimi --session <sessionId>`(flag 风格，id 形态 session_<uuid>，resume 精确性已实测)；删除走删整个 session 目录 + session_index.jsonl 剔行。
 //! 删除统一移入回收站(trash，非交互、可恢复)。
 
@@ -1348,7 +1349,7 @@ fn kimi_data_root() -> Option<PathBuf> {
     home().map(|h| h.join(".kimi-code"))
 }
 
-/// RFC3339 时间串（kimi state.json 的 createdAt/updatedAt，如 2026-07-20T11:55:25.353Z）→ 毫秒时间戳。
+/// RFC3339 时间串（kimi state.json v1 的 createdAt/updatedAt，如 2026-07-20T11:55:25.353Z）→ 毫秒时间戳。
 /// 解析失败归 0：该条仅排到列表最末/不参与捕获，不影响其他会话。
 fn rfc3339_ms(s: &str) -> i64 {
     time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
@@ -1356,8 +1357,40 @@ fn rfc3339_ms(s: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// kimi：扫 <数据根>/sessions/<workDirKey>/<sessionId>/state.json，workDir 匹配的列出；
-/// 标题取 title（缺失回退 lastPrompt），ts 取 updatedAt；id = 目录名（session_<uuid> 完整形态）。
+/// kimi state.json 工作区路径：v1=`workDir`，v2=`cwd`（非空串优先前者）。
+fn kimi_session_workdir(v: &serde_json::Value) -> Option<&str> {
+    for key in ["workDir", "cwd"] {
+        if let Some(s) = v.get(key).and_then(|value| value.as_str()) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// kimi state.json 时间字段：v1=RFC3339 串，v2=epoch 毫秒 number；失败归 0。
+fn kimi_ts_ms(v: &serde_json::Value, key: &str) -> i64 {
+    let Some(value) = v.get(key) else {
+        return 0;
+    };
+    if let Some(s) = value.as_str() {
+        return rfc3339_ms(s);
+    }
+    if let Some(n) = value.as_i64() {
+        return n;
+    }
+    value.as_u64().map(|n| n as i64).unwrap_or(0)
+}
+
+/// kimi v2 `archived: true` → 不列入活跃会话列表 / 不参与 capture。
+fn kimi_is_archived(v: &serde_json::Value) -> bool {
+    v.get("archived").and_then(|value| value.as_bool()) == Some(true)
+}
+
+/// kimi：扫 <数据根>/sessions/<workDirKey>/<sessionId>/state.json，workDir|cwd 匹配的列出；
+/// 标题取 title（缺失回退 lastPrompt），ts 取 updatedAt（RFC3339|ms）；id = 目录名（session_<uuid> 完整形态）。
 pub fn list_kimi_sessions(cwd: &str) -> Vec<SessionRef> {
     let Some(data_root) = kimi_data_root() else {
         return Vec::new();
@@ -1386,11 +1419,10 @@ pub(crate) fn list_kimi_sessions_in(data_root: &Path, cwd: &str) -> Vec<SessionR
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
             continue;
         };
-        if v.get("workDir")
-            .and_then(|value| value.as_str())
-            .map(|value| same_path(value, cwd))
-            != Some(true)
-        {
+        if kimi_is_archived(&v) {
+            continue;
+        }
+        if kimi_session_workdir(&v).map(|value| same_path(value, cwd)) != Some(true) {
             continue;
         }
         let Some(session_dir) = p.parent() else {
@@ -1404,11 +1436,7 @@ pub(crate) fn list_kimi_sessions_in(data_root: &Path, cwd: &str) -> Vec<SessionR
             .and_then(|value| value.as_str())
             .map(|s| s.chars().take(80).collect());
         let label = cursor_label(v.get("title").and_then(|value| value.as_str()), fallback);
-        let ts = v
-            .get("updatedAt")
-            .and_then(|value| value.as_str())
-            .map(rfc3339_ms)
-            .unwrap_or(0);
+        let ts = kimi_ts_ms(&v, "updatedAt");
         out.push(SessionRef {
             label,
             id: id.to_string(),
@@ -1757,6 +1785,15 @@ fn scan_kimi_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
     let Some(data_root) = kimi_data_root() else {
         return Vec::new();
     };
+    scan_kimi_session_times_in(&data_root, cwd, since_ms)
+}
+
+/// 测试 / list 同源：在给定数据根下按 createdAt(since) + workDir|cwd 扫会话 id。
+pub(crate) fn scan_kimi_session_times_in(
+    data_root: &Path,
+    cwd: &str,
+    since_ms: i64,
+) -> Vec<(String, i64)> {
     let root = data_root.join("sessions");
     if !root.is_dir() {
         return Vec::new();
@@ -1777,19 +1814,14 @@ fn scan_kimi_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
             continue;
         };
-        let created = v
-            .get("createdAt")
-            .and_then(|value| value.as_str())
-            .map(rfc3339_ms)
-            .unwrap_or(0);
+        if kimi_is_archived(&v) {
+            continue;
+        }
+        let created = kimi_ts_ms(&v, "createdAt");
         if created < since_ms {
             continue;
         }
-        if v.get("workDir")
-            .and_then(|value| value.as_str())
-            .map(|value| same_path(value, cwd))
-            != Some(true)
-        {
+        if kimi_session_workdir(&v).map(|value| same_path(value, cwd)) != Some(true) {
             continue;
         }
         let Some(session_dir) = p.parent() else {
@@ -2314,9 +2346,10 @@ fn capture_kimi_ids(cwd: &str, since_ms: i64) -> Vec<String> {
 mod tests {
     use super::{
         canonical_existing_under, codex_label, cursor_bucket, cursor_label,
-        first_prompt_from_history, list_codex_sessions_in, locate_claude_session_in,
-        locate_codex_session_in, locate_cursor_session_in, parse_codex_session_titles,
-        validate_codex_relative_path, validate_session_id, ExistingPathKind,
+        first_prompt_from_history, list_codex_sessions_in, list_kimi_sessions_in,
+        locate_claude_session_in, locate_codex_session_in, locate_cursor_session_in,
+        parse_codex_session_titles, scan_kimi_session_times_in, validate_codex_relative_path,
+        validate_session_id, ExistingPathKind,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -2832,5 +2865,119 @@ mod tests {
 
         let all_blank = serde_json::json!(["", "   "]);
         assert_eq!(first_prompt_from_history(&all_blank), None);
+    }
+
+    const KIMI_V1_ID: &str = "session_11111111-1111-4111-8111-111111111111";
+    const KIMI_V2_ID: &str = "session_22222222-2222-4222-8222-222222222222";
+    const KIMI_V2_ARCHIVED_ID: &str = "session_33333333-3333-4333-8333-333333333333";
+    const KIMI_V2_OTHER_ID: &str = "session_44444444-4444-4444-8444-444444444444";
+    /// 与现场 v2 实证同量级的 epoch 毫秒（≈2026-08-07）。
+    const KIMI_V2_CREATED_MS: i64 = 1_786_107_797_534;
+    const KIMI_V2_UPDATED_MS: i64 = 1_786_107_896_324;
+
+    fn write_kimi_state(data_root: &Path, bucket: &str, session_id: &str, state: &Value) {
+        let dir = data_root.join("sessions").join(bucket).join(session_id);
+        fs::create_dir_all(&dir).expect("create kimi session dir");
+        fs::write(
+            dir.join("state.json"),
+            serde_json::to_vec_pretty(state).expect("serialize kimi state"),
+        )
+        .expect("write kimi state.json");
+    }
+
+    #[test]
+    fn list_kimi_sessions_reads_v1_workdir_and_v2_cwd_with_dual_timestamps() {
+        let ctx = test_home();
+        let cwd = path_text(&ctx.workspace).replace('\\', "/");
+        let bucket = "wd_fixture_test";
+
+        write_kimi_state(
+            &ctx.home,
+            bucket,
+            KIMI_V1_ID,
+            &json!({
+                "createdAt": "2026-08-06T06:12:18.365Z",
+                "updatedAt": "2026-08-06T14:30:35.119Z",
+                "title": "v1-session",
+                "workDir": cwd,
+                "lastPrompt": "old"
+            }),
+        );
+        write_kimi_state(
+            &ctx.home,
+            bucket,
+            KIMI_V2_ID,
+            &json!({
+                "id": KIMI_V2_ID,
+                "version": 2,
+                "cwd": cwd,
+                "createdAt": KIMI_V2_CREATED_MS,
+                "updatedAt": KIMI_V2_UPDATED_MS,
+                "archived": false,
+                "title": "v2-session",
+                "lastPrompt": "hello"
+            }),
+        );
+        // 其它工作区 v2 —— 不得列入
+        write_kimi_state(
+            &ctx.home,
+            bucket,
+            KIMI_V2_OTHER_ID,
+            &json!({
+                "version": 2,
+                "cwd": path_text(&ctx.other_workspace).replace('\\', "/"),
+                "createdAt": KIMI_V2_CREATED_MS,
+                "updatedAt": KIMI_V2_UPDATED_MS,
+                "title": "other-ws",
+            }),
+        );
+        // 已归档 —— 决策 A 跳过
+        write_kimi_state(
+            &ctx.home,
+            bucket,
+            KIMI_V2_ARCHIVED_ID,
+            &json!({
+                "version": 2,
+                "cwd": cwd,
+                "createdAt": KIMI_V2_CREATED_MS + 1,
+                "updatedAt": KIMI_V2_UPDATED_MS + 1,
+                "archived": true,
+                "title": "archived",
+            }),
+        );
+
+        let listed = list_kimi_sessions_in(&ctx.home, &cwd);
+        assert_eq!(listed.len(), 2, "应同时列出 v1+v2，排除其它 cwd 与 archived");
+        assert_eq!(listed[0].id, KIMI_V2_ID, "v2 updatedAt 更新 → 排前");
+        assert_eq!(listed[0].label, "v2-session");
+        assert_eq!(listed[0].ts, KIMI_V2_UPDATED_MS);
+        assert_eq!(listed[1].id, KIMI_V1_ID);
+        assert_eq!(listed[1].label, "v1-session");
+        assert!(listed[1].ts > 0, "v1 RFC3339 应解析为非零 ms");
+
+        let captured = scan_kimi_session_times_in(&ctx.home, &cwd, KIMI_V2_CREATED_MS);
+        assert_eq!(
+            captured.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec![KIMI_V2_ID],
+            "capture 应按 epoch createdAt 命中 v2，且跳过 archived"
+        );
+    }
+
+    #[test]
+    fn list_kimi_sessions_skips_v2_without_path() {
+        let ctx = test_home();
+        let cwd = path_text(&ctx.workspace).replace('\\', "/");
+        write_kimi_state(
+            &ctx.home,
+            "wd_empty",
+            KIMI_V2_ID,
+            &json!({
+                "version": 2,
+                "createdAt": KIMI_V2_CREATED_MS,
+                "updatedAt": KIMI_V2_UPDATED_MS,
+                "title": "no-cwd",
+            }),
+        );
+        assert!(list_kimi_sessions_in(&ctx.home, &cwd).is_empty());
     }
 }
