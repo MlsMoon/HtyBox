@@ -15,9 +15,11 @@ use zip::{CompressionMethod, HasZipMetadata, ZipArchive, ZipWriter};
 
 pub const SESSION_FORMAT: &str = "htybox.session";
 pub const MEMORY_FORMAT: &str = "htybox.memory";
+pub const ACCOUNTS_FORMAT: &str = "htybox.accounts";
 pub const PACKAGE_VERSION: u32 = 1;
 pub const SESSION_EXTENSION: &str = "htybox-session";
 pub const MEMORY_EXTENSION: &str = "htybox-memory";
+pub const ACCOUNTS_EXTENSION: &str = "htybox-accounts";
 const MANIFEST_NAME: &str = "manifest.json";
 const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -26,6 +28,7 @@ const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
 pub enum PackageKind {
     Session,
     Memory,
+    Accounts,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -104,12 +107,24 @@ pub struct MemoryManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsManifest {
+    pub version: u32,
+    pub kind: PackageKind,
+    pub exported_at_ms: i64,
+    pub preset_count: usize,
+    pub entries: Vec<ManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "format")]
 pub enum PortableManifest {
     #[serde(rename = "htybox.session")]
     Session(SessionManifest),
     #[serde(rename = "htybox.memory")]
     Memory(MemoryManifest),
+    #[serde(rename = "htybox.accounts")]
+    Accounts(AccountsManifest),
 }
 
 impl PortableManifest {
@@ -117,6 +132,7 @@ impl PortableManifest {
         match self {
             Self::Session(_) => SESSION_FORMAT,
             Self::Memory(_) => MEMORY_FORMAT,
+            Self::Accounts(_) => ACCOUNTS_FORMAT,
         }
     }
 
@@ -124,6 +140,7 @@ impl PortableManifest {
         match self {
             Self::Session(_) => SESSION_EXTENSION,
             Self::Memory(_) => MEMORY_EXTENSION,
+            Self::Accounts(_) => ACCOUNTS_EXTENSION,
         }
     }
 
@@ -131,6 +148,7 @@ impl PortableManifest {
         match self {
             Self::Session(value) => &value.entries,
             Self::Memory(value) => &value.entries,
+            Self::Accounts(value) => &value.entries,
         }
     }
 
@@ -138,6 +156,7 @@ impl PortableManifest {
         match self {
             Self::Session(value) => &mut value.entries,
             Self::Memory(value) => &mut value.entries,
+            Self::Accounts(value) => &mut value.entries,
         }
     }
 
@@ -148,6 +167,7 @@ impl PortableManifest {
         match self {
             Self::Session(value) => validate_session_manifest(value),
             Self::Memory(value) => validate_memory_manifest(value),
+            Self::Accounts(value) => validate_accounts_manifest(value),
         }
     }
 }
@@ -276,6 +296,19 @@ fn validate_memory_manifest(value: &MemoryManifest) -> Result<(), String> {
     validate_manifest_entries(&value.entries)
 }
 
+fn validate_accounts_manifest(value: &AccountsManifest) -> Result<(), String> {
+    if value.kind != PackageKind::Accounts {
+        return Err("Accounts 包必须声明 kind=accounts".into());
+    }
+    if value.version != PACKAGE_VERSION {
+        return Err(format!("不支持的包版本：{}", value.version));
+    }
+    if value.exported_at_ms < 0 {
+        return Err("manifest exportedAtMs 不能为负数".into());
+    }
+    validate_manifest_entries(&value.entries)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ArchiveLimits {
     pub max_entries: usize,
@@ -299,6 +332,15 @@ impl ArchiveLimits {
             max_entries: 20_000,
             max_file_bytes: 64 * 1024 * 1024,
             max_total_bytes: 512 * 1024 * 1024,
+            max_compression_ratio: 1_000,
+        }
+    }
+    /// 账号预设包：单个 JSON，条目极少、体积小。
+    pub const fn accounts() -> Self {
+        Self {
+            max_entries: 16,
+            max_file_bytes: 4 * 1024 * 1024,
+            max_total_bytes: 8 * 1024 * 1024,
             max_compression_ratio: 1_000,
         }
     }

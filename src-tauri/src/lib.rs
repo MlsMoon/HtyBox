@@ -1,3 +1,4 @@
+mod agent_accounts;
 mod agent_env;
 mod broker;
 mod catalog;
@@ -99,6 +100,71 @@ async fn detect_agents() -> Result<Vec<agent_env::AgentInstallStatus>, String> {
         .await
         .map_err(|error| format!("agent 安装检测任务失败：{error}"))?)
 }
+
+// ---------- Agent 配置：账号 / API Key 预设（cc-switch 式，第一期 kimi） ----------
+
+/// 列出某 agent 的预设（掩码视图，不含明文密钥）+ 当前现场生效态。
+#[tauri::command]
+fn agent_accounts_list(agent: String) -> Result<agent_accounts::ListResult, String> {
+    agent_accounts::list(&agent)
+}
+
+/// 新建 / 更新 API Key 预设（id 空 = 新建；更新时 apiKey 传空串 = 保持原 key）。
+#[tauri::command]
+fn agent_accounts_save_apikey(
+    agent: String,
+    id: Option<String>,
+    name: String,
+    api_key: String,
+    base_url: Option<String>,
+) -> Result<(), String> {
+    agent_accounts::save_apikey(&agent, id, &name, &api_key, base_url)
+}
+
+#[tauri::command]
+fn agent_accounts_rename(agent: String, id: String, name: String) -> Result<(), String> {
+    agent_accounts::rename(&agent, &id, &name)
+}
+
+#[tauri::command]
+fn agent_accounts_remove(agent: String, id: String) -> Result<(), String> {
+    agent_accounts::remove(&agent, &id)
+}
+
+/// 一键切换（互斥：切 apikey 撤下 OAuth 凭证 / 切 oauth 清空 api_key；切走前自动重快照保鲜）。
+#[tauri::command]
+fn agent_accounts_apply(agent: String, id: String) -> Result<agent_accounts::ApplyResult, String> {
+    agent_accounts::apply(&agent, &id)
+}
+
+/// 隔离登录（KIMI_CODE_HOME staging + kimi login device-code），返回轮询句柄。
+#[tauri::command]
+fn agent_accounts_login_start(agent: String, name: String) -> Result<String, String> {
+    agent_accounts::login_start(&agent, &name)
+}
+
+#[tauri::command]
+fn agent_accounts_login_poll(handle: String) -> Result<agent_accounts::LoginPoll, String> {
+    agent_accounts::login_poll(&handle)
+}
+
+#[tauri::command]
+fn agent_accounts_login_cancel(handle: String) -> Result<(), String> {
+    agent_accounts::login_cancel(&handle)
+}
+
+/// 导出全部预设为 `.htybox-accounts` 包，返回最终文件路径。
+#[tauri::command]
+fn agent_accounts_export(destination: String) -> Result<String, String> {
+    agent_accounts::export_package(&destination)
+}
+
+/// 导入 `.htybox-accounts` 包（快照替换 + 原子回滚），返回导入的预设数。
+#[tauri::command]
+fn agent_accounts_import(source: String) -> Result<usize, String> {
+    agent_accounts::import_package(&source)
+}
+
 
 /// Channel → 同步进度回调(Mutex 包一层以满足 Send+Sync,供 spawn_blocking 内多线程 reader 调用)。
 fn agent_progress_cb(
@@ -1520,6 +1586,16 @@ pub fn run() {
             detect_agents,
             install_agent,
             update_agent,
+            agent_accounts_list,
+            agent_accounts_save_apikey,
+            agent_accounts_rename,
+            agent_accounts_remove,
+            agent_accounts_apply,
+            agent_accounts_login_start,
+            agent_accounts_login_poll,
+            agent_accounts_login_cancel,
+            agent_accounts_export,
+            agent_accounts_import,
             mcp_broker_url,
             setup_mcp_agent,
             write_agent_brief,

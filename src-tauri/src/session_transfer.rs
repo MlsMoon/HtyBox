@@ -1174,7 +1174,7 @@ mod tests {
             .expect("valid exported package")
         {
             PortableManifest::Session(value) => value,
-            PortableManifest::Memory(_) => panic!("unexpected memory package"),
+            _ => panic!("unexpected non-session package"),
         }
     }
 

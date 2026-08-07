@@ -6,6 +6,7 @@ import { loadIgnore } from "../fileIgnore";
 import { countWorkspaceFiles } from "../catalog";
 import ConnectionSettings from "./ConnectionSettings";
 import AgentSettings from "./AgentSettings";
+import AgentAccountsSettings from "./AgentAccountsSettings";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { checkForUpdateDetailed, type Update } from "../updater";
@@ -226,6 +227,7 @@ type SectionKey =
   | "appearance"
   | "terminal"
   | "agents"
+  | "agentAccounts"
   | "files"
   | "skill"
   | "htyenv"
@@ -236,6 +238,7 @@ const SECTIONS: { key: SectionKey; label: string }[] = [
   { key: "appearance", label: "外观" },
   { key: "terminal", label: "终端" },
   { key: "agents", label: "Agent" },
+  { key: "agentAccounts", label: "Agent 配置" },
   { key: "files", label: "文件与搜索" },
   { key: "skill", label: "Skill" },
   { key: "htyenv", label: "hty环境" },
@@ -867,6 +870,7 @@ export default function SettingsModal({
               </div>
             )}
             {section === "agents" && <AgentSettings />}
+            {section === "agentAccounts" && <AgentAccountsSettings />}
             {section === "connection" && <ConnectionSettings />}
             {section === "help" && (
               <div className="space-y-1 pb-2">
@@ -878,7 +882,7 @@ export default function SettingsModal({
                   <HelpRow keys="Shift+Enter" desc="换行" />
                   <HelpRow keys="/" desc="唤出已上架 Skill 列表，↑↓ / Tab 选择，Enter 补全" />
                   <HelpRow keys="Left Ctrl+S" desc="暂存当前输入并清空；再按一次恢复；发送临时内容后自动填回暂存" />
-                  <HelpRow keys="Left Ctrl+C" desc="清空当前输入（不影响已暂存内容）" />
+                  <HelpRow keys="Left Ctrl+Space" desc="清空当前输入（不影响已暂存内容）" />
                   <HelpRow keys="Ctrl+V" desc="剪贴板为图片时附加为附件；有文本时正常粘贴" />
                   <HelpRow keys="Ctrl+Shift+I" desc="开关内置输入框并记住为全局默认（无工作流时）/ 展开工作流输入（有工作流时）" />
                   <HelpRow keys="拖入" desc="左栏 Skill / 文件 / 记忆 / 书签可拖入输入框末尾追加" />

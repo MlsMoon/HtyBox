@@ -32,7 +32,7 @@ export type StashMap = Record<string, string>;
 
 /**
  * Left Ctrl+S：暂存并清空 / 再按恢复（对齐 Claude Code）。
- * Left Ctrl+C：清空当前输入（不碰暂存）。
+ * Left Ctrl+Space：清空当前输入（不碰暂存）。
  * 返回 true = 已处理。
  */
 export function handleInputStashKey(
@@ -61,7 +61,7 @@ export function handleInputStashKey(
     return true;
   }
 
-  if (k === "c" || k === "C") {
+  if (e.code === "Space") {
     e.preventDefault();
     setText("");
     return true;
