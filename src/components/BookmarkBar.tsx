@@ -5,6 +5,11 @@ import { useMaskDismiss } from "./ui/maskDismiss";
 import ContextMenu, { MENU_SEP } from "./ui/ContextMenu";
 import { deleteEntry, readImageDataUrl } from "../catalog";
 import {
+  hasPrimaryShortcutModifier,
+  readClipboardText,
+  writeClipboardText,
+} from "../platformServices";
+import {
   beginClipboardPasteBusy,
   endClipboardPasteBusy,
 } from "../clipboardPasteBusy";
@@ -280,8 +285,7 @@ function BookmarkEditor({
         .catch(() => {})
         .finally(() => endClipboardPasteBusy());
     };
-    navigator.clipboard
-      ?.readText()
+    readClipboardText()
       .then((raw) => {
         if (!raw) fwd();
       })
@@ -332,7 +336,7 @@ function BookmarkEditor({
         onChange={(e) => setBody(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Escape") cancel();
-          if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
+          if (hasPrimaryShortcutModifier(e) && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
         }}
         placeholder="内容（可空；无图时标题与内容至少填一个）"
         rows={5}
@@ -608,7 +612,7 @@ export default function BookmarkBar({ scope, workspacePath }: { scope: string; w
           onAction={(id) => {
             const b = menu.b;
             if (id === "edit") setEditing(b);
-            else if (id === "copy") navigator.clipboard.writeText(copyTextOf(b)).catch(() => {});
+            else if (id === "copy") writeClipboardText(copyTextOf(b)).catch(() => {});
             else if (id === "important") toggleImportant(scope, b.id);
             else if (id === "delete") quickDelete(b); // 与快捷按钮同路径：直删+撤销（决策 2=B 统一）
           }}

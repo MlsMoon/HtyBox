@@ -8,6 +8,7 @@ pub mod htyenv; // hty环境引擎:pub 供独立测试 harness/后续命令层�
 pub mod large_text; // plan-1:大文本分片读(pub 供独立验证 bin 调用)
 mod memory_transfer;
 mod portable_archive;
+mod platform_services;
 mod pty;
 mod relay_client;
 mod session_import;
@@ -93,7 +94,7 @@ fn ws_port(state: State<'_, AppState>) -> u16 {
     state.ws_port
 }
 
-/// 设置「Agent」页：检测四家 agent CLI 安装状态（where.exe + --version + latest 对比）。
+/// 设置「Agent」页：检测四家 agent CLI 安装状态（平台命令查找 + --version + latest 对比）。
 #[tauri::command]
 async fn detect_agents() -> Result<Vec<agent_env::AgentInstallStatus>, String> {
     Ok(tauri::async_runtime::spawn_blocking(agent_env::detect_agents)
@@ -178,7 +179,7 @@ fn agent_progress_cb(
     })
 }
 
-/// 设置「Agent」页：对**单个** agent 跑官方 Windows 安装脚本（流式进度，300s 超时）。
+/// 设置「Agent」页：对**单个** agent 跑目标平台官方安装命令（流式进度，300s 超时）。
 #[tauri::command]
 async fn install_agent(
     id: String,
@@ -935,6 +936,15 @@ fn list_dir(path: String) -> Result<Vec<fs_tree::DirEntry>, String> {
     fs_tree::list_dir(&path)
 }
 
+/// 通过平台适配层把工作区与独立路径段解析为本机绝对路径。
+#[tauri::command]
+fn resolve_workspace_path(
+    workspace_dir: String,
+    components: Vec<String>,
+) -> Result<String, String> {
+    platform_services::platform_services().workspace_path(&workspace_dir, &components)
+}
+
 /// M9：读文本文件（目录 → Err；超上限/二进制 → editable=false；文本白名单/强制 → 有损打开）。
 /// force_lossy / max_bytes / max_open_bytes 可选（invoke 侧 forceLossy / maxBytes / maxOpenBytes），
 /// 缺省 = 不强制 / 编辑上限 10MB / 可打开上限 512MB（超编辑上限但可打开 → viewable=true 供分流）。
@@ -1063,9 +1073,41 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
     fs_tree::reveal_in_explorer(&path)
 }
 
+/// 返回当前平台的主快捷键是否使用 Meta（macOS 的 Command）。
+#[tauri::command]
+fn primary_shortcut_uses_meta() -> bool {
+    platform_services::platform_services().primary_shortcut_uses_meta()
+}
+
+/// 返回前端需要的平台能力；平台判断由适配层统一提供。
+#[tauri::command]
+fn platform_capabilities() -> platform_services::PlatformCapabilities {
+    platform_services::platform_services().capabilities()
+}
+
+/// 通过平台适配层写入系统文本剪贴板。
+#[tauri::command]
+async fn write_clipboard_text(text: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        platform_services::platform_services().write_clipboard_text(&text)
+    })
+    .await
+    .map_err(|error| format!("系统剪贴板写入任务失败：{error}"))?
+}
+
+/// 通过平台适配层读取系统文本剪贴板。
+#[tauri::command]
+async fn read_clipboard_text() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        platform_services::platform_services().read_clipboard_text()
+    })
+    .await
+    .map_err(|error| format!("系统剪贴板读取任务失败：{error}"))?
+}
+
 /// 剪贴板图片存到 `<工作区>/.htybox/<subdir>/`，返回绝对路径（剪贴板无图返回 Err）。
 /// `subdir` 缺省/`None`/`""` → `"tmp"`（终端/Flow）；书签传 `"bookmarks"`（无 48h 清理）。
-/// 重活（PowerShell 读图 + PNG 落盘）走 spawn_blocking，避免同步命令堵死 UI。
+/// 重活（平台剪贴板读取 + PNG 落盘）走 spawn_blocking，避免同步命令堵死 UI。
 #[tauri::command]
 async fn save_clipboard_image(
     workspace_dir: String,
@@ -1550,6 +1592,7 @@ pub fn run() {
             set_skill_enabled,
             apply_skill_template,
             list_dir,
+            resolve_workspace_path,
             read_text_file,
             open_text_document,
             read_text_lines,
@@ -1566,6 +1609,10 @@ pub fn run() {
             import_make_dir,
             import_dropped_entry,
             reveal_in_explorer,
+            primary_shortcut_uses_meta,
+            platform_capabilities,
+            write_clipboard_text,
+            read_clipboard_text,
             save_clipboard_image,
             set_screenshot_hotkey_enabled,
             watch_file,

@@ -271,6 +271,10 @@ export interface DirEntry {
 /** 列某目录的直接子项。 */
 export const listDir = (path: string) => invoke<DirEntry[]>("list_dir", { path });
 
+/** 由后端平台适配层将工作区与路径段解析为本机绝对路径。 */
+export const resolveWorkspacePath = (workspaceDir: string, components: string[]) =>
+  invoke<string>("resolve_workspace_path", { workspaceDir, components });
+
 // ---- M9：文件读写 / 增删改 ----
 export interface ReadTextResult {
   content: string;

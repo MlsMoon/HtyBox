@@ -58,6 +58,7 @@ import { registerDockHost, emitActiveFile, openEditor as routeOpenEditor } from 
 import { registerFileOpener, registerFileRevealer } from "../fileOpenBus";
 import * as previewWin from "../previewWindow";
 import { EV_READY } from "../previewProtocol";
+import { hasPrimaryShortcutModifier } from "../platformServices";
 import { getSettings } from "../settings";
 import {
   listClaudeSessions,
@@ -712,7 +713,7 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
 
     // Ctrl+Shift+I：仅当前活动终端面板唤起内置输入（自由输入切换 / 工作流输入展开）
     const onHotkey = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey && e.shiftKey && !e.altKey && (e.key === "I" || e.key === "i"))) return;
+      if (!(hasPrimaryShortcutModifier(e) && e.shiftKey && !e.altKey && (e.key === "I" || e.key === "i"))) return;
       if (!apiRef.current.isActive || !apiRef.current.isVisible) return;
       e.preventDefault();
       e.stopPropagation();

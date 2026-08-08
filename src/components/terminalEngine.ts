@@ -6,6 +6,14 @@ import { pingAgentActivity } from "../agentStatus";
 import { attachMiddleScroll } from "../middleScroll";
 import { isAgentTerminal } from "../profiles";
 import {
+  hasPrimaryShortcutModifier,
+  isWindowsPlatform,
+  macosTerminalTextInputData,
+  primaryShortcutUsesMeta,
+  readClipboardText,
+  writeClipboardText,
+} from "../platformServices";
+import {
   beginClipboardPasteBusy,
   endClipboardPasteBusy,
 } from "../clipboardPasteBusy";
@@ -44,6 +52,7 @@ interface Engine {
   agentKind?: string; // "claude"|"codex"|"cursor"|"shell"：决定是否把 PTY 活动上报运行状态总线
   lastPingAt?: number; // 最近一次向 agentStatus 上报活动的时刻（节流 PTY 高频输出，避免每帧都 ping）
   midScroll: () => void; // 解绑中键自动滚动（dispose 时调用；见 middleScroll.ts）
+  textInputCleanup?: () => void; // 解绑 macOS WebKit 文本提交修正
 }
 
 const engines = new Map<string, Engine>();
@@ -97,7 +106,7 @@ export function ensureEngine(
     // resize 时 xterm 重排行 + ConPTY 整屏重绘【双重处理】→ 行错位/重复/叠影（claude 退出 resume
     // 选择器整屏重绘时最明显）。buildNumber 暂硬编码当前系统(Win10 19045)，待加 Rust 动态获取以
     // 适配 Win11(>=21376 时 ConPTY 支持 reflow、xterm 不禁用)。
-    windowsPty: navigator.userAgent.includes("Windows")
+    windowsPty: isWindowsPlatform()
       ? { backend: "conpty", buildNumber: 19045 }
       : undefined,
   });
@@ -113,15 +122,14 @@ export function ensureEngine(
   );
 
   // 复制粘贴：
-  // · Ctrl+V → 用 navigator.clipboard 读剪贴板(本 WebView 实测可用；paste 事件的 clipboardData
-  //   在 WebView2 读不到，故不用)，按 agent 规范化换行 + bracketed 包裹后注入。
-  //   读到空/异常且是 agent 终端 → 剪贴板多半是【图片/截图】：后端把剪贴板位图存到
+  // · Ctrl/Cmd+V → 通过平台层读剪贴板，按 agent 规范化换行 + bracketed 包裹后注入。
+  //   成功读到空文本且是 agent 终端 → 剪贴板多半是【图片/截图】：后端把剪贴板位图存到
   //   <工作区>/.htybox/tmp/clip-<ts>.png（真存储，48h 自动清理），注入其 `@路径 ` 引用文本
   //   （与拖文件进终端同一语义）。注：透传 0x16/win32 键事件均无法触发 claude 原生 imagePaste
   //   （ConPTY 探针实证），勿再走键盘注入路线。
-  // · Ctrl+C → 有选区复制并清选区，无选区放行(=SIGINT)。
+  // · Ctrl/Cmd+C → 有选区复制并清选区；Ctrl+C 无选区放行(=SIGINT)，Cmd+C 无选区不发送。
   term.attachCustomKeyEventHandler((e) => {
-    if (e.type !== "keydown" || !e.ctrlKey || e.altKey) return true;
+    if (e.type !== "keydown" || !hasPrimaryShortcutModifier(e) || e.altKey) return true;
     if (e.key === "v" || e.key === "V") {
       const pasteClipImage = () => {
         if (!isAgentTerminal(agentKind)) return;
@@ -135,8 +143,7 @@ export function ensureEngine(
           .catch(() => {}) // 剪贴板无图 → 静默
           .finally(() => endClipboardPasteBusy());
       };
-      navigator.clipboard
-        ?.readText()
+      readClipboardText()
         .then((raw) => {
           if (raw)
             invoke("write_terminal", {
@@ -145,16 +152,18 @@ export function ensureEngine(
             }).catch(() => {});
           else pasteClipImage();
         })
-        .catch(pasteClipImage);
+        .catch(() => {});
       return false;
     }
     if ((e.key === "c" || e.key === "C") && !e.shiftKey) {
       const sel = term.getSelection();
       if (sel) {
-        navigator.clipboard?.writeText(sel).catch(() => {});
-        term.clearSelection();
+        writeClipboardText(sel)
+          .then(() => term.clearSelection())
+          .catch(() => {});
         return false;
       }
+      if (primaryShortcutUsesMeta()) return false;
     }
     return true;
   });
@@ -186,6 +195,20 @@ export function ensureEngine(
     // 中键自动滚动挂宿主 el（与 paste 拦截同位置）：跟随引擎生命周期，dockview 重排不丢
     midScroll: attachMiddleScroll(term, el),
   });
+}
+
+function installTerminalTextInputHandler(engine: Engine): () => void {
+  const textarea = engine.term.textarea;
+  if (!textarea) return () => {};
+  const onBeforeInput = (event: InputEvent) => {
+    const data = macosTerminalTextInputData(event);
+    if (data === undefined) return;
+    event.preventDefault();
+    event.stopPropagation();
+    engine.term.input(data, true);
+  };
+  textarea.addEventListener("beforeinput", onBeforeInput, true);
+  return () => textarea.removeEventListener("beforeinput", onBeforeInput, true);
 }
 
 /** 按"当前已 fit 的真实列宽"创建后端 PTY（每个引擎只建一次）。 */
@@ -267,6 +290,7 @@ function doFit(termId: string): void {
   if (!e.opened) {
     e.term.open(e.el);
     e.opened = true;
+    e.textInputCleanup = installTerminalTextInputHandler(e);
     // 激活 Unicode 11 宽度表（须在 open 后）：与 claude/ConPTY 的宽字符列计算对齐，避免列错位
     try {
       e.term.unicode.activeVersion = "11";
@@ -326,6 +350,7 @@ export function disposeEngine(termId: string): void {
   if (!e) return;
   e.ro?.disconnect();
   if (e.fitTimer) clearTimeout(e.fitTimer);
+  e.textInputCleanup?.();
   e.midScroll(); // 解绑中键滚动；若滚动会话正属于本终端则一并清场
   if (e.created) invoke("close_terminal", { id: termId }).catch(() => {});
   e.term.dispose();

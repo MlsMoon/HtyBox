@@ -60,7 +60,7 @@ export interface ActiveSkillRoot {
 }
 
 export function normalizeSkillsRel(input: string): string {
-  return input.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  return input.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
 }
 
 export function validateSkillsRel(input: string): string | null {

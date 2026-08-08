@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
@@ -668,9 +668,12 @@ pub fn login_start(agent: &str, name: &str) -> Result<String, String> {
     let staging = tmp_root()?.join(format!("{LOGIN_STAGING_PREFIX}{:x}", now_millis()));
     fs::create_dir_all(&staging).map_err(|e| format!("创建登录隔离目录失败：{e}"))?;
 
-    // cmd /C 解析 PATH 里的 .cmd shim（同 agent_env agent_cli_command 范式）；2>&1 合并便于单管读取
-    let mut child = Command::new("cmd.exe")
-        .args(["/D", "/C", "kimi login 2>&1"])
+    // 通过平台 shell 启动，兼容 Windows 的 .cmd shim 和 macOS 的 Unix PATH。
+    let mut child = crate::platform_services::platform_services().agent_command(
+        "kimi",
+        &["login", "2>&1"],
+        &crate::agent_env::fresh_path(),
+    )
         .env("KIMI_CODE_HOME", &staging)
         .env("CI", "1")
         .stdin(Stdio::null())
@@ -723,17 +726,9 @@ pub fn login_start(agent: &str, name: &str) -> Result<String, String> {
     Ok(handle)
 }
 
-/// 杀登录进程树：Child::kill 只杀 cmd 壳，kimi node 孙进程会成孤儿继续持有
-/// staging 文件句柄导致隔离目录删不掉；taskkill /T /F 杀整棵树。
+/// 终止登录进程；Windows 平台实现会额外处理 cmd 子树，避免 staging 文件句柄残留。
 fn kill_process_tree(child: &mut Child) {
-    let pid = child.id().to_string();
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid, "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = child.kill();
+    crate::platform_services::platform_services().kill_process_tree(child);
 }
 
 /// 清理登录隔离目录。调用点须已将会话移出登录表 —— 本函数绝不触碰登录表，

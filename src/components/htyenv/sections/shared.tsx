@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { injectIntoTerminal, listEngines } from "../../terminalEngine";
+import { writeClipboardText } from "../../../platformServices";
 
 export const fmtUtc = (utc?: string) =>
   utc && utc.length >= 16 ? utc.slice(5, 16).replace("T", " ") : "-";
@@ -110,7 +111,7 @@ export function InjectModal({
         <div className="mt-3 flex justify-end gap-2">
           <button
             onClick={() =>
-              navigator.clipboard.writeText(text).then(() => setCopied(true)).catch(() => setCopied(false))
+              writeClipboardText(text).then(() => setCopied(true)).catch(() => setCopied(false))
             }
             className="rounded-md border border-[var(--accent-border)] px-3 py-1 text-[12px] text-[var(--accent-text)] hover:bg-[var(--accent-soft)]"
           >

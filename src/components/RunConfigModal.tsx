@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { saveConfigs, emptyConfig, parseImport, buildAiPrompt, type RunConfig } from "../runConfigs";
-import { readTextFile } from "../catalog";
+import { readTextFile, resolveWorkspacePath } from "../catalog";
+import { writeClipboardText } from "../platformServices";
 import { useMaskDismiss } from "./ui/maskDismiss";
 
 function PlayIcon() {
@@ -41,7 +42,8 @@ export default function RunConfigModal({
   // 从 <工作区>/.htybox/run-configs.json 导入（按名去重，仅追加新配置）
   const importFromProject = async () => {
     try {
-      const r = await readTextFile(`${root}\\.htybox\\run-configs.json`);
+      const path = await resolveWorkspacePath(root, [".htybox", "run-configs.json"]);
+      const r = await readTextFile(path);
       if (!r.editable) return setImportMsg("无法读取 .htybox/run-configs.json");
       const names = new Set(list.map((c) => c.name));
       const fresh = parseImport(r.content).filter((c) => !names.has(c.name));
@@ -54,7 +56,7 @@ export default function RunConfigModal({
   };
   // 复制"AI 自动配置"提示词：粘到终端里的 AI，让它生成 .htybox/run-configs.json，再回来点「从项目导入」
   const copyAiPrompt = () => {
-    navigator.clipboard?.writeText(buildAiPrompt(root)).then(
+    writeClipboardText(buildAiPrompt(root)).then(
       () => setImportMsg("已复制提示词，粘给终端里的 AI"),
       () => setImportMsg("复制失败"),
     );

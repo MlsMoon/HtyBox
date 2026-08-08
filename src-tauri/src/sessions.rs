@@ -315,7 +315,18 @@ pub(crate) fn locate_claude_session_in(
     let workspace = canonical_workspace(cwd)?;
     let claude_root = home.join(".claude");
     let projects_root = claude_root.join("projects");
-    let expected_slug = crate::catalog::claude_project_slug(cwd)?;
+    let mut expected_slugs = vec![crate::catalog::claude_project_slug(cwd)?];
+    let canonical_slug = crate::catalog::claude_project_slug(
+        workspace
+            .to_str()
+            .ok_or_else(|| "规范工作区路径不是 UTF-8".to_string())?,
+    )?;
+    if !expected_slugs
+        .iter()
+        .any(|slug| slug.eq_ignore_ascii_case(&canonical_slug))
+    {
+        expected_slugs.push(canonical_slug);
+    }
     let root_metadata = crate::portable_archive::reject_link_or_reparse(&projects_root)?;
     if !root_metadata.is_dir() {
         return Err("Claude projects 根目录不存在".into());
@@ -356,7 +367,10 @@ pub(crate) fn locate_claude_session_in(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("");
-    if !actual_slug.eq_ignore_ascii_case(&expected_slug) {
+    if !expected_slugs
+        .iter()
+        .any(|slug| actual_slug.eq_ignore_ascii_case(slug))
+    {
         return Err("Claude transcript 不在当前工作区对应 project bucket".into());
     }
     let (source_cwd, source_agent_version) =
@@ -434,7 +448,10 @@ pub(crate) fn list_claude_sessions_in(home_dir: &Path, cwd: &str) -> Vec<Session
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        if v.get("project").and_then(|p| p.as_str()) != Some(cwd) {
+        let Some(project) = v.get("project").and_then(|p| p.as_str()) else {
+            continue;
+        };
+        if !same_path(project, cwd) {
             continue;
         }
         let Some(id) = v.get("sessionId").and_then(|s| s.as_str()) else {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { writeClipboardText } from "../platformServices";
 import {
   applyPreset,
   exportAccounts,
@@ -258,7 +259,7 @@ function LoginModal({ onDone, onClose }: { onDone: () => void; onClose: () => vo
                 {poll.url.replace(/^https?:\/\/(www\.)?/, "").split("?")[0]}
               </span>
               <button
-                onClick={() => void navigator.clipboard.writeText(poll.url ?? "")}
+                onClick={() => void writeClipboardText(poll.url ?? "")}
                 className={btnCls + " px-2 py-1 text-[11px]"}
               >
                 复制链接

@@ -2,6 +2,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import { initFont } from "./fonts";
 import { initTheme } from "./theme";
+import { initPlatformServices } from "./platformServices";
 import { IconProvider, DEFAULT_ICON_CONFIGS } from "@icon-park/react";
 import "allotment/dist/style.css";
 import "@icon-park/react/styles/index.css";
@@ -23,8 +24,12 @@ const ICON_CONFIG = {
 initFont();
 initTheme();
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <IconProvider value={ICON_CONFIG}>
-    <App />
-  </IconProvider>
-);
+const renderApp = () => {
+  ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+    <IconProvider value={ICON_CONFIG}>
+      <App />
+    </IconProvider>,
+  );
+};
+
+void initPlatformServices().finally(renderApp);

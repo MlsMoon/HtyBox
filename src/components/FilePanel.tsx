@@ -23,6 +23,7 @@ import { loadIgnore, saveIgnore, extOf, type IgnoreCfg } from "../fileIgnore";
 import { loadFavFolders, toggleFavFolder as toggleFavStored, remapFavPaths, onFavFoldersChange } from "../favFolders";
 import { getWsState, setWsState } from "../wsState";
 import { useSettings } from "../settings";
+import { writeClipboardText } from "../platformServices";
 
 const DRAG_MIME = "application/x-htybox-item";
 const MAX_IMPORT = 20 * 1024 * 1024; // 单文件导入上限 20MB
@@ -433,8 +434,8 @@ export default function FilePanel({
             if (fails.length) setOpErr(`部分粘贴失败：${fails.join("；")}`);
           }
           break;
-        case "copyPath": await navigator.clipboard.writeText(targets.join("\n")); break;
-        case "copyRelPath": await navigator.clipboard.writeText(targets.map(relOf).join("\n")); break;
+        case "copyPath": await writeClipboardText(targets.join("\n")); break;
+        case "copyRelPath": await writeClipboardText(targets.map(relOf).join("\n")); break;
         case "reveal": await revealInExplorer(node.path); break;
         case "toggleFav": toggleFavFolder(node.path); break;
         case "ignoreFolder": ignoreFolder(node.name); break;
