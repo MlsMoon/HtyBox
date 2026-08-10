@@ -153,8 +153,8 @@ export default function MemorySyncSection({
         <div className="text-[13px] font-bold">其他 Agent</div>
         <div className="mt-2 space-y-1.5 text-[11px]">
           <div className="flex gap-2">
-            <span className="w-14 shrink-0 text-[var(--text-2)]">codex</span>
-            <span className="text-[var(--text-3)]">直读权威记忆(rules/codex.md 指引),无缓存链路,无需同步</span>
+            <span className="w-28 shrink-0 text-[var(--text-2)]">Codex / OpenCode</span>
+            <span className="text-[var(--text-3)]">共用 rules/codex.md，直读权威记忆，无缓存链路，无需同步</span>
           </div>
           <div className="flex gap-2">
             <span className="w-14 shrink-0 text-[var(--text-2)]">cursor</span>

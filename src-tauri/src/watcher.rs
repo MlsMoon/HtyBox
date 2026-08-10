@@ -1,4 +1,4 @@
-//! 监听 skill / memory / Claude·Codex·Cursor·Kimi 会话落盘，防抖后向前端发刷新事件（M3b）。
+//! 监听 skill / memory / 各 Agent 会话落盘，防抖后向前端发刷新事件（M3b）。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -34,6 +34,15 @@ fn is_codex_session_watch_path(path: &Path, codex_root: &Path) -> bool {
         return false;
     }
     path_key.contains("/rollout-") && path_key.ends_with(".jsonl")
+}
+
+/// OpenCode v1 的会话状态存于 SQLite；提交会触发 db 或 WAL 变化。
+/// 只读连接也会更新 SHM 的 reader mark，监听 SHM 会把会话刷新变成自激循环。
+fn is_opencode_session_watch_path(path: &Path, opencode_root: &Path) -> bool {
+    let key = watch_path_key(path);
+    ["opencode.db", "opencode.db-wal"]
+        .iter()
+        .any(|name| key == watch_path_key(&opencode_root.join(name)))
 }
 
 /// Claude：`~/.claude/history.jsonl` 或 `projects/<slug>/<id>.jsonl`（会话转录 / ai-title）。
@@ -131,6 +140,8 @@ pub fn start(app: AppHandle) {
     let projects_for_handler = claude_projects.clone();
     let codex = home.join(".codex");
     let codex_for_handler = codex.clone();
+    let opencode = home.join(".local").join("share").join("opencode");
+    let opencode_for_handler = opencode.clone();
     let cursor_chats = home.join(".cursor").join("chats");
     let cursor_chats_for_handler = cursor_chats.clone();
     // kimi 数据根：KIMI_CODE_HOME 优先，缺省 ~/.kimi-code（与 sessions::kimi_data_root 同契约）
@@ -154,6 +165,7 @@ pub fn start(app: AppHandle) {
             let mut memory = false;
             let mut claude_sessions = false;
             let mut codex_sessions = false;
+            let mut opencode_sessions = false;
             let mut cursor_sessions = false;
             let mut kimi_sessions = false;
             for e in &events {
@@ -174,6 +186,9 @@ pub fn start(app: AppHandle) {
                 if is_codex_session_watch_path(&e.path, &codex_for_handler) {
                     codex_sessions = true;
                 }
+                if is_opencode_session_watch_path(&e.path, &opencode_for_handler) {
+                    opencode_sessions = true;
+                }
                 if is_cursor_session_watch_path(&e.path, &cursor_chats_for_handler) {
                     cursor_sessions = true;
                 }
@@ -192,6 +207,9 @@ pub fn start(app: AppHandle) {
             }
             if codex_sessions {
                 let _ = handler_app.emit("codex-sessions-changed", ());
+            }
+            if opencode_sessions {
+                let _ = handler_app.emit("opencode-sessions-changed", ());
             }
             if cursor_sessions {
                 let _ = handler_app.emit("cursor-sessions-changed", ());
@@ -220,6 +238,8 @@ pub fn start(app: AppHandle) {
     // Codex：索引(自动命名/`/rename`) + sessions 下落盘的 rollout（首条消息改 label 时 index 可能仍空）
     let _ = w.watch(&codex, RecursiveMode::NonRecursive);
     let _ = w.watch(&codex.join("sessions"), RecursiveMode::Recursive);
+    // OpenCode：监听 SQLite 主文件和 WAL；SHM 的只读 reader mark 不是会话变化。
+    let _ = w.watch(&opencode, RecursiveMode::NonRecursive);
     // Cursor：chats/<hash>/<chatId>/meta.json 的 title 更新
     let _ = w.watch(&cursor_chats, RecursiveMode::Recursive);
     // Kimi：sessions/<workDirKey>/<sessionId>/state.json 的 title/updatedAt 更新
@@ -315,6 +335,7 @@ mod tests {
     use super::{
         claude_memory_watch_root, is_claude_memory_path, is_claude_session_watch_path,
         is_codex_session_index, is_codex_session_watch_path, is_cursor_session_watch_path,
+        is_opencode_session_watch_path,
     };
     use std::path::Path;
 
@@ -358,6 +379,27 @@ mod tests {
         ));
         assert!(!is_codex_session_watch_path(
             Path::new(r"C:\Users\tester\.codex\sessions\2026\07\13\notes.txt"),
+            root
+        ));
+    }
+
+    #[test]
+    fn opencode_database_files_trigger_session_refresh() {
+        let root = Path::new(r"C:\Users\tester\.local\share\opencode");
+        assert!(is_opencode_session_watch_path(
+            Path::new(r"C:\Users\tester\.local\share\opencode\opencode.db"),
+            root
+        ));
+        assert!(is_opencode_session_watch_path(
+            Path::new(r"c:\users\TESTER\.local\share\opencode\OPENCODE.DB-WAL"),
+            root
+        ));
+        assert!(!is_opencode_session_watch_path(
+            Path::new(r"C:\Users\tester\.local\share\opencode\opencode.db-shm"),
+            root
+        ));
+        assert!(!is_opencode_session_watch_path(
+            Path::new(r"C:\Users\tester\.local\share\opencode\auth.json"),
             root
         ));
     }

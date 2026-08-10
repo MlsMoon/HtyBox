@@ -33,6 +33,7 @@ import {
 } from "../profiles";
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
+import opencodeIcon from "../assets/opencode.svg";
 import cursorIcon from "../assets/cursor.svg";
 import { ProfileIcon, KimiIcon } from "./ProfileIcon";
 import {
@@ -44,6 +45,7 @@ import {
 import HtyBoxLogo from "./ui/HtyBoxLogo";
 import {
   setupMcpAgent,
+  mcpBrokerUrl,
   registerAgentLauncher,
   registerAgentTerminal,
   markTerminalClosed,
@@ -63,6 +65,7 @@ import { getSettings } from "../settings";
 import {
   listClaudeSessions,
   listCodexSessions,
+  listOpenCodeSessions,
   listCursorSessions,
   listKimiSessions,
   mapAgentSessionsByPty,
@@ -204,15 +207,18 @@ function injectBriefWhenReady(termId: string, prompt: string): void {
   }, 100);
 }
 
-/** 把当前 cwd 下该 agent 的 list label 写入原生名缓存，供 Tab 与 Session 列表同构。 */
-async function refreshNativeLabels(agentKind: AgentKind, cwd: string): Promise<void> {
-  if (!cwd || !isAgentTerminal(agentKind)) return;
+const nativeLabelRefreshes = new Map<string, Promise<void>>();
+
+/** 执行一次原生名刷新；调用入口按 agent+cwd 合并并发，避免每个终端重复查询同一份会话。 */
+async function performNativeLabelRefresh(agentKind: AgentKind, cwd: string): Promise<void> {
   try {
     const fetcher =
       agentKind === "claude"
         ? listClaudeSessions
         : agentKind === "codex"
           ? listCodexSessions
+          : agentKind === "opencode"
+            ? listOpenCodeSessions
           : agentKind === "kimi"
             ? listKimiSessions
             : listCursorSessions;
@@ -224,6 +230,21 @@ async function refreshNativeLabels(agentKind: AgentKind, cwd: string): Promise<v
   } catch {
     /* ignore */
   }
+}
+
+/** 把当前 cwd 下该 agent 的 list label 写入原生名缓存，供 Tab 与 Session 列表同构。 */
+function refreshNativeLabels(agentKind: AgentKind, cwd: string): Promise<void> {
+  if (!cwd || !isAgentTerminal(agentKind)) return Promise.resolve();
+  const key = `${agentKind}\0${cwd}`;
+  const active = nativeLabelRefreshes.get(key);
+  if (active) return active;
+
+  const refresh = performNativeLabelRefresh(agentKind, cwd);
+  nativeLabelRefreshes.set(key, refresh);
+  void refresh.finally(() => {
+    if (nativeLabelRefreshes.get(key) === refresh) nativeLabelRefreshes.delete(key);
+  });
+  return refresh;
 }
 
 /** 同 agent+cwd 下尚未认领、捕获未中止的终端，按 CAPTURE_SINCE 升序（= 启动顺序）。 */
@@ -252,9 +273,9 @@ function bindSessionId(termId: string, agentKind: AgentKind, sid: string): void 
 }
 
 /**
- * 集中认领（串行化）：四 agent 一律按 PTY 映射 sessionId
+ * 集中认领（串行化）：所有 agent 一律按 PTY 映射 sessionId
  * - claude：sessions/<pid>.json 落在 PTY 进程树
- * - codex/cursor/kimi：PTY 子树 agent 进程创建时间 ↔ 会话 createdAt 最近邻
+ * - codex/opencode/cursor/kimi：PTY 子树 agent 进程创建时间 ↔ 会话 createdAt 最近邻
  */
 async function assignCapturedSessions(agentKind: AgentKind, cwd: string): Promise<void> {
   let release!: () => void;
@@ -438,6 +459,7 @@ function TabTypeIcon({ params }: { params: TermParams & { editorPath?: string } 
   if (ep) return <FileTypeIcon path={ep} className={cls} />;
   if (params.agentKind === "claude") return <img src={claudeIcon} alt="" className={cls} draggable={false} />;
   if (params.agentKind === "codex") return <img src={codexIcon} alt="" className={"codex-glyph " + cls} draggable={false} />;
+  if (params.agentKind === "opencode") return <img src={opencodeIcon} alt="" className={cls} draggable={false} />;
   if (params.agentKind === "cursor") return <img src={cursorIcon} alt="" className={"cursor-glyph " + cls} draggable={false} />;
   if (params.agentKind === "kimi") return <KimiIcon className={cls} />;
   return (
@@ -740,6 +762,8 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
         ? "claude-sessions-changed"
         : agentKind === "codex"
           ? "codex-sessions-changed"
+          : agentKind === "opencode"
+            ? "opencode-sessions-changed"
           : agentKind === "cursor"
             ? "cursor-sessions-changed"
             : agentKind === "kimi"
@@ -1125,7 +1149,27 @@ export default function TerminalDock({
         } catch (e) {
           console.error("write_agent_brief failed", e);
         }
-        // 各 agent 的 MCP 配置 setupMcpAgent 已写好（.mcp.json / .codex/config.toml / .cursor/mcp.json / .kimi-code/mcp.json）
+        let opencodeConfig: string | undefined;
+        if (spec.agentKind === "opencode") {
+          try {
+            const url = await mcpBrokerUrl();
+            opencodeConfig = JSON.stringify({
+              $schema: "https://opencode.ai/config.json",
+              mcp: {
+                htybox: {
+                  type: "remote",
+                  url,
+                  oauth: false,
+                  headers: { Authorization: "Bearer {env:HTYBOX_MCP_TOKEN}" },
+                },
+              },
+            });
+          } catch (e) {
+            console.error("mcp_broker_url failed", e);
+            continue;
+          }
+        }
+        // OpenCode 用进程级内联配置接入团队 MCP，不改用户的 opencode.json。
         api.addPanel({
           id,
           component: "terminal",
@@ -1144,6 +1188,7 @@ export default function TerminalDock({
               HTYBOX_ROLE_NAME: spec.roleName,
               HTYBOX_WORKSPACE_ID: workspaceId,
               HTYBOX_RESPONSIBILITY: spec.responsibility ?? "", // 职责，供 M7-C 协议注入
+              ...(opencodeConfig ? { OPENCODE_CONFIG_CONTENT: opencodeConfig } : {}),
             },
           },
           position: prevId

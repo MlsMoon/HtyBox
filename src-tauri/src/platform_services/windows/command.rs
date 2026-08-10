@@ -23,6 +23,7 @@ pub(super) fn install_agent_command(agent: &str) -> Command {
     let script = match agent {
         "claude" => "irm https://claude.ai/install.ps1 | iex",
         "codex" => "irm https://chatgpt.com/codex/install.ps1 | iex",
+        "opencode" => "if (Get-Command scoop -ErrorAction SilentlyContinue) { scoop install opencode } elseif (Get-Command choco -ErrorAction SilentlyContinue) { choco install opencode -y } elseif (Get-Command npm -ErrorAction SilentlyContinue) { npm install -g opencode-ai } else { Write-Error 'Installing OpenCode requires Scoop, Chocolatey, or Node.js/npm'; exit 1 }",
         "cursor" => "irm 'https://cursor.com/install?win32=true' | iex",
         "kimi" => "irm https://code.kimi.com/kimi-code/install.ps1 | iex",
         _ => "exit 1",

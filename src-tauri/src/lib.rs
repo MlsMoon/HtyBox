@@ -94,7 +94,7 @@ fn ws_port(state: State<'_, AppState>) -> u16 {
     state.ws_port
 }
 
-/// 设置「Agent」页：检测四家 agent CLI 安装状态（平台命令查找 + --version + latest 对比）。
+/// 设置「Agent」页：检测 agent CLI 安装状态（平台命令查找 + --version + latest 对比）。
 #[tauri::command]
 async fn detect_agents() -> Result<Vec<agent_env::AgentInstallStatus>, String> {
     Ok(tauri::async_runtime::spawn_blocking(agent_env::detect_agents)
@@ -1180,6 +1180,12 @@ fn list_codex_sessions(cwd: String) -> Vec<sessions::SessionRef> {
     sessions::list_codex_sessions(&cwd)
 }
 
+/// 列本工作区 OpenCode 会话（通过 `opencode session list --format json`）。
+#[tauri::command]
+fn list_opencode_sessions(cwd: String) -> Vec<sessions::SessionRef> {
+    sessions::list_opencode_sessions(&cwd)
+}
+
 /// M9：删除 claude 会话（删 <id>.jsonl 入回收站）。
 #[tauri::command]
 fn delete_claude_session(id: String) -> Result<(), String> {
@@ -1190,6 +1196,12 @@ fn delete_claude_session(id: String) -> Result<(), String> {
 #[tauri::command]
 fn delete_codex_session(path: String) -> Result<(), String> {
     sessions::delete_codex_session(&path)
+}
+
+/// 先将 OpenCode 原生导出放入回收站，再调用官方 CLI 删除会话。
+#[tauri::command]
+fn delete_opencode_session(id: String, cwd: String) -> Result<(), String> {
+    sessions::delete_opencode_session(&id, &cwd)
 }
 
 /// 列本工作区 cursor 会话（~/.cursor/chats 按 meta.json.cwd）。
@@ -1216,13 +1228,13 @@ fn delete_kimi_session(path: String) -> Result<(), String> {
     sessions::delete_kimi_session(&path)
 }
 
-/// 运行后捕获 agent(claude/codex/cursor/kimi) 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
+/// 运行后捕获 agent 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
 #[tauri::command]
 fn capture_session_ids(agent: String, cwd: String, since_ms: i64) -> Vec<String> {
     sessions::capture_session_ids(&agent, &cwd, since_ms)
 }
 
-/// 按 PTY 精确认领 session：claude 走 sessions/<pid>.json；codex/cursor/kimi 走子树进程创建时间↔会话 createdAt。
+/// 按 PTY 精确认领 session：claude 走 sessions/<pid>.json；其他 Agent 走子树进程创建时间↔会话 createdAt。
 #[tauri::command]
 fn map_agent_sessions_by_pty(
     agent: String,
@@ -1621,10 +1633,12 @@ pub fn run() {
             count_workspace_files,
             list_claude_sessions,
             list_codex_sessions,
+            list_opencode_sessions,
             list_cursor_sessions,
             list_kimi_sessions,
             delete_claude_session,
             delete_codex_session,
+            delete_opencode_session,
             delete_cursor_session,
             delete_kimi_session,
             capture_session_ids,

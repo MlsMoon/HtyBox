@@ -24,6 +24,7 @@ export interface Team {
 export const DEFAULT_MODELS: Record<Exclude<AgentKind, "shell">, string[]> = {
   claude: ["opus", "sonnet", "haiku"],
   codex: ["gpt-5-codex", "o3"],
+  opencode: [],
   cursor: ["auto", "claude-sonnet-5-high", "gpt-5.2", "composer-2.5"],
   // kimi 别名来自 `kimi provider list --json` 实测(v0.26.0 managed:kimi-code 共 3 个；k3 为本机默认)
   kimi: ["kimi-code/k3", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
@@ -116,7 +117,7 @@ export function exportTeams(teams: Team[]): string {
   return JSON.stringify(teams, null, 2);
 }
 
-const VALID_AGENT_KINDS: Exclude<AgentKind, "shell">[] = ["claude", "codex", "cursor", "kimi"];
+const VALID_AGENT_KINDS: Exclude<AgentKind, "shell">[] = ["claude", "codex", "opencode", "cursor", "kimi"];
 
 /** 解析导入 JSON（数组或单个），重新分配 id 避免与现有冲突。 */
 export function importTeams(json: string): Team[] {

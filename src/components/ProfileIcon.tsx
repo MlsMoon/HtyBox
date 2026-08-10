@@ -1,5 +1,6 @@
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
+import opencodeIcon from "../assets/opencode.svg";
 import cursorIcon from "../assets/cursor.svg";
 
 /** Kimi 品牌图标（内联 SVG：白 K + 蓝点）。K 的 fill 走 .kimi-k，深色主题经 CSS 反转成白底黑 K（见 index.css .kimi-glyph）。 */
@@ -29,6 +30,8 @@ export function ProfileIcon({ id }: { id: string }) {
     return (
       <img src={codexIcon} alt="Codex" className="codex-glyph h-4 w-4" draggable={false} />
     );
+  if (id === "opencode")
+    return <img src={opencodeIcon} alt="OpenCode" className="h-4 w-4" draggable={false} />;
   if (id === "cursor")
     return (
       <img src={cursorIcon} alt="Cursor" className="cursor-glyph h-4 w-4" draggable={false} />

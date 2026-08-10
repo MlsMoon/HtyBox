@@ -8,7 +8,7 @@
 | Agent | 子目录 | Skill 发现目录(薄壳) | 规则差异条款 | 记忆链路 |
 |---|---|---|---|---|
 | Claude Code | `claude/` | `.claude/skills/<id>/SKILL.md` | `rules/claude.md` | 产品自动记忆 = 双写缓存(`~/.claude/projects/<工作区slug>/memory/`,与 canonical `memory/` 同构;slug = 工作区绝对路径中 `: \ / _` 逐字符替换为 `-`) |
-| Codex | `codex/` | `.agents/skills/<id>/SKILL.md`(+ `agents/` 发现层 metadata,如 openai.yaml) | `rules/codex.md` | 直读 canonical `memory/` |
+| Codex / OpenCode | `codex/`(共享兼容层) | `.agents/skills/<id>/SKILL.md`(+ `agents/` 发现层 metadata,如 openai.yaml) | `rules/codex.md` | 直读 canonical `memory/` |
 
 ## 新增 Skill 时
 
@@ -19,10 +19,12 @@
 ## 更新记忆时
 
 1. 权威写 `.htyworkflows/memory/`(策展契约见其 MEMORY.md 头部)。
-2. 按上表"记忆链路"列同步:Claude 需双写产品缓存;Codex 直读无需额外动作。
+2. 按上表"记忆链路"列同步:Claude 需双写产品缓存;Codex / OpenCode 直读无需额外动作。
 3. 禁止只写某个 Agent 的原生缓存不写 canonical(反向覆盖违约)。
 
 ## 新增一个 Agent 的接入步骤
+
+能原生读取根 `AGENTS.md` 与 `.agents/skills/` 的兼容产品可复用 `codex` 共享层，不必新增重复 provider；OpenCode 即采用此方式。
 
 1. 本目录新建 `<agent>/README.md`(overlay 语义说明;overlay 为空是常态)。
 2. `workflow-manifest.json` 的 `providers` 增加该 Agent(adapterDir / 原生规则入口)。

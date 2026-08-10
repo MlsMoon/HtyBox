@@ -48,6 +48,11 @@ export default function TeamEditor({
           <option key={m} value={m} />
         ))}
       </datalist>
+      <datalist id="models-opencode">
+        {DEFAULT_MODELS.opencode.map((m) => (
+          <option key={m} value={m} />
+        ))}
+      </datalist>
       <datalist id="models-cursor">
         {DEFAULT_MODELS.cursor.map((m) => (
           <option key={m} value={m} />
@@ -118,6 +123,7 @@ export default function TeamEditor({
                 >
                   <option value="claude">ClaudeCode</option>
                   <option value="codex">Codex</option>
+                  <option value="opencode">OpenCode</option>
                   <option value="cursor">Cursor</option>
                   <option value="kimi">Kimi</option>
                 </select>

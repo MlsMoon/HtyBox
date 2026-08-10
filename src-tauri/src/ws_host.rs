@@ -415,7 +415,8 @@ impl Conn {
                 let cwd = v.get("cwd").and_then(Value::as_str).unwrap_or("");
                 let claude = crate::sessions::list_claude_sessions(cwd);
                 let codex = crate::sessions::list_codex_sessions(cwd);
-                self.send_json(&RpcResponse::new(types::CATALOG_SESSIONS_LIST_RESP, req_id, serde_json::json!({ "claude": claude, "codex": codex })));
+                let opencode = crate::sessions::list_opencode_sessions(cwd);
+                self.send_json(&RpcResponse::new(types::CATALOG_SESSIONS_LIST_RESP, req_id, serde_json::json!({ "claude": claude, "codex": codex, "opencode": opencode })));
             }
             other => {
                 if !req_id.is_empty() {

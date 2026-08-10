@@ -63,6 +63,11 @@ const AGENTS: &[AgentSpec] = &[
         update_args: Some(&["update"]),
     },
     AgentSpec {
+        id: "opencode",
+        command: "opencode",
+        update_args: Some(&["upgrade"]),
+    },
+    AgentSpec {
         id: "cursor",
         command: "cursor-agent",
         update_args: Some(&["update"]),
@@ -325,6 +330,7 @@ fn fetch_latest(id: &str) -> Option<String> {
     match id {
         "claude" => fetch_npm_latest("@anthropic-ai/claude-code"),
         "codex" => fetch_npm_latest("@openai/codex"),
+        "opencode" => fetch_npm_latest("opencode-ai"),
         "kimi" => fetch_npm_latest("@moonshot-ai/kimi-code"),
         "cursor" => fetch_cursor_latest(),
         _ => None,
@@ -446,6 +452,11 @@ mod tests {
             normalize_version("codex-cli 0.144.5").as_deref(),
             Some("0.144.5")
         );
+    }
+
+    #[test]
+    fn normalize_opencode() {
+        assert_eq!(normalize_version("1.15.3").as_deref(), Some("1.15.3"));
     }
 
     #[test]

@@ -80,6 +80,7 @@ pub(crate) fn unix_install_agent_command(agent: &str) -> Command {
     let script = match agent {
         "claude" => "curl -fsSL https://claude.ai/install.sh | bash",
         "codex" => "npm install -g @openai/codex",
+        "opencode" => "curl -fsSL https://opencode.ai/install | bash",
         "cursor" => "curl -fsSL https://cursor.com/install | bash",
         "kimi" => "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
         _ => "false",

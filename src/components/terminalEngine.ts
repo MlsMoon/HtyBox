@@ -77,7 +77,7 @@ export function ensureEngine(
   launchCmd?: string,
   cwd?: string,
   env?: Record<string, string>,
-  agentKind?: string, // "claude"|"codex"|"cursor"|"kimi"|"shell"：决定粘贴的换行/包裹方式
+  agentKind?: string, // Agent 类型：决定粘贴的换行/包裹方式
 ): void {
   if (engines.has(termId)) return;
 
