@@ -78,7 +78,7 @@ export const listCanonicalMemoryTree = (projectDir: string) =>
   invoke<MemoryNode[]>("list_canonical_memory_tree", { projectDir });
 
 // ---- M9：claude/codex/cursor/kimi 会话记录 ----
-export type SessionAgent = "claude" | "codex" | "cursor" | "kimi";
+export type SessionAgent = "claude" | "codex" | "cursor" | "kimi" | "hermes";
 
 export interface SessionRef {
   id: string;
@@ -153,6 +153,10 @@ export const listKimiSessions = (cwd: string) =>
   invoke<SessionRef[]>("list_kimi_sessions", { cwd });
 export const deleteKimiSession = (path: string) =>
   invoke<void>("delete_kimi_session", { path });
+export const listHermesSessions = (cwd: string) =>
+  invoke<SessionRef[]>("list_hermes_sessions", { cwd });
+export const deleteHermesSession = (id: string) =>
+  invoke<void>("delete_hermes_session", { id });
 export const exportSessionArchive = (
   agent: SessionAgent,
   id: string,

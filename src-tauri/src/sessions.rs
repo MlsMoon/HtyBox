@@ -12,12 +12,16 @@
 //!   **v1**（≤约 0.26）：`workDir` + RFC3339 时间串；**v2**（0.34+）：`cwd` 取代 workDir、`createdAt`/`updatedAt` 为 epoch 毫秒 number，可有 `archived`；
 //!   workDirKey 为 cwd 派生分桶，不逆向算法、直接扫全部 state.json，路径双读 workDir|cwd、时间双读 RFC3339|ms，跳过 archived；title 缺失回退 lastPrompt；
 //!   复原 `kimi --session <sessionId>`(flag 风格，id 形态 session_<uuid>，resume 精确性已实测)；删除走删整个 session 目录 + session_index.jsonl 剔行。
-//! 删除统一移入回收站(trash，非交互、可恢复)。
+//! - hermes：会话 <HERMES_HOME|%LOCALAPPDATA%/hermes|~/.hermes>/state.db（SQLite `sessions` 表）；
+//!   id=`YYYYMMDD_HHMMSS_`+6hex；cwd 列匹配工作区；ts=last_activity_at|started_at（Unix 秒→ms）；
+//!   复原 `hermes --resume <id>`(已实测)；删除 SQL 删 sessions+messages（无 per-session 目录）。
+//! 删除统一移入回收站(trash，非交互、可恢复)——hermes 为库内行删除，无文件 trash。
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use walkdir::WalkDir;
 
@@ -1503,6 +1507,187 @@ pub fn delete_kimi_session(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------- hermes（SQLite state.db）----------------
+
+/// Hermes 数据根：`HERMES_HOME` → `%LOCALAPPDATA%/hermes`(若有 state.db) → `~/.hermes`。
+pub(crate) fn hermes_home() -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("HERMES_HOME") {
+        let v = v.trim().trim_matches('"');
+        if !v.is_empty() {
+            return Some(PathBuf::from(v));
+        }
+    }
+    if let Some(local) = dirs::data_local_dir() {
+        let p = local.join("hermes");
+        if p.join("state.db").is_file() {
+            return Some(p);
+        }
+    }
+    home().map(|h| h.join(".hermes"))
+}
+
+fn hermes_state_db() -> Option<PathBuf> {
+    let root = hermes_home()?;
+    let db = root.join("state.db");
+    db.is_file().then_some(db)
+}
+
+/// id 形态：`YYYYMMDD_HHMMSS_` + 6 hex（例 `20260807_044312_9b9292`）。
+fn is_hermes_session_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    if b.len() != 22 {
+        return false;
+    }
+    b[8] == b'_'
+        && b[15] == b'_'
+        && b[..8].iter().all(|c| c.is_ascii_digit())
+        && b[9..15].iter().all(|c| c.is_ascii_digit())
+        && b[16..].iter().all(|c| c.is_ascii_hexdigit())
+}
+
+fn open_hermes_db_ro(db: &Path) -> Result<Connection, String> {
+    Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())
+}
+
+fn hermes_ts_ms(seconds: f64) -> i64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+    (seconds * 1000.0) as i64
+}
+
+/// hermes：读 state.db `sessions`，cwd 匹配且未 archived；label=title 回退 id；path=id（删除按 id）。
+pub fn list_hermes_sessions(cwd: &str) -> Vec<SessionRef> {
+    let Some(db) = hermes_state_db() else {
+        return Vec::new();
+    };
+    list_hermes_sessions_in(&db, cwd)
+}
+
+pub(crate) fn list_hermes_sessions_in(db: &Path, cwd: &str) -> Vec<SessionRef> {
+    let Ok(conn) = open_hermes_db_ro(db) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, title, cwd, COALESCE(last_activity_at, started_at, 0), COALESCE(archived, 0)
+         FROM sessions",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, f64>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for row in rows.flatten() {
+        let (id, title, sess_cwd, act, archived) = row;
+        if archived != 0 || !is_hermes_session_id(&id) {
+            continue;
+        }
+        let Some(sc) = sess_cwd.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if !same_path(sc, cwd) {
+            continue;
+        }
+        let label = title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(80).collect())
+            .unwrap_or_else(|| id.clone());
+        out.push(SessionRef {
+            id: id.clone(),
+            label,
+            ts: hermes_ts_ms(act),
+            path: id,
+        });
+    }
+    out.sort_by(|a, b| b.ts.cmp(&a.ts));
+    out
+}
+
+/// 删除 hermes 会话：校验 id 后从 state.db 删除 messages + sessions 行。
+pub fn delete_hermes_session(id: &str) -> Result<(), String> {
+    let id = id.trim();
+    if !is_hermes_session_id(id) {
+        return Err("Hermes 会话 id 形态无效".into());
+    }
+    let db = hermes_state_db().ok_or_else(|| "无 hermes state.db".to_string())?;
+    let conn = Connection::open(&db).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM messages WHERE session_id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    let n = conn
+        .execute("DELETE FROM sessions WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("Hermes 会话不存在".into());
+    }
+    Ok(())
+}
+
+fn scan_hermes_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
+    let Some(db) = hermes_state_db() else {
+        return Vec::new();
+    };
+    scan_hermes_session_times_in(&db, cwd, since_ms)
+}
+
+fn scan_hermes_session_times_in(db: &Path, cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
+    let Ok(conn) = open_hermes_db_ro(db) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, cwd, COALESCE(started_at, 0), COALESCE(archived, 0) FROM sessions",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for row in rows.flatten() {
+        let (id, sess_cwd, started, archived) = row;
+        if archived != 0 || !is_hermes_session_id(&id) {
+            continue;
+        }
+        let Some(sc) = sess_cwd.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if !same_path(sc, cwd) {
+            continue;
+        }
+        let created_ms = hermes_ts_ms(started);
+        if created_ms < since_ms {
+            continue;
+        }
+        hits.push((id, created_ms));
+    }
+    hits.sort_by_key(|(_, t)| *t);
+    hits
+}
+
+fn capture_hermes_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+    scan_hermes_session_times(cwd, since_ms)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
 // ---------------- 运行后捕获 agent 自生成的 session id ----------------
 
 /// 只比较两个现存目录的 canonical identity；解析失败即不匹配。
@@ -1510,14 +1695,15 @@ fn same_path(a: &str, b: &str) -> bool {
     canonical_same_existing_path(Path::new(a), Path::new(b)).unwrap_or(false)
 }
 
-/// 捕获某 agent(claude/codex/cursor/kimi) 在 cwd 下、启动时刻(since_ms)之后新生成的会话 id（按时间升序）。
-/// 四者都不便在新建时预分配 id，故新建发裸命令、启动后由此关联各自终端的真实 session id。
+/// 捕获某 agent(claude/codex/cursor/kimi/hermes) 在 cwd 下、启动时刻(since_ms)之后新生成的会话 id（按时间升序）。
+/// 都不便在新建时预分配 id，故新建发裸命令、启动后由此关联各自终端的真实 session id。
 pub fn capture_session_ids(agent: &str, cwd: &str, since_ms: i64) -> Vec<String> {
     match agent {
         "claude" => capture_claude_ids(cwd, since_ms),
         "codex" => capture_codex_ids(cwd, since_ms),
         "cursor" => capture_cursor_ids(cwd, since_ms),
         "kimi" => capture_kimi_ids(cwd, since_ms),
+        "hermes" => capture_hermes_ids(cwd, since_ms),
         _ => Vec::new(),
     }
 }
@@ -1607,8 +1793,8 @@ fn capture_claude_ids(cwd: &str, since_ms: i64) -> Vec<String> {
 
 /// 将各 PTY shell pid 映射到对应 agent 的 sessionId。
 /// - claude：`sessions/<pid>.json` 的 pid 落在 PTY 进程树内（精确）
-/// - cursor/codex/kimi：优先解析子树进程命令行里的 `--resume`/`resume`/`--session`；
-///   否则用**主进程**（index.js / codex.js / kimi.exe，非 worker）创建时间 ↔ 会话 createdAt 最近邻
+/// - cursor/codex/kimi/hermes：优先解析子树进程命令行里的 `--resume`/`resume`/`--session`；
+///   否则用**主进程**（index.js / codex.js / kimi.exe / hermes.exe，非 worker）创建时间 ↔ 会话 createdAt 最近邻
 pub fn map_agent_sessions_by_pty(
     agent: &str,
     cwd: &str,
@@ -1617,7 +1803,7 @@ pub fn map_agent_sessions_by_pty(
 ) -> Vec<PtySessionMap> {
     match agent {
         "claude" => map_claude_sessions_by_pty(cwd, since_ms, pty_pids),
-        "codex" | "cursor" | "kimi" => {
+        "codex" | "cursor" | "kimi" | "hermes" => {
             map_sessions_by_agent_process(agent, cwd, since_ms, pty_pids)
         }
         _ => Vec::new(),
@@ -1666,6 +1852,7 @@ fn scan_session_times(agent: &str, cwd: &str, since_ms: i64) -> Vec<(String, i64
         "codex" => scan_codex_session_times(cwd, since_ms),
         "cursor" => scan_cursor_session_times(cwd, since_ms),
         "kimi" => scan_kimi_session_times(cwd, since_ms),
+        "hermes" => scan_hermes_session_times(cwd, since_ms),
         _ => Vec::new(),
     }
 }
@@ -1960,6 +2147,11 @@ fn extract_session_id_from_cmdline(agent: &str, cmd: &str) -> Option<String> {
                 normalize_uuid(raw).map(|u| format!("session_{u}"))
             }
         }
+        "hermes" => {
+            // `hermes --resume YYYYMMDD_HHMMSS_xxxxxx` / `-r`
+            let raw = extract_flag_value(&lower, &["--resume", "-r"])?;
+            is_hermes_session_id(raw).then(|| raw.to_string())
+        }
         _ => None,
     }
 }
@@ -2066,6 +2258,19 @@ fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32
                 .iter()
                 .copied()
                 .filter(|pid| snap.names.get(pid).map(|n| n.as_str()) == Some("kimi.exe"))
+                .collect();
+            pick_earliest_pid(&hits)
+        }
+        "hermes" => {
+            let hits: Vec<u32> = desc
+                .iter()
+                .copied()
+                .filter(|pid| {
+                    matches!(
+                        snap.names.get(pid).map(|n| n.as_str()),
+                        Some("hermes.exe") | Some("hermes-agent.exe")
+                    )
+                })
                 .collect();
             pick_earliest_pid(&hits)
         }

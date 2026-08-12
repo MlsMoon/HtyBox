@@ -11,12 +11,26 @@ import {
 } from "../agentInstall";
 import { ProfileIcon } from "./ProfileIcon";
 
-/** 设置「Agent」页展示的 4 家 CLI（顺序 = profiles.ts PROFILES 中 agent 顺序）。 */
-const AGENTS: { id: AgentId; name: string; command: string; desc: string }[] = [
+/** 设置「Agent」页展示的 CLI（顺序 = profiles.ts PROFILES 中 agent 顺序）。hermes 仅检测、无一键安装。 */
+const AGENTS: {
+  id: AgentId;
+  name: string;
+  command: string;
+  desc: string;
+  /** 为 true 时设置页不提供一键安装（需用户自行装 CLI） */
+  detectOnly?: boolean;
+}[] = [
   { id: "claude", name: "Claude Code", command: "claude", desc: "官方原生安装脚本（claude.ai），当前用户安装、免 admin" },
   { id: "codex", name: "Codex", command: "codex", desc: "官方独立安装脚本（chatgpt.com），不依赖 Node.js" },
   { id: "cursor", name: "Cursor", command: "cursor-agent", desc: "官方原生安装脚本（cursor.com），当前用户安装、免 admin" },
   { id: "kimi", name: "Kimi Code", command: "kimi", desc: "官方安装脚本（code.kimi.com）；首次启动前需自行安装 Git for Windows" },
+  {
+    id: "hermes",
+    name: "Hermes",
+    command: "hermes",
+    desc: "Nous Hermes Agent（官方安装脚本）；本页仅检测 PATH，不提供一键安装",
+    detectOnly: true,
+  },
 ];
 
 const btnCls =
@@ -57,10 +71,18 @@ function InlineProgress({ label, line }: { label: string; line?: string }) {
   );
 }
 
-/** 行右侧：按状态渲染 安装/更新/重试 或状态文本。 */
-function RowAction({ id, st }: { id: AgentId; st: AgentState }) {
+/** 行右侧：按状态渲染 安装/更新/重试 或状态文本。detectOnly=无一键安装。 */
+function RowAction({
+  id,
+  st,
+  detectOnly,
+}: {
+  id: AgentId;
+  st: AgentState;
+  detectOnly?: boolean;
+}) {
   if (st.phase === "installed") {
-    if (st.updateAvailable && st.version && st.latestVersion) {
+    if (!detectOnly && st.updateAvailable && st.version && st.latestVersion) {
       return (
         <div className="flex shrink-0 items-center gap-2">
           <span className="max-w-[220px] truncate text-[11px] text-[var(--accent-text)]" title={`${st.version} → ${st.latestVersion}\n${st.path ?? ""}`}>
@@ -73,7 +95,9 @@ function RowAction({ id, st }: { id: AgentId; st: AgentState }) {
       );
     }
     const latestHint =
-      st.latestVersion && st.version && st.version === st.latestVersion ? " · 最新" : "";
+      !detectOnly && st.latestVersion && st.version && st.version === st.latestVersion
+        ? " · 最新"
+        : "";
     return (
       <span className="shrink-0 whitespace-nowrap text-[11px] text-[var(--accent)]" title={st.path}>
         已安装{st.version ? ` · ${st.version}` : ""}
@@ -82,6 +106,11 @@ function RowAction({ id, st }: { id: AgentId; st: AgentState }) {
     );
   }
   if (st.phase === "missing" || st.phase === "installFailed" || st.phase === "installing") {
+    if (detectOnly) {
+      return (
+        <span className="shrink-0 whitespace-nowrap text-[11px] text-[var(--text-faint)]">未安装</span>
+      );
+    }
     const busy = st.phase === "installing";
     return (
       <button disabled={busy} onClick={() => void install(id)} className={btnCls}>
@@ -148,7 +177,7 @@ export default function AgentSettings() {
                   <div className="text-[11px] text-[var(--text-faint)]">{a.desc}</div>
                 </div>
               </div>
-              <RowAction id={a.id} st={row} />
+              <RowAction id={a.id} st={row} detectOnly={a.detectOnly} />
             </div>
             {busy && (
               <InlineProgress

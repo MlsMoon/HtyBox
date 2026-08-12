@@ -34,6 +34,7 @@ import {
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
 import cursorIcon from "../assets/cursor.svg";
+import hermesIcon from "../assets/hermes.svg";
 import { ProfileIcon, KimiIcon } from "./ProfileIcon";
 import {
   agentUnavailable,
@@ -64,6 +65,7 @@ import {
   listCodexSessions,
   listCursorSessions,
   listKimiSessions,
+  listHermesSessions,
   mapAgentSessionsByPty,
   terminalPtyPid,
 } from "../catalog";
@@ -214,7 +216,9 @@ async function refreshNativeLabels(agentKind: AgentKind, cwd: string): Promise<v
           ? listCodexSessions
           : agentKind === "kimi"
             ? listKimiSessions
-            : listCursorSessions;
+            : agentKind === "hermes"
+              ? listHermesSessions
+              : listCursorSessions;
     const list = await fetcher(cwd);
     setNativeSessionLabels(
       agentKind,
@@ -439,6 +443,8 @@ function TabTypeIcon({ params }: { params: TermParams & { editorPath?: string } 
   if (params.agentKind === "codex") return <img src={codexIcon} alt="" className={"codex-glyph " + cls} draggable={false} />;
   if (params.agentKind === "cursor") return <img src={cursorIcon} alt="" className={"cursor-glyph " + cls} draggable={false} />;
   if (params.agentKind === "kimi") return <KimiIcon className={cls} />;
+  if (params.agentKind === "hermes")
+    return <img src={hermesIcon} alt="" className={"hermes-glyph " + cls} draggable={false} />;
   return (
     <svg className={cls} viewBox="0 0 24 24">
       <rect x="2" y="3.5" width="20" height="17" rx="5" fill="var(--text)" />
@@ -539,7 +545,8 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
       : title;
   // kimi/cursor 无 OSC 原生状态前缀 → 自研 tab 标记：双点摆(活跃) / 收束成点(跑完静默)；三态语义见 agentStatus.ts
   const tabStatus =
-    p2.termId && (p2.agentKind === "kimi" || p2.agentKind === "cursor")
+    p2.termId &&
+    (p2.agentKind === "kimi" || p2.agentKind === "cursor" || p2.agentKind === "hermes")
       ? isTermRunning(p2.termId)
         ? "running"
         : isTermFinished(p2.termId)
@@ -743,7 +750,9 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
             ? "cursor-sessions-changed"
             : agentKind === "kimi"
               ? "kimi-sessions-changed"
-              : null;
+              : agentKind === "hermes"
+                ? "hermes-sessions-changed"
+                : null;
     let sessionsUnlisten: (() => void) | undefined;
     let sessionsDisposed = false;
     if (sessionsEvt && cwd) {
@@ -1149,8 +1158,9 @@ export default function TerminalDock({
             ? { referencePanel: prevId, direction: "right" }
             : undefined,
         });
-        // kimi 无位置 prompt 参数（-p 是非交互模式）：简报改为终端就绪后 injectAndSubmit 注入
-        if (spec.agentKind === "kimi") injectBriefWhenReady(id, briefPrompt(spec.agentId));
+        // kimi/hermes 无交互位置 prompt（kimi -p / hermes -z 均为非交互）：简报改启动后 injectAndSubmit
+        if (spec.agentKind === "kimi" || spec.agentKind === "hermes")
+          injectBriefWhenReady(id, briefPrompt(spec.agentId));
         prevId = id;
       }
     });

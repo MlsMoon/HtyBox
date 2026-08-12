@@ -86,6 +86,19 @@ fn is_kimi_session_watch_path(path: &Path, sessions_root: &Path) -> bool {
     path_key.ends_with("/state.json")
 }
 
+/// Hermes：`<HERMES_HOME>/state.db`（及 WAL/SHM）更新即刷新会话列表。
+fn is_hermes_session_watch_path(path: &Path, hermes_home: &Path) -> bool {
+    let path_key = watch_path_key(path);
+    let root = watch_path_key(hermes_home).trim_end_matches('/').to_string();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let under = path_key.starts_with(&format!("{root}/")) || path_key == root;
+    under && (name == "state.db" || name == "state.db-wal" || name == "state.db-shm")
+}
+
 /// `projects/<slug>/memory` 本身或其任意后代才是原生 Memory 变化。
 /// 同级导入 staging/old/conflict 即使内部含 `payload/memory` 也不能暴露。
 fn is_claude_memory_path(path: &Path, projects_root: &Path) -> bool {
@@ -142,6 +155,20 @@ pub fn start(app: AppHandle) {
         .unwrap_or_else(|| home.join(".kimi-code"));
     let kimi_sessions_root = kimi_data.join("sessions");
     let kimi_sessions_for_handler = kimi_sessions_root.clone();
+    // hermes：HERMES_HOME → %LOCALAPPDATA%/hermes(有 state.db) → ~/.hermes（与 sessions::hermes_home 同契约）
+    let hermes_home = std::env::var("HERMES_HOME")
+        .ok()
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            dirs::data_local_dir().and_then(|d| {
+                let p = d.join("hermes");
+                p.join("state.db").is_file().then_some(p)
+            })
+        })
+        .unwrap_or_else(|| home.join(".hermes"));
+    let hermes_home_for_handler = hermes_home.clone();
 
     let handler_app = app.clone();
     let debouncer = new_debouncer(
@@ -156,6 +183,7 @@ pub fn start(app: AppHandle) {
             let mut codex_sessions = false;
             let mut cursor_sessions = false;
             let mut kimi_sessions = false;
+            let mut hermes_sessions = false;
             for e in &events {
                 let p = e.path.to_string_lossy().replace('\\', "/");
                 if p.contains("/.claude/skills/") || p.contains("/plugins/") {
@@ -180,6 +208,9 @@ pub fn start(app: AppHandle) {
                 if is_kimi_session_watch_path(&e.path, &kimi_sessions_for_handler) {
                     kimi_sessions = true;
                 }
+                if is_hermes_session_watch_path(&e.path, &hermes_home_for_handler) {
+                    hermes_sessions = true;
+                }
             }
             if skills {
                 let _ = handler_app.emit("skills-changed", ());
@@ -198,6 +229,9 @@ pub fn start(app: AppHandle) {
             }
             if kimi_sessions {
                 let _ = handler_app.emit("kimi-sessions-changed", ());
+            }
+            if hermes_sessions {
+                let _ = handler_app.emit("hermes-sessions-changed", ());
             }
         },
     );
@@ -224,6 +258,8 @@ pub fn start(app: AppHandle) {
     let _ = w.watch(&cursor_chats, RecursiveMode::Recursive);
     // Kimi：sessions/<workDirKey>/<sessionId>/state.json 的 title/updatedAt 更新
     let _ = w.watch(&kimi_sessions_root, RecursiveMode::Recursive);
+    // Hermes：state.db / WAL 更新（非递归听 HERMES_HOME 根即可）
+    let _ = w.watch(&hermes_home, RecursiveMode::NonRecursive);
 
     // 保活到进程结束：drop 会停止监听
     std::mem::forget(debouncer);

@@ -1174,7 +1174,19 @@ fn delete_kimi_session(path: String) -> Result<(), String> {
     sessions::delete_kimi_session(&path)
 }
 
-/// 运行后捕获 agent(claude/codex/cursor/kimi) 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
+/// 列本工作区 hermes 会话（HERMES_HOME/state.db 的 sessions 表按 cwd）。
+#[tauri::command]
+fn list_hermes_sessions(cwd: String) -> Vec<sessions::SessionRef> {
+    sessions::list_hermes_sessions(&cwd)
+}
+
+/// 删除 hermes 会话（按 id 从 state.db 删 messages+sessions 行）。
+#[tauri::command]
+fn delete_hermes_session(id: String) -> Result<(), String> {
+    sessions::delete_hermes_session(&id)
+}
+
+/// 运行后捕获 agent(claude/codex/cursor/kimi/hermes) 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
 #[tauri::command]
 fn capture_session_ids(agent: String, cwd: String, since_ms: i64) -> Vec<String> {
     sessions::capture_session_ids(&agent, &cwd, since_ms)
@@ -1366,6 +1378,78 @@ fn write_kimi_config(cwd: &str, url: &str) -> Result<(), String> {
     write_atomic(&path, &pretty)
 }
 
+/// 把 htybox 合并进 `%HERMES_HOME%/config.yaml` 的 `mcp_servers`（全局，非项目级）。
+/// HTTP：`url` + `headers.Authorization: Bearer ${HTYBOX_MCP_TOKEN}`（Hermes 官方契约 + env 替换）。
+/// 用字符串手术写入，避免 serde_yaml 整文件重写抹掉用户注释。
+fn write_hermes_config(_cwd: &str, url: &str) -> Result<(), String> {
+    let home = sessions::hermes_home().ok_or_else(|| "无 hermes 数据目录".to_string())?;
+    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let path = home.join("config.yaml");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    let safe_url = url.replace('\\', "\\\\").replace('"', "\\\"");
+    let entry = format!(
+        "  htybox:\n    url: \"{safe_url}\"\n    headers:\n      Authorization: \"Bearer ${{HTYBOX_MCP_TOKEN}}\"\n"
+    );
+    if text.contains("\n  htybox:") || text.starts_with("  htybox:") {
+        // 已有 htybox：只替换其 url 行（保留其余字段/注释布局）
+        let mut out = String::with_capacity(text.len() + 32);
+        let mut in_htybox = false;
+        let mut replaced_url = false;
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("htybox:") && (line.starts_with("  htybox:") || line == "  htybox:")
+            {
+                in_htybox = true;
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            if in_htybox {
+                if !line.is_empty()
+                    && !line.starts_with(' ')
+                    && !line.starts_with('\t')
+                {
+                    in_htybox = false;
+                } else if trimmed.starts_with("url:") && !replaced_url {
+                    out.push_str("    url: \"");
+                    out.push_str(&safe_url);
+                    out.push_str("\"\n");
+                    replaced_url = true;
+                    continue;
+                } else if !line.starts_with("    ")
+                    && !line.starts_with('\t')
+                    && !line.is_empty()
+                    && !trimmed.starts_with('#')
+                {
+                    // 同级其他 server key（两空格）
+                    if line.starts_with("  ") && trimmed.contains(':') && !line.starts_with("    ") {
+                        in_htybox = false;
+                    }
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !replaced_url {
+            return Err("config.yaml 已有 htybox 但未找到 url 行".into());
+        }
+        text = out;
+    } else if let Some(idx) = text.find("mcp_servers:") {
+        let insert_at = text[idx..]
+            .find('\n')
+            .map(|i| idx + i + 1)
+            .unwrap_or(text.len());
+        text.insert_str(insert_at, &entry);
+    } else {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("\nmcp_servers:\n");
+        text.push_str(&entry);
+    }
+    write_atomic(&path, &text)
+}
+
 /// M7-A：注册一个 agent（token→身份）并把 htybox 合并进该 cwd 的 .mcp.json。
 /// 之后前端用 `HTYBOX_MCP_TOKEN=<token>` 等环境变量起该 agent 的终端。
 #[tauri::command]
@@ -1391,7 +1475,8 @@ fn setup_mcp_agent(
     write_mcp_json(&cwd, &url)?; // claude 读
     write_codex_config(&cwd, &url)?; // codex 读（信任项目时）
     write_cursor_config(&cwd, &url)?; // cursor 读
-    write_kimi_config(&cwd, &url) // kimi 读
+    write_kimi_config(&cwd, &url)?; // kimi 读
+    write_hermes_config(&cwd, &url) // hermes 读全局 config.yaml
 }
 
 /// M7-C：写某 agent 的协作简报到 `<cwd>/.htybox/brief-<agentId>.md`。
@@ -1576,10 +1661,12 @@ pub fn run() {
             list_codex_sessions,
             list_cursor_sessions,
             list_kimi_sessions,
+            list_hermes_sessions,
             delete_claude_session,
             delete_codex_session,
             delete_cursor_session,
             delete_kimi_session,
+            delete_hermes_session,
             capture_session_ids,
             map_agent_sessions_by_pty,
             map_claude_sessions_by_pty,

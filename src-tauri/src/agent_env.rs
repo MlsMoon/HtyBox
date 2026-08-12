@@ -85,6 +85,13 @@ const AGENTS: &[AgentSpec] = &[
         install_script: "irm https://code.kimi.com/kimi-code/install.ps1 | iex",
         update_args: None,
     },
+    // Hermes：本期仅 PATH 检测（决策 4=A）；install_script 占位，install_agent 会拒绝对 hermes 安装
+    AgentSpec {
+        id: "hermes",
+        command: "hermes",
+        install_script: "Write-Error 'Hermes 请使用官方安装方式（见 hermes-agent.nousresearch.com），HtyBox 不提供一键安装'",
+        update_args: None,
+    },
 ];
 
 /// 一条命令的执行捕获:退出码(超时被杀为 None)+ 超时标记 + stdout/stderr 合并文本。
@@ -421,13 +428,29 @@ fn normalize_version(raw: &str) -> Option<String> {
         return None;
     }
     let before_paren = s.split('(').next().unwrap_or(s).trim();
+    // Hermes Agent v0.20.0 → 优先抓 vX.Y.Z / X.Y.Z
+    for tok in before_paren.split_whitespace() {
+        let t = tok.trim_start_matches('v');
+        if t.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && t.contains('.')
+            && t.chars().all(|c| c.is_ascii_digit() || c == '.')
+        {
+            return Some(t.to_string());
+        }
+    }
     let stripped = before_paren
         .strip_prefix("codex-cli ")
         .or_else(|| before_paren.strip_prefix("codex "))
         .or_else(|| before_paren.strip_prefix("Codex CLI "))
+        .or_else(|| before_paren.strip_prefix("Hermes Agent "))
         .unwrap_or(before_paren)
         .trim();
-    let token = stripped.split_whitespace().next().unwrap_or("").trim();
+    let token = stripped
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('v');
     if token.is_empty() {
         None
     } else {
@@ -500,6 +523,9 @@ pub fn install_agent(
     id: &str,
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
 ) -> Result<InstallResult, String> {
+    if id == "hermes" {
+        return Err("Hermes 不支持一键安装，请使用官方安装方式".into());
+    }
     let spec = find_spec(id)?;
     let mut cmd = Command::new("powershell.exe");
     cmd.args([

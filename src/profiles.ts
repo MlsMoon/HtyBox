@@ -1,4 +1,4 @@
-export type AgentKind = "claude" | "codex" | "cursor" | "kimi" | "shell";
+export type AgentKind = "claude" | "codex" | "cursor" | "kimi" | "hermes" | "shell";
 
 /** 是否为真正的 agent 终端(区别于裸 shell)；未来新增 agent 类型无需再逐处补分支。
  *  写成类型谓词(k is ...)而非裸 boolean，是为了保留原 `agentKind === "claude" || agentKind === "codex"`
@@ -59,6 +59,15 @@ export const PROFILES: Profile[] = [
     launchCmd: "kimi\r",
     dotColor: "#1783FF",
   },
+  {
+    id: "hermes",
+    label: "Hermes",
+    agentKind: "hermes",
+    shell: "powershell.exe",
+    launchCmd: "hermes\r",
+    // LobeHub HermesAgent colorPrimary 近似暖铜金(品牌识别点)
+    dotColor: "#C4A35A",
+  },
 ];
 
 export const DEFAULT_PROFILE = PROFILES[0];
@@ -72,6 +81,7 @@ export const DEFAULT_PROFILE = PROFILES[0];
  * - codex：新建 `codex`；复原 `codex resume <id>`；无 id 退回 `codex resume`(选择器)
  * - cursor：新建 `cursor-agent`；复原 `cursor-agent --resume <id>`(与 claude 同为 flag 风格，已实测)；无 id 退回 `cursor-agent --resume`(选择器)
  * - kimi：新建 `kimi`(无位置 prompt 参数，不拼 initialPrompt)；复原 `kimi --session <id>`(flag 风格，id 形态 session_<uuid>，已实测)；无 id 退回 `kimi --session`(选择器)
+ * - hermes：新建 `hermes`(不拼 initialPrompt；`-z` 是 oneshot 非交互)；复原 `hermes --resume <id>`(id=`YYYYMMDD_HHMMSS_`+6hex，已实测)；无 id 退回 `hermes -c`(continue；`--resume` 必填参数)
  * - shell：无启动命令。
  */
 export function launchCmdFor(
@@ -120,6 +130,15 @@ export function launchCmdFor(
     if (resume) return ksid ? `kimi --session ${ksid}\r` : "kimi --session\r";
     return `kimi${m}\r`;
   }
+  // hermes 不支持新建时预分配 id；id 由 hermes 自生成、HtyBox 启动后捕获。
+  // 复原：--resume 精确恢复已实测；无 id 用 -c(continue)。新建不拼 ip：-z 是 oneshot。
+  if (agent === "hermes") {
+    const hsid = /^\d{8}_\d{6}_[0-9a-fA-F]{6}$/.test((sessionId ?? "").trim())
+      ? (sessionId as string).trim()
+      : "";
+    if (resume) return hsid ? `hermes --resume ${hsid}\r` : "hermes -c\r";
+    return `hermes${m}\r`;
+  }
   return undefined;
 }
 
@@ -141,11 +160,13 @@ export function injectText(item: DragItem, agent: AgentKind): string {
   if (item.kind === "skill") {
     // cursor-agent 与 claude 同走原生 /skill-name slash-invoke(已实测确认，非文本转发)；
     // kimi 同为原生 skill 机制(/skill:<name>，与系统命令无冲突时可简写 /<name>，本会话实证)。
-    if (agent === "claude" || agent === "cursor" || agent === "kimi") return item.invoke ?? item.path ?? ""; // /skill-name
+    // hermes 同为 /<skill-name>(Step 0 实测)。
+    if (agent === "claude" || agent === "cursor" || agent === "kimi" || agent === "hermes")
+      return item.invoke ?? item.path ?? ""; // /skill-name
     if (agent === "codex") return "@" + (item.path ?? ""); // codex 无原生机制，用文件路径
     return item.path ?? ""; // 裸 shell：纯路径
   }
-  // memory / file：shell 用裸路径，claude/codex 用 @路径；file 多选时各路径转换后以空格拼接
+  // memory / file：shell 用裸路径，其余 agent 用 @路径；file 多选时各路径转换后以空格拼接
   const toRef = (p: string) => (agent === "shell" ? p : "@" + p);
   if (item.kind === "file" && item.paths?.length) return item.paths.map(toRef).join(" ");
   return toRef(item.path ?? "");
