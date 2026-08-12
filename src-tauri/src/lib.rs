@@ -8,6 +8,7 @@ pub mod htyenv; // hty环境引擎:pub 供独立测试 harness/后续命令层�
 pub mod large_text; // plan-1:大文本分片读(pub 供独立验证 bin 调用)
 mod memory_transfer;
 mod portable_archive;
+mod platform_services;
 mod pty;
 mod relay_client;
 mod session_import;
@@ -93,7 +94,7 @@ fn ws_port(state: State<'_, AppState>) -> u16 {
     state.ws_port
 }
 
-/// 设置「Agent」页：检测四家 agent CLI 安装状态（where.exe + --version + latest 对比）。
+/// 设置「Agent」页：检测 agent CLI 安装状态（平台命令查找 + --version + latest 对比）。
 #[tauri::command]
 async fn detect_agents() -> Result<Vec<agent_env::AgentInstallStatus>, String> {
     Ok(tauri::async_runtime::spawn_blocking(agent_env::detect_agents)
@@ -178,7 +179,7 @@ fn agent_progress_cb(
     })
 }
 
-/// 设置「Agent」页：对**单个** agent 跑官方 Windows 安装脚本（流式进度，300s 超时）。
+/// 设置「Agent」页：对**单个** agent 跑目标平台官方安装命令（流式进度，300s 超时）。
 #[tauri::command]
 async fn install_agent(
     id: String,
@@ -935,6 +936,15 @@ fn list_dir(path: String) -> Result<Vec<fs_tree::DirEntry>, String> {
     fs_tree::list_dir(&path)
 }
 
+/// 通过平台适配层把工作区与独立路径段解析为本机绝对路径。
+#[tauri::command]
+fn resolve_workspace_path(
+    workspace_dir: String,
+    components: Vec<String>,
+) -> Result<String, String> {
+    platform_services::platform_services().workspace_path(&workspace_dir, &components)
+}
+
 /// M9：读文本文件（目录 → Err；超上限/二进制 → editable=false；文本白名单/强制 → 有损打开）。
 /// force_lossy / max_bytes / max_open_bytes 可选（invoke 侧 forceLossy / maxBytes / maxOpenBytes），
 /// 缺省 = 不强制 / 编辑上限 10MB / 可打开上限 512MB（超编辑上限但可打开 → viewable=true 供分流）。
@@ -1063,9 +1073,41 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
     fs_tree::reveal_in_explorer(&path)
 }
 
+/// 返回当前平台的主快捷键是否使用 Meta（macOS 的 Command）。
+#[tauri::command]
+fn primary_shortcut_uses_meta() -> bool {
+    platform_services::platform_services().primary_shortcut_uses_meta()
+}
+
+/// 返回前端需要的平台能力；平台判断由适配层统一提供。
+#[tauri::command]
+fn platform_capabilities() -> platform_services::PlatformCapabilities {
+    platform_services::platform_services().capabilities()
+}
+
+/// 通过平台适配层写入系统文本剪贴板。
+#[tauri::command]
+async fn write_clipboard_text(text: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        platform_services::platform_services().write_clipboard_text(&text)
+    })
+    .await
+    .map_err(|error| format!("系统剪贴板写入任务失败：{error}"))?
+}
+
+/// 通过平台适配层读取系统文本剪贴板。
+#[tauri::command]
+async fn read_clipboard_text() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        platform_services::platform_services().read_clipboard_text()
+    })
+    .await
+    .map_err(|error| format!("系统剪贴板读取任务失败：{error}"))?
+}
+
 /// 剪贴板图片存到 `<工作区>/.htybox/<subdir>/`，返回绝对路径（剪贴板无图返回 Err）。
 /// `subdir` 缺省/`None`/`""` → `"tmp"`（终端/Flow）；书签传 `"bookmarks"`（无 48h 清理）。
-/// 重活（PowerShell 读图 + PNG 落盘）走 spawn_blocking，避免同步命令堵死 UI。
+/// 重活（平台剪贴板读取 + PNG 落盘）走 spawn_blocking，避免同步命令堵死 UI。
 #[tauri::command]
 async fn save_clipboard_image(
     workspace_dir: String,
@@ -1138,6 +1180,12 @@ fn list_codex_sessions(cwd: String) -> Vec<sessions::SessionRef> {
     sessions::list_codex_sessions(&cwd)
 }
 
+/// 列本工作区 OpenCode 会话（通过 `opencode session list --format json`）。
+#[tauri::command]
+fn list_opencode_sessions(cwd: String) -> Vec<sessions::SessionRef> {
+    sessions::list_opencode_sessions(&cwd)
+}
+
 /// M9：删除 claude 会话（删 <id>.jsonl 入回收站）。
 #[tauri::command]
 fn delete_claude_session(id: String) -> Result<(), String> {
@@ -1148,6 +1196,12 @@ fn delete_claude_session(id: String) -> Result<(), String> {
 #[tauri::command]
 fn delete_codex_session(path: String) -> Result<(), String> {
     sessions::delete_codex_session(&path)
+}
+
+/// 先将 OpenCode 原生导出放入回收站，再调用官方 CLI 删除会话。
+#[tauri::command]
+fn delete_opencode_session(id: String, cwd: String) -> Result<(), String> {
+    sessions::delete_opencode_session(&id, &cwd)
 }
 
 /// 列本工作区 cursor 会话（~/.cursor/chats 按 meta.json.cwd）。
@@ -1186,13 +1240,13 @@ fn delete_hermes_session(id: String) -> Result<(), String> {
     sessions::delete_hermes_session(&id)
 }
 
-/// 运行后捕获 agent(claude/codex/cursor/kimi/hermes) 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
+/// 运行后捕获 agent 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
 #[tauri::command]
 fn capture_session_ids(agent: String, cwd: String, since_ms: i64) -> Vec<String> {
     sessions::capture_session_ids(&agent, &cwd, since_ms)
 }
 
-/// 按 PTY 精确认领 session：claude 走 sessions/<pid>.json；codex/cursor/kimi 走子树进程创建时间↔会话 createdAt。
+/// 按 PTY 精确认领 session：claude 走 sessions/<pid>.json；其他 Agent 走子树进程创建时间↔会话 createdAt。
 #[tauri::command]
 fn map_agent_sessions_by_pty(
     agent: String,
@@ -1635,6 +1689,7 @@ pub fn run() {
             set_skill_enabled,
             apply_skill_template,
             list_dir,
+            resolve_workspace_path,
             read_text_file,
             open_text_document,
             read_text_lines,
@@ -1651,6 +1706,10 @@ pub fn run() {
             import_make_dir,
             import_dropped_entry,
             reveal_in_explorer,
+            primary_shortcut_uses_meta,
+            platform_capabilities,
+            write_clipboard_text,
+            read_clipboard_text,
             save_clipboard_image,
             set_screenshot_hotkey_enabled,
             watch_file,
@@ -1659,11 +1718,13 @@ pub fn run() {
             count_workspace_files,
             list_claude_sessions,
             list_codex_sessions,
+            list_opencode_sessions,
             list_cursor_sessions,
             list_kimi_sessions,
             list_hermes_sessions,
             delete_claude_session,
             delete_codex_session,
+            delete_opencode_session,
             delete_cursor_session,
             delete_kimi_session,
             delete_hermes_session,

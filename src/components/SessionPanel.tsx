@@ -4,11 +4,13 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   listClaudeSessions,
   listCodexSessions,
+  listOpenCodeSessions,
   listCursorSessions,
   listKimiSessions,
   listHermesSessions,
   deleteClaudeSession,
   deleteCodexSession,
+  deleteOpenCodeSession,
   deleteCursorSession,
   deleteKimiSession,
   deleteHermesSession,
@@ -33,12 +35,14 @@ import TagEditor from "./TagEditor";
 import { useMaskDismiss } from "./ui/maskDismiss";
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
+import opencodeIcon from "../assets/opencode.svg";
 import cursorIcon from "../assets/cursor.svg";
 import hermesIcon from "../assets/hermes.svg";
 
 const AGENTS: { k: SessionAgentKind; label: string; icon?: string }[] = [
   { k: "claude" as const, label: "Claude Code", icon: claudeIcon },
   { k: "codex" as const, label: "Codex", icon: codexIcon },
+  { k: "opencode" as const, label: "OpenCode", icon: opencodeIcon },
   { k: "cursor" as const, label: "Cursor", icon: cursorIcon },
   { k: "kimi" as const, label: "Kimi" }, // kimi 图标走内联 KimiIcon（深色需反转白底黑 K，img 做不到）
   { k: "hermes" as const, label: "Hermes", icon: hermesIcon },
@@ -66,7 +70,7 @@ function saveSessFavs(root: string, keys: string[]): void {
 
 // Session 的 claude/codex/cursor/kimi 选择按工作区持久化（用户点名要持久化的"有状态选择"）
 type SessionAgentKind = SessionAgent;
-const AGENT_KINDS: SessionAgentKind[] = ["claude", "codex", "cursor", "kimi", "hermes"];
+const AGENT_KINDS: SessionAgentKind[] = ["claude", "codex", "opencode", "cursor", "kimi", "hermes"];
 const AGENT_KEY = "htybox.sessionAgent.v1";
 const readAgent = (root: string): SessionAgentKind => {
   const v = getWsState<SessionAgentKind>(AGENT_KEY, root, "claude");
@@ -171,6 +175,8 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
         ? listClaudeSessions
         : kind === "codex"
           ? listCodexSessions
+          : kind === "opencode"
+            ? listOpenCodeSessions
           : kind === "kimi"
             ? listKimiSessions
             : kind === "hermes"
@@ -202,6 +208,8 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
         ? "claude-sessions-changed"
         : agentKind === "codex"
           ? "codex-sessions-changed"
+          : agentKind === "opencode"
+            ? "opencode-sessions-changed"
           : agentKind === "cursor"
             ? "cursor-sessions-changed"
             : agentKind === "kimi"
@@ -319,14 +327,15 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
     try {
       if (agentKind === "claude") await deleteClaudeSession(s.id);
       else if (agentKind === "codex") await deleteCodexSession(s.path);
+      else if (agentKind === "opencode") await deleteOpenCodeSession(s.id, root);
       else if (agentKind === "kimi") await deleteKimiSession(s.path);
       else if (agentKind === "hermes") await deleteHermesSession(s.id);
       else await deleteCursorSession(s.path);
       // 乐观移除：直接从列表剔除该项，避免整列重载导致滚动条跳回顶部
       setList((prev) => (prev ? prev.filter((x) => x.id !== s.id) : prev));
       clearSession(sessionKey(agentKind, s.id)); // 删除会话 → 清其 tag 关联（词表保留，供他会话用）
-    } catch {
-      /* ignore */
+    } catch (error) {
+      setNotice({ tone: "error", message: `删除会话失败：${String(error)}` });
     }
   };
   const favKey = (s: SessionRef) => `${agentKind}:${s.id}`;
@@ -685,15 +694,19 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
           y={menu.y}
           items={[
             { id: "resume", label: "复原到终端" },
-            // kimi/hermes 归档导入导出本期未接入（决策 3=A）→ 隐藏其导出入口
-            ...(agentKind === "kimi" || agentKind === "hermes"
+            // kimi/hermes/opencode 归档导入导出本期未接入（决策 3=A）→ 隐藏其导出入口
+            ...(["kimi", "hermes", "opencode"].includes(agentKind)
               ? []
               : [{ id: "export", label: "导出会话…" }]),
             { id: "rename", label: "重命名" },
             { id: "tags", label: "标签…" },
             { id: "fav", label: isFav(menu.s) ? "取消收藏" : "收藏" },
             MENU_SEP,
-            { id: "delete", label: "删除会话（移入回收站）", danger: true },
+            {
+              id: "delete",
+              label: agentKind === "opencode" ? "删除会话（先备份到回收站）" : "删除会话（移入回收站）",
+              danger: true,
+            },
           ]}
           onAction={(id) => {
             if (id === "resume") resume(menu.s);

@@ -1,4 +1,4 @@
-export type AgentKind = "claude" | "codex" | "cursor" | "kimi" | "hermes" | "shell";
+export type AgentKind = "claude" | "codex" | "opencode" | "cursor" | "kimi" | "hermes" | "shell";
 
 /** 是否为真正的 agent 终端(区别于裸 shell)；未来新增 agent 类型无需再逐处补分支。
  *  写成类型谓词(k is ...)而非裸 boolean，是为了保留原 `agentKind === "claude" || agentKind === "codex"`
@@ -42,6 +42,14 @@ export const PROFILES: Profile[] = [
     shell: "powershell.exe",
     launchCmd: "codex\r",
     dotColor: "#10a37f",
+  },
+  {
+    id: "opencode",
+    label: "OpenCode",
+    agentKind: "opencode",
+    shell: "powershell.exe",
+    launchCmd: "opencode\r",
+    dotColor: "#5a5858",
   },
   {
     id: "cursor",
@@ -93,7 +101,7 @@ export function launchCmdFor(
 ): string | undefined {
   // 新建时按团队配置传 --model（claude/codex 均支持，已核实）；复原不带(会话自带模型)。
   // 清洗成安全 token(词字符+ . - :)，防破坏命令。
-  const mm = (model ?? "").trim().replace(/[^\w.:-]/g, "");
+  const mm = (model ?? "").trim().replace(/[^\w./:-]/g, "");
   const m = mm ? ` --model ${mm}` : "";
   // M7-C：新建时把"先读协作简报"作为位置 prompt（claude/codex 默认进交互并处理它）。清洗双引号/换行防破坏命令。
   const ipRaw = (initialPrompt ?? "").replace(/["\r\n]/g, "").trim();
@@ -113,6 +121,15 @@ export function launchCmdFor(
   if (agent === "codex") {
     if (resume) return sid ? `codex resume ${sid}\r` : "codex resume\r";
     return `codex${m}${ip}\r`;
+  }
+  // OpenCode 模型名使用 provider/model；会话 id 由 CLI 生成，形态为 ses_<token>。
+  if (agent === "opencode") {
+    const osid = /^ses_[A-Za-z0-9]{1,124}$/.test((sessionId ?? "").trim())
+      ? (sessionId as string).trim()
+      : "";
+    if (resume) return osid ? `opencode --session ${osid}\r` : "opencode --continue\r";
+    const prompt = ipRaw ? ` --prompt "${ipRaw}"` : "";
+    return `opencode${m}${prompt}\r`;
   }
   // cursor-agent 不支持新建时预分配 id，其 id 由 cursor-agent 自生成、HtyBox 启动后捕获。
   // 复原：--resume 是 flag 风格(与 claude 同构，已实测)，有 id 精确复原，无 id 落到官方选择器。
@@ -163,7 +180,7 @@ export function injectText(item: DragItem, agent: AgentKind): string {
     // hermes 同为 /<skill-name>(Step 0 实测)。
     if (agent === "claude" || agent === "cursor" || agent === "kimi" || agent === "hermes")
       return item.invoke ?? item.path ?? ""; // /skill-name
-    if (agent === "codex") return "@" + (item.path ?? ""); // codex 无原生机制，用文件路径
+    if (agent === "codex" || agent === "opencode") return "@" + (item.path ?? ""); // 无原生 skill 机制，用文件路径
     return item.path ?? ""; // 裸 shell：纯路径
   }
   // memory / file：shell 用裸路径，其余 agent 用 @路径；file 多选时各路径转换后以空格拼接

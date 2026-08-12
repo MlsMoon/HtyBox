@@ -1,5 +1,6 @@
 import claudeIcon from "../assets/claude.svg";
 import codexIcon from "../assets/codex.svg";
+import opencodeIcon from "../assets/opencode.svg";
 import cursorIcon from "../assets/cursor.svg";
 import hermesIcon from "../assets/hermes.svg";
 
@@ -30,6 +31,8 @@ export function ProfileIcon({ id }: { id: string }) {
     return (
       <img src={codexIcon} alt="Codex" className="codex-glyph h-4 w-4" draggable={false} />
     );
+  if (id === "opencode")
+    return <img src={opencodeIcon} alt="OpenCode" className="h-4 w-4" draggable={false} />;
   if (id === "cursor")
     return (
       <img src={cursorIcon} alt="Cursor" className="cursor-glyph h-4 w-4" draggable={false} />

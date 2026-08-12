@@ -8,6 +8,7 @@ import {
   setRelayConfig,
   type PairingOffer,
 } from "../catalog";
+import { writeClipboardText } from "../platformServices";
 
 /** 小开关（与 SettingsModal 同风格，本组件自带以解耦）。 */
 function Toggle({ on, onChange }: { on: boolean; onChange: () => void }) {
@@ -96,8 +97,7 @@ export default function ConnectionSettings() {
 
   const copy = () => {
     if (!offer) return;
-    navigator.clipboard
-      .writeText(offer.offerUrl)
+    writeClipboardText(offer.offerUrl)
       .then(() => {
         setCopied(true);
         setTimeout(() => setCopied(false), 1500);

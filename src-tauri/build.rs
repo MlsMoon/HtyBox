@@ -1,4 +1,6 @@
+#[cfg(windows)]
 use std::path::Path;
+#[cfg(windows)]
 use std::{env, fs};
 
 fn main() {

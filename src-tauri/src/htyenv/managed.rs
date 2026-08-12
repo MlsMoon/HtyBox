@@ -22,14 +22,21 @@ pub enum ManagedState {
     Diverged,
 }
 
-/// 三态判定(纯函数,便于单测)。`ws==builtin` 优先,内容一致即最新。
-pub fn judge(ws_sha: Option<&str>, base: Option<&str>, builtin_sha: &str) -> ManagedState {
+/// 状态判定(纯函数,便于单测)。本地内容必须显式记录过裁决才进入 Reconciled。
+pub fn judge(
+    ws_sha: Option<&str>,
+    base: Option<&str>,
+    reconciled_sha: Option<&str>,
+    builtin_sha: &str,
+) -> ManagedState {
     match ws_sha {
         None => ManagedState::Missing,
         Some(w) if w == builtin_sha => ManagedState::UpToDate,
         Some(w) => match base {
-            // base==builtin(且 ws≠builtin)= 已针对当前官方版裁决、保留本地变体 → 无动作
-            Some(b) if b == builtin_sha => ManagedState::Reconciled,
+            // 当前本地内容已针对当前官方版显式裁决 → 无动作。
+            Some(b) if b == builtin_sha && reconciled_sha == Some(w) => {
+                ManagedState::Reconciled
+            }
             // base==ws(且 ws≠builtin)= ws 仍是所记旧官方版、官方已更新 → 安全更新
             Some(b) if b == w => ManagedState::CleanOutdated,
             _ => ManagedState::Diverged,
@@ -76,7 +83,8 @@ pub fn scan(workspace: &Path, manifest: &WorkflowManifest) -> Result<ManagedScan
         };
         let builtin_sha = manifest::sha256_hex_upper(content.as_bytes());
         let base = manifest.managed_baseline(rel);
-        match judge(ws_sha.as_deref(), base, &builtin_sha) {
+        let reconciled_sha = manifest.managed_reconciled_sha(rel);
+        match judge(ws_sha.as_deref(), base, reconciled_sha, &builtin_sha) {
             ManagedState::Missing => {}
             ManagedState::UpToDate => {
                 if base != Some(builtin_sha.as_str()) {
@@ -136,13 +144,19 @@ pub fn merge_brief(workspace: &Path, rels: &[String]) -> Result<String, String> 
     Ok(lines.join("\n"))
 }
 
-/// 标记已裁决:对给定 Managed 文件设 base=当前内置 sha(不改内容),使之转 Reconciled、不再报 diverged。
+/// 标记已裁决:记录当前本地 sha 与当前内置基线的关系，不改本地内容。
 pub fn reconcile(workspace: &Path, rels: &[String]) -> Result<usize, String> {
     let mut m = manifest::load(workspace)?;
+    let root = manifest::env_root(workspace);
     let mut n = 0;
     for rel in rels {
         let builtin = builtin_content(rel)?;
-        m.upsert_managed_baseline(rel, &manifest::sha256_hex_upper(builtin.as_bytes()));
+        let local_sha = manifest::sha256_file_upper(&root.join(rel))?;
+        m.mark_managed_reconciled(
+            rel,
+            &manifest::sha256_hex_upper(builtin.as_bytes()),
+            &local_sha,
+        );
         n += 1;
     }
     if n > 0 {
@@ -159,14 +173,15 @@ mod tests {
 
     #[test]
     fn judge_covers_five_states() {
-        assert_eq!(judge(None, None, "B"), ManagedState::Missing);
-        assert_eq!(judge(None, Some("X"), "B"), ManagedState::Missing);
-        assert_eq!(judge(Some("B"), None, "B"), ManagedState::UpToDate, "内容==内置即最新");
-        assert_eq!(judge(Some("B"), Some("A"), "B"), ManagedState::UpToDate, "ws==builtin 优先于基线");
-        assert_eq!(judge(Some("A"), Some("B"), "B"), ManagedState::Reconciled, "ws≠内置但 base==内置=已裁决");
-        assert_eq!(judge(Some("A"), Some("A"), "B"), ManagedState::CleanOutdated, "ws==base 且内置领先");
-        assert_eq!(judge(Some("A"), None, "B"), ManagedState::Diverged, "首装无基线且内容异");
-        assert_eq!(judge(Some("A"), Some("C"), "B"), ManagedState::Diverged, "ws 既非 base 又非 builtin");
+        assert_eq!(judge(None, None, None, "B"), ManagedState::Missing);
+        assert_eq!(judge(None, Some("X"), None, "B"), ManagedState::Missing);
+        assert_eq!(judge(Some("B"), None, None, "B"), ManagedState::UpToDate, "内容==内置即最新");
+        assert_eq!(judge(Some("B"), Some("A"), None, "B"), ManagedState::UpToDate, "ws==builtin 优先于基线");
+        assert_eq!(judge(Some("A"), Some("B"), Some("A"), "B"), ManagedState::Reconciled, "本地 sha 已针对当前官方版裁决");
+        assert_eq!(judge(Some("A"), Some("B"), None, "B"), ManagedState::Diverged, "仅有当前官方基线不代表已裁决");
+        assert_eq!(judge(Some("A"), Some("A"), None, "B"), ManagedState::CleanOutdated, "ws==base 且内置领先");
+        assert_eq!(judge(Some("A"), None, None, "B"), ManagedState::Diverged, "首装无基线且内容异");
+        assert_eq!(judge(Some("A"), Some("C"), None, "B"), ManagedState::Diverged, "ws 既非 base 又非 builtin");
     }
 
     #[test]

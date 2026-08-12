@@ -22,6 +22,7 @@ const AGENTS: {
 }[] = [
   { id: "claude", name: "Claude Code", command: "claude", desc: "官方原生安装脚本（claude.ai），当前用户安装、免 admin" },
   { id: "codex", name: "Codex", command: "codex", desc: "官方独立安装脚本（chatgpt.com），不依赖 Node.js" },
+  { id: "opencode", name: "OpenCode", command: "opencode", desc: "官方安装脚本（opencode.ai）；Windows 依次尝试 Scoop、Chocolatey、npm" },
   { id: "cursor", name: "Cursor", command: "cursor-agent", desc: "官方原生安装脚本（cursor.com），当前用户安装、免 admin" },
   { id: "kimi", name: "Kimi Code", command: "kimi", desc: "官方安装脚本（code.kimi.com）；首次启动前需自行安装 Git for Windows" },
   {
@@ -135,7 +136,7 @@ function RowAction({
   );
 }
 
-/** 设置「Agent」区：4 家 CLI 安装/最新检测 + 单 agent 安装或更新（带行内进度条）。 */
+/** 设置「Agent」区：CLI 安装/最新检测 + 单 agent 安装或更新（带行内进度条）。 */
 export default function AgentSettings() {
   const st = useAgentInstall();
   const [expanded, setExpanded] = useState<AgentId | null>(null);

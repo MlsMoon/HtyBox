@@ -2,6 +2,7 @@
 // 数据真实纪律:描述/版本链/来源全部取自库 manifest 与实文件;「最近动向」= 版本链事件,无事件即空。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { writeClipboardText } from "../../platformServices";
 import ContextMenu from "../ui/ContextMenu";
 import ConfirmModal from "../ui/ConfirmModal";
 import {
@@ -550,7 +551,7 @@ function CollectModal({
               </pre>
               <div className="mt-3 flex justify-end gap-2">
                 <button
-                  onClick={() => navigator.clipboard.writeText(showBrief).catch(() => {})}
+                  onClick={() => writeClipboardText(showBrief).catch(() => {})}
                   className="rounded-md border border-[var(--accent-border)] px-3 py-1 text-[12px] text-[var(--accent-text)] hover:bg-[var(--accent-soft)]"
                 >
                   复制

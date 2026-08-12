@@ -65,6 +65,8 @@ pub struct ProtectedFile {
 pub struct ManagedFile {
     pub path: String,
     pub sha256: String,
+    #[serde(rename = "reconciledSha256", skip_serializing_if = "Option::is_none")]
+    pub reconciled_sha256: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -108,17 +110,39 @@ impl WorkflowManifest {
             .map(|m| m.sha256.as_str())
     }
 
+    pub fn managed_reconciled_sha(&self, path: &str) -> Option<&str> {
+        self.managed_template_files
+            .as_ref()?
+            .iter()
+            .find(|m| m.path == path)?
+            .reconciled_sha256
+            .as_deref()
+    }
+
     /// 写入/更新受管官方文件基线 sha(存在则改，不存在则追加)。
     pub fn upsert_managed_baseline(&mut self, path: &str, sha: &str) {
         let list = self.managed_template_files.get_or_insert_with(Vec::new);
         if let Some(e) = list.iter_mut().find(|m| m.path == path) {
             e.sha256 = sha.to_string();
+            e.reconciled_sha256 = None;
         } else {
             list.push(ManagedFile {
                 path: path.to_string(),
                 sha256: sha.to_string(),
+                reconciled_sha256: None,
                 extra: Map::new(),
             });
+        }
+    }
+
+    pub fn mark_managed_reconciled(&mut self, path: &str, baseline_sha: &str, local_sha: &str) {
+        self.upsert_managed_baseline(path, baseline_sha);
+        if let Some(entry) = self
+            .managed_template_files
+            .as_mut()
+            .and_then(|files| files.iter_mut().find(|entry| entry.path == path))
+        {
+            entry.reconciled_sha256 = Some(local_sha.to_string());
         }
     }
 }
@@ -415,8 +439,11 @@ mod tests {
         assert!(m.managed_baseline("tools/verify.ps1").is_none(), "初始无基线");
         m.upsert_managed_baseline("tools/verify.ps1", "AA");
         assert_eq!(m.managed_baseline("tools/verify.ps1"), Some("AA"));
+        m.mark_managed_reconciled("tools/verify.ps1", "AA", "LOCAL");
+        assert_eq!(m.managed_reconciled_sha("tools/verify.ps1"), Some("LOCAL"));
         m.upsert_managed_baseline("tools/verify.ps1", "BB"); // upsert 改现值
         assert_eq!(m.managed_baseline("tools/verify.ps1"), Some("BB"));
+        assert!(m.managed_reconciled_sha("tools/verify.ps1").is_none());
         assert_eq!(m.managed_template_files.as_ref().unwrap().len(), 1, "同路径不重复");
         let out = serialize(&m).unwrap();
         assert!(out.contains("managedTemplateFiles"), "序列化应含 camelCase 字段");

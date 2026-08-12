@@ -10,6 +10,7 @@ import {
   genId,
 } from "../teams";
 import type { AgentSpec } from "../mcp";
+import { readClipboardText, writeClipboardText } from "../platformServices";
 import TeamEditor from "./TeamEditor";
 import RunPanel from "./RunPanel";
 import { useMaskDismiss } from "./ui/maskDismiss";
@@ -72,14 +73,13 @@ export default function CollabModal({
     ]);
 
   const doExport = () => {
-    navigator.clipboard?.writeText(exportTeams(teams)).then(
+    writeClipboardText(exportTeams(teams)).then(
       () => flash("已复制全部团队 JSON 到剪贴板"),
       () => flash("复制失败"),
     );
   };
   const doImport = () => {
-    navigator.clipboard
-      ?.readText()
+    readClipboardText()
       .then((txt) => {
         const imported = importTeams(txt);
         if (!imported.length) return flash("剪贴板没有可导入的团队 JSON");

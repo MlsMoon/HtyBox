@@ -1,6 +1,7 @@
 // agent记忆同步页(用户第三轮反馈定名):仅本工作区权威记忆 ↔ Claude 原生缓存的单向收敛;
 // codex(直读 canonical)/cursor(未实测)如实标注暂不支持同步。
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { resolveWorkspacePath } from "../../../catalog";
 import type { SyncReport } from "../../../htyenv";
 import type { DashWorkspace } from "../DashboardShell";
 import { InjectModal, slugify } from "./shared";
@@ -19,12 +20,27 @@ export default function MemorySyncSection({
   onRecheck: () => void;
 }) {
   const [inject, setInject] = useState<string | null>(null);
+  const [canonicalDir, setCanonicalDir] = useState<string | null>(null);
   const memory = check?.memory;
-  const canonicalDir = `${ws.path}\\.htyworkflows\\memory`;
   const pending = memory ? [...memory.conflicts.map((rel) => ({ rel, kind: "CONFLICT" as const })), ...memory.uncurated.map((rel) => ({ rel, kind: "UNCURATED" as const }))] : [];
 
+  useEffect(() => {
+    let active = true;
+    setCanonicalDir(null);
+    resolveWorkspacePath(ws.path, [".htyworkflows", "memory"])
+      .then((path) => {
+        if (active) setCanonicalDir(path);
+      })
+      .catch(() => {
+        if (active) setCanonicalDir(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [ws.path]);
+
   const buildBrief = () => {
-    if (!memory) return "";
+    if (!memory || !canonicalDir) return "";
     const lines = [
       `工作区「${ws.name}」的权威记忆与 Claude 原生缓存出现待裁决项,请按双写收敛纪律处置:`,
       `- 权威侧(唯一真源): ${canonicalDir}`,
@@ -70,7 +86,7 @@ export default function MemorySyncSection({
         <div className="mt-3 space-y-1.5 font-mono text-[11px] text-[var(--text-2)]">
           <div className="flex gap-2">
             <span className="w-20 shrink-0 font-sans text-[var(--text-3)]">权威(真源)</span>
-            <span className="break-all">{canonicalDir}</span>
+            <span className="break-all">{canonicalDir ?? "解析中…"}</span>
           </div>
           <div className="flex gap-2">
             <span className="w-20 shrink-0 font-sans text-[var(--text-3)]">Claude 缓存</span>
@@ -97,7 +113,8 @@ export default function MemorySyncSection({
           {pending.length > 0 && (
             <button
               onClick={() => setInject(buildBrief())}
-              className="ml-auto rounded-lg border border-[var(--danger)]/60 px-3 py-1 text-[11px] text-[var(--danger)] transition-colors hover:bg-[var(--danger)]/10"
+              disabled={!canonicalDir}
+              className="ml-auto rounded-lg border border-[var(--danger)]/60 px-3 py-1 text-[11px] text-[var(--danger)] transition-colors hover:bg-[var(--danger)]/10 disabled:cursor-not-allowed disabled:opacity-50"
             >
               注入终端裁决…
             </button>
@@ -136,8 +153,8 @@ export default function MemorySyncSection({
         <div className="text-[13px] font-bold">其他 Agent</div>
         <div className="mt-2 space-y-1.5 text-[11px]">
           <div className="flex gap-2">
-            <span className="w-14 shrink-0 text-[var(--text-2)]">codex</span>
-            <span className="text-[var(--text-3)]">直读权威记忆(rules/codex.md 指引),无缓存链路,无需同步</span>
+            <span className="w-28 shrink-0 text-[var(--text-2)]">Codex / OpenCode</span>
+            <span className="text-[var(--text-3)]">共用 rules/codex.md，直读权威记忆，无缓存链路，无需同步</span>
           </div>
           <div className="flex gap-2">
             <span className="w-14 shrink-0 text-[var(--text-2)]">cursor</span>

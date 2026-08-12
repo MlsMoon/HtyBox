@@ -1,9 +1,6 @@
 //! Agent CLI 安装检测与一键安装/更新(设置「Agent」页数据源)。
 //!
-//! 核心约束:HtyBox 进程 PATH 在应用启动时固定,而各 CLI 安装器写的是注册表 User PATH。
-//! 因此检测(where.exe / --version)与 pty.rs spawn 一律使用 fresh_path() =
-//! 进程 PATH + 注册表 User/Machine PATH 合并去重(保序、进程 PATH 优先),
-//! 否则装完 CLI 必须重启应用才能检测到、新终端才能找到命令。
+//! Agent 检测、安装和更新依赖平台层提供的命令查找与 shell 执行能力。
 
 use serde::Serialize;
 use std::io::Read;
@@ -20,7 +17,7 @@ pub struct AgentInstallStatus {
     pub installed: bool,
     /// 本地版本(规范化;--version best-effort,拿不到不影响 installed 判定)。
     pub version: Option<String>,
-    /// where.exe 解析出的首个路径(未安装为 None)。
+    /// 平台命令查找得到的首个路径(未安装为 None)。
     pub path: Option<String>,
     /// 远端 latest(规范化;拉取失败为 None——此时不声称最新/非最新)。
     pub latest_version: Option<String>,
@@ -49,40 +46,35 @@ pub struct ProgressEvent {
 struct AgentSpec {
     id: &'static str,
     command: &'static str,
-    install_script: &'static str,
-    /// 原生命令更新子命令;None = 更新时重跑 install_script(仅该 agent)。
+    /// 原生命令更新子命令;None = 重新执行该 Agent 的平台安装命令。
     update_args: Option<&'static [&'static str]>,
 }
 
-/// agent 表:检测命令名 + 官方 Windows 安装脚本(均为当前用户安装、免 admin、免 Node;出处随附)。
+/// Agent 业务元数据。平台安装命令由 PlatformServices 具体实现提供。
 const AGENTS: &[AgentSpec] = &[
-    // https://docs.anthropic.com/en/docs/claude-code/setup
     AgentSpec {
         id: "claude",
         command: "claude",
-        install_script: "irm https://claude.ai/install.ps1 | iex",
         update_args: Some(&["update"]),
     },
-    // https://github.com/openai/codex (Quickstart)
     AgentSpec {
         id: "codex",
         command: "codex",
-        install_script: "irm https://chatgpt.com/codex/install.ps1 | iex",
         update_args: Some(&["update"]),
     },
-    // https://cursor.com/docs/cli/installation
+    AgentSpec {
+        id: "opencode",
+        command: "opencode",
+        update_args: Some(&["upgrade"]),
+    },
     AgentSpec {
         id: "cursor",
         command: "cursor-agent",
-        install_script: "irm 'https://cursor.com/install?win32=true' | iex",
         update_args: Some(&["update"]),
     },
-    // https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html
-    // Windows 原生安装 upgrade 可能仅打印手动指引 → 更新走 install_script(只动 kimi)
     AgentSpec {
         id: "kimi",
         command: "kimi",
-        install_script: "irm https://code.kimi.com/kimi-code/install.ps1 | iex",
         update_args: None,
     },
     // Hermes：本期仅 PATH 检测（决策 4=A）；install_script 占位，install_agent 会拒绝对 hermes 安装
@@ -160,12 +152,7 @@ fn run_capture_streaming(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::platform_services::platform_services().configure_background_command(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let buf = Arc::new(Mutex::new(String::new()));
     let last_line: Option<Arc<Mutex<Option<String>>>> = on_progress
@@ -237,79 +224,17 @@ fn run_capture_streaming(
     })
 }
 
-/// Windows:杀进程树(cmd 拉起的 npm/安装器常成孙子进程,只 kill 父进程会假死挂起)。
+/// 终止安装/更新进程；Windows 实现会额外终止 cmd 子树。
 fn kill_process_tree(child: &mut std::process::Child) {
-    #[cfg(windows)]
-    {
-        let pid = child.id();
-        let mut kill = Command::new("taskkill");
-        kill.args(["/PID", &pid.to_string(), "/T", "/F"]);
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            kill.creation_flags(CREATE_NO_WINDOW);
-        }
-        let _ = kill.status();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = child.kill();
-    }
-    let _ = child.kill();
+    crate::platform_services::platform_services().kill_process_tree(child);
 }
 
-/// 注册表 PATH 读取缓存:terminal spawn 是高频路径,而读注册表要 spawn 一次 powershell(~百毫秒级)。
-/// 短 TTL 折中——连续开终端不重复付费;安装耗时远超 TTL,装完后的检测/spawn 必然拿到新值。
-static REG_PATH_CACHE: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
-const REG_PATH_TTL: Duration = Duration::from_secs(10);
 const LATEST_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// 实时 PATH = 当前进程 PATH + 注册表 User/Machine PATH(合并去重、忽略大小写、进程 PATH 优先)。
-/// 注册表读取失败时退回进程 PATH(检测/spawn 仍可用,只是看不到运行期新装的)。
+/// 实时 PATH 由平台层提供；Windows 实现会合并注册表 User/Machine PATH。
 pub fn fresh_path() -> String {
-    let mut parts: Vec<String> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    for extra in registry_paths() {
-        if !parts.iter().any(|p| p.eq_ignore_ascii_case(&extra)) {
-            parts.push(extra);
-        }
-    }
-    parts.join(";")
-}
-
-/// 读注册表 User + Machine PATH(spawn powershell 调 .NET API,免新增 winreg 依赖;
-/// ExpandEnvironmentVariables 展开 %USERPROFILE% 等 REG_EXPAND_SZ 内嵌变量)。
-fn registry_paths() -> Vec<String> {
-    {
-        let cache = REG_PATH_CACHE.lock().unwrap();
-        if let Some((at, paths)) = &*cache {
-            if at.elapsed() < REG_PATH_TTL {
-                return paths.clone();
-            }
-        }
-    }
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "[Environment]::ExpandEnvironmentVariables([Environment]::GetEnvironmentVariable('Path','User')); \
-         [Environment]::ExpandEnvironmentVariables([Environment]::GetEnvironmentVariable('Path','Machine'))",
-    ]);
-    let paths = match run_capture(cmd, Duration::from_secs(10)) {
-        Ok(cap) if !cap.timed_out && cap.code == Some(0) => cap
-            .text
-            .split([';', '\r', '\n'])
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect(),
-        _ => Vec::new(),
-    };
-    *REG_PATH_CACHE.lock().unwrap() = Some((Instant::now(), paths.clone()));
-    paths
+    crate::platform_services::platform_services().standard_path()
 }
 
 /// 检测全部 agent(本地顺序;已安装者并行拉 latest,单条失败不影响其他)。
@@ -362,52 +287,17 @@ fn detect_one_local(a: &AgentSpec, path: &str) -> AgentInstallStatus {
     }
 }
 
-/// where.exe 全部命中里优先可直接/经 cmd 执行的路径(.exe > .cmd > .bat > 首行)。
-/// npm 常同时给出无扩展 shim 与 `.cmd`——前者 CreateProcess 会报「不是有效的 Win32 应用程序」。
+/// 由平台实现查找 Agent 可执行文件或 shell shim。
 fn resolve_command_path(command: &str, path: &str) -> Option<String> {
-    let mut where_cmd = Command::new("where.exe");
-    where_cmd.arg(command).env("PATH", path);
-    let lines: Vec<String> = match run_capture(where_cmd, Duration::from_secs(10)) {
-        Ok(cap) if !cap.timed_out && cap.code == Some(0) => cap
-            .text
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
-            .collect(),
-        _ => return None,
-    };
-    let prefer = |ext: &str| {
-        lines
-            .iter()
-            .find(|l| l.to_ascii_lowercase().ends_with(ext))
-            .cloned()
-    };
-    prefer(".exe")
-        .or_else(|| prefer(".cmd"))
-        .or_else(|| prefer(".bat"))
-        .or_else(|| lines.into_iter().next())
+    crate::platform_services::platform_services().resolve_command_path(command, path)
 }
 
-/// 经 `cmd.exe /D /C` 跑 agent CLI(解析 PATHEXT / npm `.cmd` shim;CreateProcess 直跑会失败)。
+/// 经平台 shell 跑 agent CLI，兼容 Windows 的 `.cmd` shim 和 Unix PATH。
 fn agent_cli_command(command: &str, args: &[&str], path: &str) -> Command {
-    let mut line = command.to_string();
-    for a in args {
-        line.push(' ');
-        line.push_str(a);
-    }
-    let mut cmd = Command::new("cmd.exe");
-    cmd.args(["/D", "/C", &line])
-        .env("PATH", path)
-        // 避免 npm/安装器等交互提示把无 stdin 的后台进程挂死
-        .env("CI", "1")
-        .env("npm_config_yes", "true")
-        .env("npm_config_fund", "false")
-        .env("npm_config_update_notifier", "false");
-    cmd
+    crate::platform_services::platform_services().agent_command(command, args, path)
 }
 
-/// best-effort 版本探测:`cmd /C <command> --version` 首个非空行(8s 超时;含 cmd+shim 冷启动)。
+/// best-effort 版本探测:平台 shell 执行 `<command> --version` 的首个非空行。
 fn probe_version_raw(command: &str, path: &str) -> Option<String> {
     let cmd = agent_cli_command(command, &["--version"], path);
     match run_capture(cmd, Duration::from_secs(8)) {
@@ -463,6 +353,7 @@ fn fetch_latest(id: &str) -> Option<String> {
     match id {
         "claude" => fetch_npm_latest("@anthropic-ai/claude-code"),
         "codex" => fetch_npm_latest("@openai/codex"),
+        "opencode" => fetch_npm_latest("opencode-ai"),
         "kimi" => fetch_npm_latest("@moonshot-ai/kimi-code"),
         "cursor" => fetch_cursor_latest(),
         _ => None,
@@ -473,24 +364,17 @@ fn fetch_npm_latest(package: &str) -> Option<String> {
     // scoped 包 URL 需 encode `/` → `%2F`
     let path = package.replace('/', "%2F");
     let url = format!("https://registry.npmjs.org/{path}/latest");
-    let ps = format!(
-        "try {{ (Invoke-RestMethod -Uri '{url}' -TimeoutSec 5).version }} catch {{ '' }}"
-    );
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps]);
+    let cmd = crate::platform_services::platform_services().fetch_command(&url);
     match run_capture(cmd, LATEST_FETCH_TIMEOUT + Duration::from_secs(2)) {
-        Ok(cap) if !cap.timed_out && cap.code == Some(0) => {
-            let v = cap.text.lines().map(|l| l.trim()).find(|l| !l.is_empty())?;
-            normalize_version(v)
-        }
+        Ok(cap) if !cap.timed_out && cap.code == Some(0) => serde_json::from_str::<serde_json::Value>(&cap.text)
+            .ok()
+            .and_then(|json| json.get("version").and_then(|value| value.as_str()).and_then(normalize_version)),
         _ => None,
     }
 }
 
 fn fetch_cursor_latest() -> Option<String> {
-    let ps = "try { (Invoke-WebRequest -Uri 'https://cursor.com/install?win32=true' -UseBasicParsing -TimeoutSec 5).Content } catch { '' }";
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", ps]);
+    let cmd = crate::platform_services::platform_services().fetch_command("https://cursor.com/install?win32=true");
     match run_capture(cmd, LATEST_FETCH_TIMEOUT + Duration::from_secs(3)) {
         Ok(cap) if !cap.timed_out => parse_cursor_install_version(&cap.text),
         _ => None,
@@ -527,15 +411,7 @@ pub fn install_agent(
         return Err("Hermes 不支持一键安装，请使用官方安装方式".into());
     }
     let spec = find_spec(id)?;
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        spec.install_script,
-    ]);
+    let cmd = crate::platform_services::platform_services().install_agent_command(spec.id);
     finish_action(
         run_capture_streaming(cmd, INSTALL_TIMEOUT, on_progress)?,
         "安装",
@@ -543,8 +419,8 @@ pub fn install_agent(
 }
 
 /// 对指定 **单个** agent 执行更新(不批量、不连带其它 agent)。
-/// Claude/Codex/Cursor → 原生命令 `update`;Kimi → 仅重跑其 install_script。
-/// 原生命令失败**不**回落 install_script(避免二次全量下载)。
+/// Claude/Codex/Cursor → 原生命令 `update`;Kimi → 仅重跑平台安装命令。
+/// 原生命令失败**不**回落安装命令(避免二次全量下载)。
 pub fn update_agent(
     id: &str,
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
@@ -552,19 +428,11 @@ pub fn update_agent(
     let spec = find_spec(id)?;
     let path = fresh_path();
     let cap = if let Some(args) = spec.update_args {
-        // 与版本探测相同:必须经 cmd,否则 npm/.cmd shim CreateProcess 失败
+        // 与版本探测相同：必须经平台 shell，Windows 的 npm/.cmd shim 才能执行。
         let cmd = agent_cli_command(spec.command, args, &path);
         run_capture_streaming(cmd, INSTALL_TIMEOUT, on_progress)?
     } else {
-        let mut cmd = Command::new("powershell.exe");
-        cmd.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            spec.install_script,
-        ]);
+        let cmd = crate::platform_services::platform_services().install_agent_command(spec.id);
         run_capture_streaming(cmd, INSTALL_TIMEOUT, on_progress)?
     };
     finish_action(cap, "更新")
@@ -610,6 +478,11 @@ mod tests {
             normalize_version("codex-cli 0.144.5").as_deref(),
             Some("0.144.5")
         );
+    }
+
+    #[test]
+    fn normalize_opencode() {
+        assert_eq!(normalize_version("1.15.3").as_deref(), Some("1.15.3"));
     }
 
     #[test]

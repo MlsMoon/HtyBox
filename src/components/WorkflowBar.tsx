@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { focusEngine, injectAndSubmit } from "./terminalEngine";
 import { injectText, type AgentKind, type DragItem } from "../profiles";
 import { deleteEntry } from "../catalog";
+import { hasPrimaryShortcutModifier, readClipboardText } from "../platformServices";
 import { isTermRunning, onAgentStatusChange } from "../agentStatus";
 import { useSettings } from "../settings";
 import {
@@ -276,8 +277,7 @@ export default function WorkflowBar({
           .catch(() => {})
           .finally(() => endClipboardPasteBusy());
       };
-      navigator.clipboard
-        ?.readText()
+      readClipboardText()
         .then((raw) => {
           if (!raw) fwd();
         })
@@ -335,7 +335,7 @@ export default function WorkflowBar({
               sendFree();
               return;
             }
-            if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
+            if (hasPrimaryShortcutModifier(e) && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
           }}
           placeholder="向 AI 描述本轮需求 / 问题背景…"
           dragOver={dragOver}
@@ -437,8 +437,7 @@ export default function WorkflowBar({
         .catch(() => {})
         .finally(() => endClipboardPasteBusy());
     };
-    navigator.clipboard
-      ?.readText()
+    readClipboardText()
       .then((raw) => {
         if (!raw) fwd();
       })
@@ -503,8 +502,7 @@ export default function WorkflowBar({
         .catch(() => {})
         .finally(() => endClipboardPasteBusy());
     };
-    navigator.clipboard
-      ?.readText()
+    readClipboardText()
       .then((raw) => {
         if (!raw) fwd();
       })
@@ -571,7 +569,7 @@ export default function WorkflowBar({
                     sendStage();
                     return;
                   }
-                  if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageToSeg(plainSegId);
+                  if (hasPrimaryShortcutModifier(e) && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageToSeg(plainSegId);
                 }}
                 placeholder={cur.segments[0].text || "输入内容，Enter 发送…"}
                 dragOver={dragOver}
@@ -649,7 +647,7 @@ export default function WorkflowBar({
                               sendStage();
                               return;
                             }
-                            if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageToSeg(seg.id);
+                            if (hasPrimaryShortcutModifier(e) && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageToSeg(seg.id);
                           }}
                           onDragOver={(e) => {
                             if (!e.dataTransfer.types.includes(DRAG_MIME)) return;
@@ -713,7 +711,7 @@ export default function WorkflowBar({
                   send();
                   return;
                 }
-                if (e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
+                if (hasPrimaryShortcutModifier(e) && !e.altKey && (e.key === "v" || e.key === "V")) pasteImageProbe();
               }}
               placeholder="输入内容，Enter 发送…"
               dragOver={dragOver}

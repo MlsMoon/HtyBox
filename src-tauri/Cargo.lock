@@ -1764,6 +1764,9 @@ dependencies = [
  "htybox-link",
  "md5",
  "notify-debouncer-mini",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "portable-pty",
  "qrcode",
  "rusqlite",
@@ -1792,6 +1795,7 @@ dependencies = [
 [[package]]
 name = "htybox-link"
 version = "0.1.0"
+source = "git+https://github.com/htyashes-crypto/htybox_link.git?rev=a3f9e8035b2acabca1b7acb663755b262c49e6ec#a3f9e8035b2acabca1b7acb663755b262c49e6ec"
 dependencies = [
  "base64 0.22.1",
  "crypto_box",

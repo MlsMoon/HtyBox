@@ -129,7 +129,7 @@ description: 把工程从原生 Agent 目录（.claude / .agents / .codex 承载
 ### Step 8 — 验收
 
 - [ ] 静态：薄壳数、dry 写入落在 `.htyworkflows/plans` 与 `svg`
-- [ ] **新会话**：Claude / Codex 能发现全部 canonical skill（发现有缓存，必须新进程）
+- [ ] **新会话**：Claude / Codex / OpenCode 能发现全部 canonical skill（发现有缓存，必须新进程）
 - [ ] 报告 → `migration/reports/acceptance-<ts>.md`
 
 ### Step 9 — 清理（必须用户二次确认）

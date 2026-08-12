@@ -257,7 +257,6 @@ pub struct ManagedSkill {
 /// 须相对、无 `..`、无空段、不以盘符/UNC/绝对 `/` 开头，且末段为 `skills`。
 pub fn normalize_skills_rel(skills_rel: &str) -> Result<String, String> {
     let s = skills_rel.trim().replace('\\', "/");
-    let s = s.trim_matches('/').to_string();
     if s.is_empty() {
         return Err("skill 根路径不能为空".into());
     }
@@ -266,6 +265,10 @@ pub fn normalize_skills_rel(skills_rel: &str) -> Result<String, String> {
         return Err(format!(
             "skill 根须为工作区相对路径，不能是绝对路径：{skills_rel}"
         ));
+    }
+    let s = s.trim_end_matches('/').to_string();
+    if s.is_empty() {
+        return Err("skill 根路径不能为空".into());
     }
     if s.len() >= 2 && s.as_bytes()[1] == b':' {
         return Err(format!(
