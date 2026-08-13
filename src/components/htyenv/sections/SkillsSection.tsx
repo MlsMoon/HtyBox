@@ -22,7 +22,7 @@ const PAGE_SIZE = 20;
 
 const AGENTS: { key: string; label: string; color: string }[] = [
   { key: "claude", label: "claude(.claude)", color: "#d97757" },
-  { key: "codex", label: "codex(.agents)", color: "#10a37f" },
+  { key: "codex", label: "codex/OpenCode(.agents)", color: "#10a37f" },
   { key: "cursor", label: "cursor(.cursor)", color: "#8a92a3" },
 ];
 

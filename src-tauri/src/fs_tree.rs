@@ -449,75 +449,16 @@ pub fn import_dropped_entry(
 
 /// 在系统资源管理器中定位该文件/目录。
 pub fn reveal_in_explorer(path: &str) -> Result<(), String> {
-    std::process::Command::new("explorer")
-        .arg(format!("/select,{path}"))
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    crate::platform_services::platform_services().reveal_path(path)
 }
 
 /// 把系统剪贴板中的图片（截图等位图）存到工作区 `.htybox/<subdir>/`，返回绝对路径。
 /// - `subdir == "tmp"`（默认）：`clip-<ts>.png`，落盘后清理超过 48h 的旧文件（终端/Flow 临时图）
 /// - `subdir == "bookmarks"`：`bm-<ts>.png`，**不做** 48h 清理（书签长期附件，生命周期跟书签删）
-/// 其它 subdir 拒绝（防任意路径写入）。读取走 PowerShell + WinForms Clipboard API。
+/// 其它 subdir 拒绝（防任意路径写入）。读取走目标平台的剪贴板实现。
 /// 本函数由 Tauri 命令经 `spawn_blocking` 调用（勿在 UI/IPC 热路径同步跑）。无损 PNG。
 pub fn save_clipboard_image(workspace_dir: &str, subdir: &str) -> Result<String, String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let (folder, prefix, cleanup_48h) = match subdir {
-        "" | "tmp" => ("tmp", "clip", true),
-        "bookmarks" => ("bookmarks", "bm", false),
-        _ => return Err(format!("不支持的剪贴板图片子目录: {subdir}")),
-    };
-
-    let dir = Path::new(workspace_dir).join(".htybox").join(folder);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_millis();
-    let path = dir.join(format!("{prefix}-{ts}.png"));
-    let path_str = path.to_string_lossy().into_owned();
-    // 路径由系统生成、不含单引号，可安全嵌入 PS 单引号字面量
-    let ps = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
-         if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) {{ exit 1 }}; \
-         $img = [System.Windows.Forms.Clipboard]::GetImage(); if ($null -eq $img) {{ exit 1 }}; \
-         $img.Save('{path_str}', [System.Drawing.Imaging.ImageFormat]::Png)"
-    );
-    let out = std::process::Command::new("powershell.exe")
-        .args(["-STA", "-NoProfile", "-NonInteractive", "-Command", &ps])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() || !path.exists() {
-        return Err("剪贴板中没有图片".into());
-    }
-
-    // 仅 tmp：先落盘再清理；清理失败不影响成功路径；整段仍在 worker 内，不堵 UI
-    if cleanup_48h {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            let now = std::time::SystemTime::now();
-            for e in rd.flatten() {
-                if e.path() == path {
-                    continue;
-                }
-                if let Ok(modified) = e.metadata().and_then(|m| m.modified()) {
-                    let old = now
-                        .duration_since(modified)
-                        .map(|d| d.as_secs() > 48 * 3600)
-                        .unwrap_or(false);
-                    if old {
-                        let _ = std::fs::remove_file(e.path());
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(path_str)
+    crate::platform_services::platform_services().save_clipboard_image(workspace_dir, subdir)
 }
 
 // ---------------- M9：全局文件搜索（双击 Shift）----------------

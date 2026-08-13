@@ -1,9 +1,11 @@
-//! M9：列出/删除 claude & codex & cursor & kimi 的工作区会话（"会话记录"按钮）。已按官方文档 + CLI --help 实证：
+//! M9：列出/删除各 Agent 的工作区会话（"会话记录"按钮）。已按官方文档 + CLI --help 实证：
 //! - claude：会话存 ~/.claude/projects/<slug>/<id>.jsonl；标题取自会话内最新 ai-title(claude 自动起的会话标题，与 /resume 选择器一致)，回退 history.jsonl 的 display；
 //!   复原 `claude --resume <id>`(须在该 cwd 下跑)；无原生删除 → 删 <id>.jsonl 文件。
 //! - codex：会话 ~/.codex/sessions/Y/M/D/rollout-*.jsonl，首行 session_meta.payload{id,cwd}；
 //!   自动命名或 `/rename` 设置的原生名称取自 ~/.codex/session_index.jsonl，未命名时回退首条真实用户消息；
 //!   复原 `codex resume <id>`；删除走删 rollout 文件。
+//! - opencode：列表从原生 SQLite 只读查询并按 directory 过滤工作区；复原 `opencode --session <id>`；
+//!   删除前通过官方 CLI 导出原生 JSON，校验后移入回收站，再调用 `opencode session delete <id>`。
 //! - cursor：会话 ~/.cursor/chats/<hash>/<chatId>/meta.json（{schemaVersion,createdAtMs,updatedAtMs,hasConversation,title?,cwd}）；
 //!   外层 hash 目录大概率是 cwd 哈希分桶，不逆向算法、直接扫全部子目录按 meta.json.cwd 过滤；
 //!   标题优先取原生 title，未命名(hasConversation:false)的空壳会话跳过展示，其余回退 prompt_history.json 首条用户输入；
@@ -20,9 +22,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 #[derive(Serialize, Clone)]
@@ -40,10 +43,206 @@ fn home() -> Option<PathBuf> {
 
 const MAX_CODEX_SCAN: usize = 1200; // 最多扫描的 codex rollout 数（按文件名时间倒序）
 const MAX_CURSOR_SCAN: usize = 2000; // 最多扫描的 cursor chat meta.json 数（安全上限，文件名不含时间故按遍历序截断）
+const MAX_OPENCODE_SESSIONS: usize = 2000;
 
 pub const CLAUDE_SESSION_SCHEMA: &str = "claude-transcript-jsonl-v1";
 pub const CODEX_SESSION_SCHEMA: &str = "codex-rollout-jsonl-v1";
 pub const CURSOR_SESSION_SCHEMA: &str = "cursor-chat-v1";
+
+#[derive(Debug)]
+struct OpenCodeSession {
+    id: String,
+    title: String,
+    updated: i64,
+    created: i64,
+    directory: String,
+}
+
+fn validate_opencode_session_id(id: &str) -> Result<(), String> {
+    let Some(token) = id.strip_prefix("ses_") else {
+        return Err("OpenCode Session ID 必须以 ses_ 开头".into());
+    };
+    if token.is_empty()
+        || token.len() > 124
+        || !token.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err("OpenCode Session ID 含非法字符".into());
+    }
+    Ok(())
+}
+
+fn run_opencode(args: &[&str]) -> Result<std::process::Output, String> {
+    let mut command = crate::platform_services::platform_services().agent_command(
+        "opencode",
+        args,
+        &crate::agent_env::fresh_path(),
+    );
+    command.output().map_err(|error| format!("运行 OpenCode CLI 失败：{error}"))
+}
+
+fn opencode_database_path() -> Result<PathBuf, String> {
+    home()
+        .map(|home| {
+            home.join(".local")
+                .join("share")
+                .join("opencode")
+                .join("opencode.db")
+        })
+        .ok_or_else(|| "无法定位 OpenCode 数据目录".into())
+}
+
+fn query_opencode_sessions_in(
+    database: &Path,
+    cwd: &str,
+) -> Result<Vec<OpenCodeSession>, String> {
+    let workspace = canonical_workspace(cwd)?;
+    let metadata = crate::portable_archive::reject_link_or_reparse(database)?;
+    if !metadata.is_file() {
+        return Err("OpenCode 会话数据库不是普通文件".into());
+    }
+    let connection = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("只读打开 OpenCode 会话数据库失败：{error}"))?;
+    connection
+        .busy_timeout(std::time::Duration::from_millis(250))
+        .map_err(|error| format!("设置 OpenCode 数据库 busy timeout 失败：{error}"))?;
+    connection
+        .execute_batch("PRAGMA query_only=ON;")
+        .map_err(|error| format!("设置 OpenCode 数据库只读模式失败：{error}"))?;
+
+    let mut statement = connection
+        .prepare(
+            "SELECT id, title, time_updated, time_created, directory \
+             FROM session ORDER BY time_updated DESC, time_created DESC",
+        )
+        .map_err(|error| format!("准备 OpenCode 会话查询失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(OpenCodeSession {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                updated: row.get(2)?,
+                created: row.get(3)?,
+                directory: row.get(4)?,
+            })
+        })
+        .map_err(|error| format!("查询 OpenCode 会话失败：{error}"))?;
+
+    let mut sessions = Vec::new();
+    let mut directory_matches = HashMap::<String, bool>::new();
+    for row in rows {
+        let session = row.map_err(|error| format!("读取 OpenCode 会话失败：{error}"))?;
+        let matches_workspace = *directory_matches
+            .entry(session.directory.clone())
+            .or_insert_with(|| {
+                path_matches_workspace(&session.directory, &workspace).unwrap_or(false)
+            });
+        if validate_opencode_session_id(&session.id).is_err()
+            || !matches_workspace
+        {
+            continue;
+        }
+        sessions.push(session);
+        if sessions.len() >= MAX_OPENCODE_SESSIONS {
+            break;
+        }
+    }
+    Ok(sessions)
+}
+
+fn query_opencode_sessions(cwd: &str) -> Result<Vec<OpenCodeSession>, String> {
+    query_opencode_sessions_in(&opencode_database_path()?, cwd)
+}
+
+pub fn list_opencode_sessions(cwd: &str) -> Vec<SessionRef> {
+    let Ok(sessions) = query_opencode_sessions(cwd) else {
+        return Vec::new();
+    };
+    let mut refs: Vec<_> = sessions
+        .into_iter()
+        .map(|session| SessionRef {
+            id: session.id,
+            label: if session.title.trim().is_empty() {
+                "(无标题)".into()
+            } else {
+                session.title
+            },
+            ts: session.updated.max(session.created),
+            path: String::new(),
+        })
+        .collect();
+    refs.sort_by(|left, right| right.ts.cmp(&left.ts));
+    refs
+}
+
+pub fn delete_opencode_session(id: &str, cwd: &str) -> Result<(), String> {
+    validate_opencode_session_id(id)?;
+    if !query_opencode_sessions(cwd)?.iter().any(|session| session.id == id) {
+        return Err("OpenCode Session 不属于当前工作区或已不存在".into());
+    }
+
+    let mut backup = tempfile::Builder::new()
+        .prefix(&format!("htybox-opencode-{id}-"))
+        .suffix(".json")
+        .tempfile()
+        .map_err(|error| format!("创建 OpenCode 会话备份失败：{error}"))?;
+    let writer = backup
+        .reopen()
+        .map_err(|error| format!("打开 OpenCode 会话备份失败：{error}"))?;
+    let mut command = crate::platform_services::platform_services().agent_command(
+        "opencode",
+        &["export", id],
+        &crate::agent_env::fresh_path(),
+    );
+    let output = command
+        .stdout(Stdio::from(writer))
+        .output()
+        .map_err(|error| format!("导出 OpenCode 会话失败：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "导出 OpenCode 会话失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    backup
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("读取 OpenCode 会话备份失败：{error}"))?;
+    #[derive(Deserialize)]
+    struct ExportEnvelope {
+        info: ExportInfo,
+        messages: serde::de::IgnoredAny,
+    }
+    #[derive(Deserialize)]
+    struct ExportInfo {
+        id: String,
+    }
+    let exported: ExportEnvelope = serde_json::from_reader(&mut backup)
+        .map_err(|error| format!("OpenCode 会话备份格式无效：{error}"))?;
+    let _ = exported.messages;
+    if exported.info.id != id {
+        return Err("OpenCode 会话备份 ID 与待删除会话不一致".into());
+    }
+    let (backup_file, backup_path) = backup
+        .keep()
+        .map_err(|error| format!("保留 OpenCode 会话备份失败：{}", error.error))?;
+    drop(backup_file);
+    trash::delete(&backup_path).map_err(|error| {
+        let _ = std::fs::remove_file(&backup_path);
+        format!("OpenCode 会话备份移入回收站失败，未删除原会话：{error}")
+    })?;
+
+    let output = run_opencode(&["session", "delete", id])
+        .map_err(|error| format!("OpenCode 原生备份已在回收站，但删除命令启动失败：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "OpenCode 原生备份已在回收站，但删除失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAgent {
@@ -319,7 +518,18 @@ pub(crate) fn locate_claude_session_in(
     let workspace = canonical_workspace(cwd)?;
     let claude_root = home.join(".claude");
     let projects_root = claude_root.join("projects");
-    let expected_slug = crate::catalog::claude_project_slug(cwd)?;
+    let mut expected_slugs = vec![crate::catalog::claude_project_slug(cwd)?];
+    let canonical_slug = crate::catalog::claude_project_slug(
+        workspace
+            .to_str()
+            .ok_or_else(|| "规范工作区路径不是 UTF-8".to_string())?,
+    )?;
+    if !expected_slugs
+        .iter()
+        .any(|slug| slug.eq_ignore_ascii_case(&canonical_slug))
+    {
+        expected_slugs.push(canonical_slug);
+    }
     let root_metadata = crate::portable_archive::reject_link_or_reparse(&projects_root)?;
     if !root_metadata.is_dir() {
         return Err("Claude projects 根目录不存在".into());
@@ -360,7 +570,10 @@ pub(crate) fn locate_claude_session_in(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("");
-    if !actual_slug.eq_ignore_ascii_case(&expected_slug) {
+    if !expected_slugs
+        .iter()
+        .any(|slug| actual_slug.eq_ignore_ascii_case(slug))
+    {
         return Err("Claude transcript 不在当前工作区对应 project bucket".into());
     }
     let (source_cwd, source_agent_version) =
@@ -438,7 +651,10 @@ pub(crate) fn list_claude_sessions_in(home_dir: &Path, cwd: &str) -> Vec<Session
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        if v.get("project").and_then(|p| p.as_str()) != Some(cwd) {
+        let Some(project) = v.get("project").and_then(|p| p.as_str()) else {
+            continue;
+        };
+        if !same_path(project, cwd) {
             continue;
         }
         let Some(id) = v.get("sessionId").and_then(|s| s.as_str()) else {
@@ -1695,12 +1911,13 @@ fn same_path(a: &str, b: &str) -> bool {
     canonical_same_existing_path(Path::new(a), Path::new(b)).unwrap_or(false)
 }
 
-/// 捕获某 agent(claude/codex/cursor/kimi/hermes) 在 cwd 下、启动时刻(since_ms)之后新生成的会话 id（按时间升序）。
-/// 都不便在新建时预分配 id，故新建发裸命令、启动后由此关联各自终端的真实 session id。
+/// 捕获某 agent 在 cwd 下、启动时刻(since_ms)之后新生成的会话 id（按时间升序）。
+/// 各 CLI 都不便在新建时预分配 id，故新建发裸命令、启动后由此关联各自终端的真实 session id。
 pub fn capture_session_ids(agent: &str, cwd: &str, since_ms: i64) -> Vec<String> {
     match agent {
         "claude" => capture_claude_ids(cwd, since_ms),
         "codex" => capture_codex_ids(cwd, since_ms),
+        "opencode" => capture_opencode_ids(cwd, since_ms),
         "cursor" => capture_cursor_ids(cwd, since_ms),
         "kimi" => capture_kimi_ids(cwd, since_ms),
         "hermes" => capture_hermes_ids(cwd, since_ms),
@@ -1803,7 +2020,7 @@ pub fn map_agent_sessions_by_pty(
 ) -> Vec<PtySessionMap> {
     match agent {
         "claude" => map_claude_sessions_by_pty(cwd, since_ms, pty_pids),
-        "codex" | "cursor" | "kimi" | "hermes" => {
+        "codex" | "opencode" | "cursor" | "kimi" | "hermes" => {
             map_sessions_by_agent_process(agent, cwd, since_ms, pty_pids)
         }
         _ => Vec::new(),
@@ -1850,11 +2067,27 @@ pub fn map_claude_sessions_by_pty(
 fn scan_session_times(agent: &str, cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
     match agent {
         "codex" => scan_codex_session_times(cwd, since_ms),
+        "opencode" => scan_opencode_session_times(cwd, since_ms),
         "cursor" => scan_cursor_session_times(cwd, since_ms),
         "kimi" => scan_kimi_session_times(cwd, since_ms),
         "hermes" => scan_hermes_session_times(cwd, since_ms),
         _ => Vec::new(),
     }
+}
+
+fn scan_opencode_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
+    let Ok(sessions) = query_opencode_sessions(cwd) else {
+        return Vec::new();
+    };
+    let mut hits: Vec<_> = sessions
+        .into_iter()
+        .filter_map(|session| {
+            let created = session.created;
+            (created >= since_ms).then_some((session.id, created))
+        })
+        .collect();
+    hits.sort_by_key(|(_, created)| *created);
+    hits
 }
 
 fn scan_codex_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
@@ -2069,7 +2302,7 @@ fn map_sessions_by_agent_process(
         let Some(agent_pid) = pick_agent_main_pid(agent, pty, &snap) else {
             continue;
         };
-        let Some(start) = process_creation_ms(agent_pid) else {
+        let Some(start) = process_creation_ms_from_snapshot(agent_pid, &snap) else {
             continue;
         };
         cands.push((pty, start));
@@ -2112,11 +2345,16 @@ fn session_id_from_pty_cmdline(
     valid: &HashSet<String>,
 ) -> Option<String> {
     for pid in descendant_pids(pty_pid, &snap.parents) {
-        let Some(cmd) = process_command_line(pid) else {
+        let Some(cmd) = process_command_line_from_snapshot(pid, snap) else {
             continue;
         };
         if let Some(id) = extract_session_id_from_cmdline(agent, &cmd) {
-            if let Some(canon) = valid.iter().find(|v| v.eq_ignore_ascii_case(&id)) {
+            let canon = if agent == "opencode" {
+                valid.get(&id)
+            } else {
+                valid.iter().find(|value| value.eq_ignore_ascii_case(&id))
+            };
+            if let Some(canon) = canon {
                 return Some(canon.clone());
             }
         }
@@ -2124,7 +2362,7 @@ fn session_id_from_pty_cmdline(
     None
 }
 
-/// 从 agent 进程命令行解析 session id（cursor `--resume`、codex `resume`、kimi `--session`）。
+/// 从 agent 进程命令行解析 session id。
 fn extract_session_id_from_cmdline(agent: &str, cmd: &str) -> Option<String> {
     let lower = cmd.to_ascii_lowercase();
     match agent {
@@ -2137,6 +2375,13 @@ fn extract_session_id_from_cmdline(agent: &str, cmd: &str) -> Option<String> {
             extract_flag_value(&lower, &["--resume", "-r"])
                 .or_else(|| extract_subcommand_value(&lower, "resume"))
                 .and_then(normalize_uuid)
+        }
+        "opencode" => {
+            let raw = extract_flag_value(cmd, &["--session", "-s"])?;
+            let value = raw.trim_matches(|c| c == '"' || c == '\'');
+            validate_opencode_session_id(value)
+                .is_ok()
+                .then(|| value.to_string())
         }
         "kimi" => {
             // `kimi --session session_<uuid>`
@@ -2197,6 +2442,8 @@ fn extract_subcommand_value<'a>(cmd: &'a str, sub: &str) -> Option<&'a str> {
 struct ProcSnap {
     parents: HashMap<u32, u32>,
     names: HashMap<u32, String>, // lowercase exe
+    commands: HashMap<u32, String>,
+    started_at: HashMap<u32, i64>,
 }
 
 fn process_snapshot() -> ProcSnap {
@@ -2206,11 +2453,73 @@ fn process_snapshot() -> ProcSnap {
     }
     #[cfg(not(windows))]
     {
-        ProcSnap {
-            parents: HashMap::new(),
-            names: HashMap::new(),
-        }
+        unix_process_snapshot()
     }
+}
+
+#[cfg(not(windows))]
+fn parse_elapsed_seconds(value: &str) -> Option<i64> {
+    let (days, clock) = if let Some((days, clock)) = value.split_once('-') {
+        (days.parse::<i64>().ok()?, clock)
+    } else {
+        (0, value)
+    };
+    let parts: Vec<i64> = clock
+        .split(':')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let seconds = match parts.as_slice() {
+        [minutes, seconds] => minutes * 60 + seconds,
+        [hours, minutes, seconds] => hours * 3600 + minutes * 60 + seconds,
+        _ => return None,
+    };
+    Some(days * 86_400 + seconds)
+}
+
+#[cfg(not(windows))]
+fn unix_process_snapshot() -> ProcSnap {
+    let mut snap = ProcSnap {
+        parents: HashMap::new(),
+        names: HashMap::new(),
+        commands: HashMap::new(),
+        started_at: HashMap::new(),
+    };
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,etime=,comm=,command="])
+        .output()
+    else {
+        return snap;
+    };
+    if !output.status.success() {
+        return snap;
+    }
+    let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(ppid), Some(elapsed), Some(command_name)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid), Some(elapsed)) = (
+            pid.parse::<u32>(),
+            ppid.parse::<u32>(),
+            parse_elapsed_seconds(elapsed),
+        ) else {
+            continue;
+        };
+        snap.parents.insert(pid, ppid);
+        let name = Path::new(command_name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(command_name)
+            .to_ascii_lowercase();
+        snap.names.insert(pid, name);
+        snap.commands.insert(pid, fields.collect::<Vec<_>>().join(" "));
+        snap.started_at.insert(pid, now as i64 - elapsed * 1000);
+    }
+    snap
 }
 
 /// 从 pid 沿父链向上，若命中 `want` 中任一祖先则返回该祖先 pid。
@@ -2259,7 +2568,7 @@ fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32
                 .copied()
                 .filter(|pid| snap.names.get(pid).map(|n| n.as_str()) == Some("kimi.exe"))
                 .collect();
-            pick_earliest_pid(&hits)
+            pick_earliest_pid(&hits, snap)
         }
         "hermes" => {
             let hits: Vec<u32> = desc
@@ -2272,7 +2581,7 @@ fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32
                     )
                 })
                 .collect();
-            pick_earliest_pid(&hits)
+            pick_earliest_pid(&hits, snap)
         }
         "cursor" => {
             // 主入口：node ...\index.js；绝不能用创建最晚的 worker node
@@ -2281,7 +2590,7 @@ fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32
                 if snap.names.get(pid).map(|n| n.as_str()) != Some("node.exe") {
                     continue;
                 }
-                let Some(cmd) = process_command_line(*pid) else {
+                let Some(cmd) = process_command_line_from_snapshot(*pid, snap) else {
                     continue;
                 };
                 let c = cmd.to_ascii_lowercase();
@@ -2289,7 +2598,7 @@ fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32
                     mains.push(*pid);
                 }
             }
-            if let Some(p) = pick_earliest_pid(&mains) {
+            if let Some(p) = pick_earliest_pid(&mains, snap) {
                 return Some(p);
             }
             // 无 cmdline 时：取创建最早的 node（主进程先于 worker）
@@ -2298,7 +2607,7 @@ fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32
                 .copied()
                 .filter(|pid| snap.names.get(pid).map(|n| n.as_str()) == Some("node.exe"))
                 .collect();
-            pick_earliest_pid(&nodes)
+            pick_earliest_pid(&nodes, snap)
         }
         "codex" => {
             let mut mains = Vec::new();
@@ -2311,7 +2620,7 @@ fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32
                 if name != "node.exe" {
                     continue;
                 }
-                let Some(cmd) = process_command_line(*pid) else {
+                let Some(cmd) = process_command_line_from_snapshot(*pid, snap) else {
                     continue;
                 };
                 let c = cmd.to_ascii_lowercase();
@@ -2320,7 +2629,7 @@ fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32
                     mains.push(*pid);
                 }
             }
-            if let Some(p) = pick_earliest_pid(&mains) {
+            if let Some(p) = pick_earliest_pid(&mains, snap) {
                 return Some(p);
             }
             let nodes: Vec<u32> = desc
@@ -2328,16 +2637,47 @@ fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32
                 .copied()
                 .filter(|pid| snap.names.get(pid).map(|n| n.as_str()) == Some("node.exe"))
                 .collect();
-            pick_earliest_pid(&nodes)
+            pick_earliest_pid(&nodes, snap)
+        }
+        "opencode" => {
+            let hits: Vec<u32> = desc
+                .iter()
+                .copied()
+                .filter(|pid| {
+                    let name = snap.names.get(pid).map(String::as_str).unwrap_or("");
+                    if matches!(name, "opencode" | "opencode.exe") {
+                        return true;
+                    }
+                    process_command_line_from_snapshot(*pid, snap)
+                        .map(|command| command.to_ascii_lowercase().contains("opencode"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            pick_earliest_pid(&hits, snap)
         }
         _ => None,
     }
 }
 
-fn pick_earliest_pid(pids: &[u32]) -> Option<u32> {
+fn pick_earliest_pid(pids: &[u32], snap: &ProcSnap) -> Option<u32> {
     pids.iter()
         .copied()
-        .min_by_key(|pid| process_creation_ms(*pid).unwrap_or(i64::MAX))
+        .min_by_key(|pid| process_creation_ms_from_snapshot(*pid, snap).unwrap_or(i64::MAX))
+}
+
+fn process_command_line_from_snapshot(pid: u32, snap: &ProcSnap) -> Option<String> {
+    snap.commands
+        .get(&pid)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| process_command_line(pid))
+}
+
+fn process_creation_ms_from_snapshot(pid: u32, snap: &ProcSnap) -> Option<i64> {
+    snap.started_at
+        .get(&pid)
+        .copied()
+        .or_else(|| process_creation_ms(pid))
 }
 
 fn process_command_line(pid: u32) -> Option<String> {
@@ -2499,7 +2839,12 @@ fn win_process_snapshot() -> ProcSnap {
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE || snap == 0 {
-            return ProcSnap { parents, names };
+            return ProcSnap {
+                parents,
+                names,
+                commands: HashMap::new(),
+                started_at: HashMap::new(),
+            };
         }
         let mut entry: ProcessEntry32W = zeroed();
         entry.dw_size = size_of::<ProcessEntry32W>() as u32;
@@ -2520,12 +2865,24 @@ fn win_process_snapshot() -> ProcSnap {
         }
         CloseHandle(snap);
     }
-    ProcSnap { parents, names }
+    ProcSnap {
+        parents,
+        names,
+        commands: HashMap::new(),
+        started_at: HashMap::new(),
+    }
 }
 
 /// codex：扫 rollout，cwd 匹配、created>=since 的 id（升序）。认领请走 `map_agent_sessions_by_pty`。
 fn capture_codex_ids(cwd: &str, since_ms: i64) -> Vec<String> {
     scan_codex_session_times(cwd, since_ms)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+fn capture_opencode_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+    scan_opencode_session_times(cwd, since_ms)
         .into_iter()
         .map(|(id, _)| id)
         .collect()
@@ -2553,9 +2910,11 @@ mod tests {
         canonical_existing_under, codex_label, cursor_bucket, cursor_label,
         first_prompt_from_history, list_codex_sessions_in, list_kimi_sessions_in,
         locate_claude_session_in, locate_codex_session_in, locate_cursor_session_in,
-        parse_codex_session_titles, scan_kimi_session_times_in, validate_codex_relative_path,
-        validate_session_id, ExistingPathKind,
+        parse_codex_session_titles, query_opencode_sessions_in, scan_kimi_session_times_in,
+        validate_codex_relative_path, validate_opencode_session_id, validate_session_id,
+        ExistingPathKind, MAX_OPENCODE_SESSIONS,
     };
+    use rusqlite::{params, Connection};
     use serde_json::{json, Value};
     use std::fs;
     use std::io::Cursor;
@@ -2590,6 +2949,91 @@ mod tests {
 
     fn path_text(path: &Path) -> String {
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn opencode_sessions_read_sqlite_filter_sort_and_bound_results() {
+        let ctx = test_home();
+        let database = ctx.home.join("opencode.db");
+        let mut connection = Connection::open(&database).expect("create OpenCode fixture database");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL
+                );",
+            )
+            .expect("create OpenCode session table");
+        let workspace = path_text(&ctx.workspace);
+        let other_workspace = path_text(&ctx.other_workspace);
+        let transaction = connection.transaction().expect("start fixture transaction");
+        for index in 0..=MAX_OPENCODE_SESSIONS {
+            transaction
+                .execute(
+                    "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        format!("ses_valid{index}"),
+                        format!("session {index}"),
+                        workspace,
+                        index as i64,
+                        index as i64
+                    ],
+                )
+                .expect("insert matching OpenCode session");
+        }
+        transaction
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["ses_other", "other", other_workspace, 9_000_i64, 9_000_i64],
+            )
+            .expect("insert other-workspace session");
+        transaction
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["ses_bad-token", "invalid", workspace, 10_000_i64, 10_000_i64],
+            )
+            .expect("insert invalid session");
+        transaction.commit().expect("commit fixture database");
+        drop(connection);
+
+        let sessions = query_opencode_sessions_in(&database, &workspace)
+            .expect("query OpenCode fixture sessions");
+        assert_eq!(sessions.len(), MAX_OPENCODE_SESSIONS);
+        assert_eq!(sessions[0].id, format!("ses_valid{MAX_OPENCODE_SESSIONS}"));
+        assert_eq!(sessions[0].title, format!("session {MAX_OPENCODE_SESSIONS}"));
+        assert_eq!(sessions[0].updated, MAX_OPENCODE_SESSIONS as i64);
+        assert_eq!(sessions.last().map(|session| session.created), Some(1));
+        assert!(validate_opencode_session_id("ses_validABC123").is_ok());
+        assert!(validate_opencode_session_id("ses_bad-token").is_err());
+    }
+
+    #[test]
+    fn opencode_resume_command_line_extracts_session_id() {
+        assert_eq!(
+            super::extract_session_id_from_cmdline(
+                "opencode",
+                "opencode --session ses_1becf408cffeLlQq78DVRtnZTz"
+            )
+            .as_deref(),
+            Some("ses_1becf408cffeLlQq78DVRtnZTz")
+        );
+        assert!(super::extract_session_id_from_cmdline(
+            "opencode",
+            "opencode --session ses_bad-token"
+        )
+        .is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_elapsed_time_parser_handles_ps_formats() {
+        assert_eq!(super::parse_elapsed_seconds("02:03"), Some(123));
+        assert_eq!(super::parse_elapsed_seconds("01:02:03"), Some(3723));
+        assert_eq!(super::parse_elapsed_seconds("2-01:02:03"), Some(176523));
+        assert_eq!(super::parse_elapsed_seconds("bad"), None);
     }
 
     fn write_json_lines(path: &Path, values: &[Value]) {

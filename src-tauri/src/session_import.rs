@@ -2820,6 +2820,14 @@ mod tests {
         fn path(&self, value: &Path) -> String {
             value.to_string_lossy().into_owned()
         }
+
+        fn canonical_path(&self, value: &Path) -> String {
+            value
+                .canonicalize()
+                .expect("canonical fixture path")
+                .to_string_lossy()
+                .into_owned()
+        }
     }
 
     fn write_lines(values: &[Value]) -> Vec<u8> {
@@ -3110,7 +3118,7 @@ mod tests {
             .collect();
         assert_eq!(
             lines[0].get("cwd").and_then(Value::as_str),
-            Some(fixture.path(&fixture.target).as_str())
+            Some(fixture.canonical_path(&fixture.target).as_str())
         );
         assert_eq!(
             lines[0].pointer("/message/cwd").and_then(Value::as_str),
@@ -3178,11 +3186,11 @@ mod tests {
             .collect();
         assert_eq!(
             values[0].pointer("/payload/cwd").and_then(Value::as_str),
-            Some(fixture.path(&fixture.target).as_str())
+            Some(fixture.canonical_path(&fixture.target).as_str())
         );
         assert_eq!(
             values[1].pointer("/payload/cwd").and_then(Value::as_str),
-            Some(fixture.path(&fixture.target).as_str())
+            Some(fixture.canonical_path(&fixture.target).as_str())
         );
         assert_eq!(
             values[2]
@@ -3208,7 +3216,7 @@ mod tests {
                 .parent()
                 .and_then(Path::file_name)
                 .and_then(|value| value.to_str()),
-            Some(cursor_bucket(&fixture.path(&fixture.target)).as_str())
+            Some(cursor_bucket(&fixture.canonical_path(&fixture.target)).as_str())
         );
         sqlite_integrity(&located.store_db).expect("imported DB integrity");
         for suffix in ["-wal", "-shm", "-journal"] {

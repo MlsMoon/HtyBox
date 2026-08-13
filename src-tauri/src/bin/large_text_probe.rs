@@ -1,7 +1,7 @@
 //! plan-1 独立验证 bin（Windows 下 cargo test 受 ConPTY dll 阻断，验证走此 bin）：
 //! - 无参：正确性套件（边界样本自动生成于 %TEMP%\htybox-probe\，参照实现 = 全量读 split 对拍）
 //! - --perf：性能套件（50MB/200MB 合成日志：open 耗时 / 取行耗时 / 内存 / LRU / mtime 失效）
-//! 运行（PowerShell）：cargo run --release --bin large_text_probe [-- --perf]
+//! 运行（PowerShell）：cargo run --release --features large-text-probe --bin large_text_probe [-- --perf]
 
 use std::fs;
 use std::path::{Path, PathBuf};

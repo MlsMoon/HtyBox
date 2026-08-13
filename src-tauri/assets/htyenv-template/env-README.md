@@ -13,9 +13,9 @@
 
 | 目录 | 职责 |
 |---|---|
-| `rules/` | common.md(各端共用规则权威正文)+ claude.md / codex.md(产品差异条款) |
+| `rules/` | common.md(各端共用规则权威正文)+ claude.md / codex.md(Codex 与 OpenCode 共用差异条款) |
 | `skills/<id>/` | canonical Skill 正文与相对资源,入口统一大写 `SKILL.md` |
-| `adapters/{claude,codex}/` | 在册 Agent 名册与 overlay(见其 README) |
+| `adapters/{claude,codex}/` | 在册 Agent 名册与 overlay；OpenCode 复用 codex/.agents 兼容层(见其 README) |
 | `memory/` | MEMORY.md 索引 + 策展记忆 + imports/(带来源快照导入) |
 | `tools/` | bootstrap / sync-adapters / verify / path-audit(无 HtyBox 时的降级脚本) |
 | `plans/`、`plans_waitChoose/` | 实施计划与待选池 |

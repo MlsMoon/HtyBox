@@ -1,18 +1,18 @@
 # HtyBox
 
 > 把**多个终端**、**Claude Skill** 与 **Claude Memory** 整合到一个窗口的桌面工作台。
-> 核心交互：把左栏 skill / 右栏 memory **拖拽**喂给终端里运行的 Claude Code / Codex，自动注入引用。
+> 核心交互：把左栏 skill / 右栏 memory **拖拽**喂给终端里运行的 Claude Code / Codex / OpenCode，自动注入引用。
 
 **技术栈**：Tauri 2 + Rust（`portable-pty`，Windows 旁加载新版 ConPTY）+ React 19 + TypeScript + Vite + xterm.js + Tailwind v4 + allotment（三栏）+ dockview（终端标签/分屏）。
 
 ## 功能
 
-- **多终端工作台**：标签页 + 拖拽分屏，一个窗口里并排多个终端；PowerShell / Claude Code / Codex 三种 Profile 一键新建。
+- **多终端工作台**：标签页 + 拖拽分屏，一个窗口里并排多个终端；PowerShell / Claude Code / Codex / OpenCode / Cursor / Kimi Profile 一键新建。
 - **拖拽注入**：把 Skill / Memory / 文件拖进任意终端，按目标终端类型自动注入 `/skill`、`@路径` 等引用。
 - **工作区 = 文件夹**：Cursor 式打开文件夹作为工作区；终端 cwd、Skill、Memory 均按工作区隔离；切换工作区后台终端常驻不杀。
 - **文件工作台**：可展开文件树 + 内置编辑器（Markdown / SVG 预览）+ 双击 Shift 全局搜索 + 收藏 / 忽略 / 运行配置。
-- **会话记录**：查看并一键恢复 Claude / Codex 的历史会话（`--resume`）。
-- **多 Agent 团队协作**：保存团队、一键开启一支由多个 Claude / Codex 组成的团队，经 MCP 中枢分工协作（任务派发 / 消息 / 共享黑板 / 文件归属 / 挂起唤醒 / 全自动接力 / 崩溃自动替补）。
+- **会话记录**：查看并一键恢复 Claude / Codex / OpenCode / Cursor / Kimi 的历史会话。
+- **多 Agent 团队协作**：保存团队、一键开启一支由多个 Claude / Codex / OpenCode / Cursor / Kimi 组成的团队，经 MCP 中枢分工协作（任务派发 / 消息 / 共享黑板 / 文件归属 / 挂起唤醒 / 全自动接力 / 崩溃自动替补）。
 - **Skill 上架/下架 + 模板**：按工作区只启用当前任务需要的一小撮 skill，降低 Claude 上下文压力。
 - **界面字体切换**：鸿蒙 / 钉钉 / 阿里 / 文楷四款，本地子集化打包。
 - **自动更新**：内置 updater，发布新版本自动提示升级。

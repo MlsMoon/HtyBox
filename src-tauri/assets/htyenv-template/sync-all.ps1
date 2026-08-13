@@ -54,7 +54,7 @@ if ($refreshed.Count -gt 0) {
 if ($LASTEXITCODE -eq 0) { $R.Add("- canonical $($ids.Count) 个 Skill → 全部在册 Agent 薄壳已重生成，check 零漂移 ✓") }
 else { $R.Add("- **sync-adapters check 未过** ⚠"); $manual++ }
 
-# ③ 记忆同步（Claude 缓存链路,安全单向收敛;Codex 直读 canonical 无需同步）
+# ③ 记忆同步（Claude 缓存链路,安全单向收敛;Codex/OpenCode 直读 canonical 无需同步）
 $R.Add("`n## ③ 记忆同步")
 $memSrc = Join-Path $w 'memory'
 $slug = ($root -replace '[:\\/_]', '-')
@@ -85,7 +85,7 @@ if ((Test-Path $cmPath) -and (Test-Path $pmPath)) {
 } else {
     $R.Add("- Claude 缓存: 补齐 $fill / 一致 $same / MEMORY.md 状态: canonical=$(Test-Path $cmPath) 缓存=$(Test-Path $pmPath)")
 }
-$R.Add("- Codex: 直读 canonical（rules/codex.md 指引$(if (Test-Path (Join-Path $w 'rules\codex.md')) { '存在 ✓' } else { '缺失 ⚠' })）")
+$R.Add("- Codex/OpenCode: 直读 canonical（rules/codex.md 指引$(if (Test-Path (Join-Path $w 'rules\codex.md')) { '存在 ✓' } else { '缺失 ⚠' })）")
 
 # ④ 全套校验
 $R.Add("`n## ④ 全套校验")

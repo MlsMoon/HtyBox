@@ -41,19 +41,20 @@ pub fn open_pty(opts: SpawnOptions) -> Result<PtyParts, String> {
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| format!("openpty: {e}"))?;
 
-    let shell = opts.shell.filter(|s| !s.is_empty()).unwrap_or_else(default_shell);
+    let requested_shell = opts.shell.as_deref();
+    let shell = crate::platform_services::platform_services().resolve_shell(requested_shell);
     let mut cmd = CommandBuilder::new(&shell);
     match opts.cwd.filter(|c| !c.is_empty()) {
         Some(cwd) => cmd.cwd(cwd),
         None => {
-            if let Some(home) = home_dir() {
+            if let Some(home) = crate::platform_services::platform_services().home_dir() {
                 cmd.cwd(home);
             }
         }
     }
     let env = opts.env.unwrap_or_default();
-    // PATH 实时化：HtyBox 进程 PATH 固定在启动时，运行期新装的 CLI（安装器写注册表 User PATH）
-    // 在新终端里会找不到 → 合并注册表实时值（agent_env::fresh_path 带 10s 缓存，热路径无感）；
+    // PATH 实时化：HtyBox 进程 PATH 固定在启动时，运行期新装的 CLI
+    // 在新终端里会找不到 → 使用平台层提供的实时 PATH；
     // 前端显式给了 PATH（Windows 环境变量名忽略大小写）时不覆盖。
     let has_path = env.keys().any(|k| k.eq_ignore_ascii_case("PATH"));
     for (k, v) in env {
@@ -77,18 +78,4 @@ pub fn open_pty(opts: SpawnOptions) -> Result<PtyParts, String> {
         .map_err(|e| format!("take writer: {e}"))?;
 
     Ok(PtyParts { writer, master: pair.master, child, reader })
-}
-
-fn default_shell() -> String {
-    if cfg!(windows) {
-        "powershell.exe".to_string()
-    } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string())
-    }
-}
-
-fn home_dir() -> Option<String> {
-    std::env::var("USERPROFILE")
-        .ok()
-        .or_else(|| std::env::var("HOME").ok())
 }

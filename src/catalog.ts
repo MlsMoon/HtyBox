@@ -77,8 +77,8 @@ export const listMemoryTree = (projectDir: string) =>
 export const listCanonicalMemoryTree = (projectDir: string) =>
   invoke<MemoryNode[]>("list_canonical_memory_tree", { projectDir });
 
-// ---- M9：claude/codex/cursor/kimi 会话记录 ----
-export type SessionAgent = "claude" | "codex" | "cursor" | "kimi" | "hermes";
+// ---- M9：各 Agent 会话记录 ----
+export type SessionAgent = "claude" | "codex" | "opencode" | "cursor" | "kimi" | "hermes";
 
 export interface SessionRef {
   id: string;
@@ -141,12 +141,16 @@ export const listClaudeSessions = (cwd: string) =>
   invoke<SessionRef[]>("list_claude_sessions", { cwd });
 export const listCodexSessions = (cwd: string) =>
   invoke<SessionRef[]>("list_codex_sessions", { cwd });
+export const listOpenCodeSessions = (cwd: string) =>
+  invoke<SessionRef[]>("list_opencode_sessions", { cwd });
 export const listCursorSessions = (cwd: string) =>
   invoke<SessionRef[]>("list_cursor_sessions", { cwd });
 export const deleteClaudeSession = (id: string) =>
   invoke<void>("delete_claude_session", { id });
 export const deleteCodexSession = (path: string) =>
   invoke<void>("delete_codex_session", { path });
+export const deleteOpenCodeSession = (id: string, cwd: string) =>
+  invoke<void>("delete_opencode_session", { id, cwd });
 export const deleteCursorSession = (path: string) =>
   invoke<void>("delete_cursor_session", { path });
 export const listKimiSessions = (cwd: string) =>
@@ -197,7 +201,7 @@ export const importMemoryArchive = (
     expectedArchiveSha256,
     expectedTargetRevision,
   });
-/** 运行后捕获 agent(claude/codex/cursor/kimi) 在 cwd 下、启动时刻(sinceMs)之后新生成的会话 id（按时间升序）。 */
+/** 运行后捕获 agent 在 cwd 下、启动时刻(sinceMs)之后新生成的会话 id（按时间升序）。 */
 export const captureSessionIds = (agent: string, cwd: string, sinceMs: number) =>
   invoke<string[]>("capture_session_ids", { agent, cwd, sinceMs });
 
@@ -205,7 +209,7 @@ export const captureSessionIds = (agent: string, cwd: string, sinceMs: number) =
 export const terminalPtyPid = (id: string) =>
   invoke<number | null>("terminal_pty_pid", { id });
 
-/** 按 PTY 精确认领：claude=sessions/<pid>.json；codex/cursor/kimi=子树进程创建时间↔会话 createdAt。 */
+/** 按 PTY 精确认领：claude=sessions/<pid>.json；其他 Agent=子树进程创建时间↔会话 createdAt。 */
 export const mapAgentSessionsByPty = (
   agent: string,
   cwd: string,
@@ -274,6 +278,10 @@ export interface DirEntry {
 
 /** 列某目录的直接子项。 */
 export const listDir = (path: string) => invoke<DirEntry[]>("list_dir", { path });
+
+/** 由后端平台适配层将工作区与路径段解析为本机绝对路径。 */
+export const resolveWorkspacePath = (workspaceDir: string, components: string[]) =>
+  invoke<string>("resolve_workspace_path", { workspaceDir, components });
 
 // ---- M9：文件读写 / 增删改 ----
 export interface ReadTextResult {

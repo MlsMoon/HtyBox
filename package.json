@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:mac": "bash scripts/build-macos.sh",
+    "test:platform": "node --test tests/platform-keyboard.test.ts",
     "preview": "vite preview",
     "tauri": "tauri",
     "gen:installer-art": "node src-tauri/installer/render-bmp.mjs"
