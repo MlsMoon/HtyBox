@@ -9,6 +9,7 @@ import AgentSettings from "./AgentSettings";
 import AgentAccountsSettings from "./AgentAccountsSettings";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import { primaryShortcutUsesMeta } from "../platformServices";
 import { checkForUpdateDetailed, type Update } from "../updater";
 import { useMaskDismiss } from "./ui/maskDismiss";
 import {
@@ -529,7 +530,11 @@ export default function SettingsModal({
                 />
                 <ToggleRow
                   title="全局截图快捷键"
-                  desc="开启后可用 Ctrl+Shift+A 框选截图到剪贴板；关闭则注销该热键（与飞书等软件的同键冲突时可关掉让出）"
+                  desc={
+                    primaryShortcutUsesMeta()
+                      ? "开启后可用 Cmd+Shift+A 框选截图到剪贴板；关闭则注销该热键（与飞书等软件的同键冲突时可关掉让出）"
+                      : "开启后可用 Ctrl+Shift+A 框选截图到剪贴板；关闭则注销该热键（与飞书等软件的同键冲突时可关掉让出）"
+                  }
                   on={s.screenshotHotkey}
                   onChange={(v) => {
                     setSetting("screenshotHotkey", v);

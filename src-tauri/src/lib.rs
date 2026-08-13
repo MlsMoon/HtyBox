@@ -1180,7 +1180,7 @@ fn list_codex_sessions(cwd: String) -> Vec<sessions::SessionRef> {
     sessions::list_codex_sessions(&cwd)
 }
 
-/// 列本工作区 OpenCode 会话（通过 `opencode session list --format json`）。
+/// 列本工作区 OpenCode 会话（只读查询原生 SQLite `opencode.db`，按 directory 过滤）。
 #[tauri::command]
 fn list_opencode_sessions(cwd: String) -> Vec<sessions::SessionRef> {
     sessions::list_opencode_sessions(&cwd)

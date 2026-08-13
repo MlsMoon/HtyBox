@@ -10,30 +10,52 @@ use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
-pub const HOTKEY: &str = "ctrl+shift+a";
+
+fn hotkey() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "cmd+shift+a"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "ctrl+shift+a"
+    }
+}
+
+fn hotkey_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Cmd+Shift+A"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "Ctrl+Shift+A"
+    }
+}
 
 static IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// 按设置开关注册 / 注销全局热键。幂等；注册失败返回 Err（由前端提示）。
 pub fn set_hotkey_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let gs = app.global_shortcut();
+    let hotkey = hotkey();
     if enabled {
-        if gs.is_registered(HOTKEY) {
+        if gs.is_registered(hotkey) {
             return Ok(());
         }
-        gs.register(HOTKEY).map_err(|e| {
-            eprintln!("[screenshot] Ctrl+Shift+A register failed: {e}");
+        gs.register(hotkey).map_err(|e| {
+            eprintln!("[screenshot] {} register failed: {e}", hotkey_label());
             e.to_string()
         })?;
-        eprintln!("[screenshot] Ctrl+Shift+A registered");
+        eprintln!("[screenshot] {} registered", hotkey_label());
         Ok(())
     } else {
-        if gs.is_registered(HOTKEY) {
-            gs.unregister(HOTKEY).map_err(|e| {
-                eprintln!("[screenshot] Ctrl+Shift+A unregister failed: {e}");
+        if gs.is_registered(hotkey) {
+            gs.unregister(hotkey).map_err(|e| {
+                eprintln!("[screenshot] {} unregister failed: {e}", hotkey_label());
                 e.to_string()
             })?;
-            eprintln!("[screenshot] Ctrl+Shift+A unregistered");
+            eprintln!("[screenshot] {} unregistered", hotkey_label());
         }
         Ok(())
     }

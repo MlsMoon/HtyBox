@@ -152,7 +152,7 @@ export function ensureEngine(
             }).catch(() => {});
           else pasteClipImage();
         })
-        .catch(() => {});
+        .catch(pasteClipImage);
       return false;
     }
     if ((e.key === "c" || e.key === "C") && !e.shiftKey) {

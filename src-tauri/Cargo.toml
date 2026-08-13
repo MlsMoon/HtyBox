@@ -53,7 +53,7 @@ tauri-plugin-process = "2"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time"] }
 axum = { version = "0.8.9", features = ["ws"] }
 futures-util = "0.3.32"
-htybox-link = { git = "https://github.com/htyashes-crypto/htybox_link.git", rev = "a3f9e8035b2acabca1b7acb663755b262c49e6ec" }
+htybox-link = { path = "../../HtyBox_link/crates/htybox-link" }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 tokio-tungstenite = "0.29" # L4: relay 反连客户端（控制+数据 socket）；默认特性 connect+handshake（ws://），rustls 留部署(决策4修正)
 tauri-plugin-global-shortcut = "2.3.2"

@@ -32,7 +32,7 @@ DMG 使用标准 Finder 安装布局。打开镜像后，将 `HtyBox.app` 拖到
 
 ## 运行前提
 
-Claude、Codex、Cursor 和 Kimi 的 CLI 需要单独安装，并且命令位于当前用户 PATH。HtyBox 会补充常见的 Homebrew、`~/.local/bin` 和 npm 全局目录，但不会替用户安装 Agent。
+Claude、Codex、OpenCode、Cursor、Kimi 和 Hermes 的 CLI 需要单独安装，并且命令位于当前用户 PATH。HtyBox 会补充常见的 Homebrew、`~/.local/bin` 和 npm 全局目录，但不会替用户安装 Agent。
 
 ## 手动验证
 
