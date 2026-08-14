@@ -609,6 +609,12 @@ export default function SettingsModal({
                   on={s.termFreeInputOpen}
                   onChange={(v) => setSetting("termFreeInputOpen", v)}
                 />
+                <ToggleRow
+                  title="性能诊断角标"
+                  desc="左下角常驻一行诊断数字（终端输出 msg/s·KB/s、write 耗时、FPS、长任务、会话重扫计数）；仅排查终端卡顿时开启，日常关闭"
+                  on={s.perfHud}
+                  onChange={(v) => setSetting("perfHud", v)}
+                />
               </div>
             )}
             {section === "files" && (

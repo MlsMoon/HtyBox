@@ -26,6 +26,23 @@ export function onAgentStatusChange(fn: Listener): () => void {
   };
 }
 
+// ---- plan-3:工作区级 running 查询 + 转 idle 通知(会话重扫退避的判据/终扫触发) ----
+const idleListeners = new Set<(ws: string) => void>();
+/** 工作区从「有 agent 在跑」转为「全部静默」时通知(会话重扫终扫触发点)。返回取消函数。 */
+export function onWorkspaceIdle(fn: (ws: string) => void): () => void {
+  idleListeners.add(fn);
+  return () => {
+    idleListeners.delete(fn);
+  };
+}
+function notifyIdleIfQuiet(ws: string): void {
+  if (!wsRunning(ws)) idleListeners.forEach((f) => f(ws));
+}
+/** 该工作区是否有 agent 终端正在跑(会话重扫退避判据)。 */
+export function isWorkspaceRunning(ws: string): boolean {
+  return wsRunning(ws);
+}
+
 const IDLE_MS = 2000; // PTY/标题静默超过此时长 → 判定完成/空闲（略放宽，容忍 spinner 慢帧/输出间隔）
 
 const running = new Map<string, boolean>(); // termId → 是否运行中
@@ -70,6 +87,7 @@ function markIdle(termId: string): void {
   finished.add(termId); // 跑过且已静默 = 完成（常驻到再次活动）
   // 该工作区聚合 running 由 true→false 跳变：若此刻非当前激活工作区 → 标记"完成待查看"
   if (!wsRunning(ws) && ws !== activeWs) doneUnseen.add(ws);
+  notifyIdleIfQuiet(ws); // plan-3：运行→静默跳变,触发会话重扫终扫
   emit();
 }
 
@@ -84,7 +102,10 @@ export function clearTerm(termId: string): void {
     window.clearTimeout(t);
     idleTimers.delete(termId);
   }
-  if (wasRunning && !wsRunning(ws)) emit();
+  if (wasRunning && !wsRunning(ws)) {
+    notifyIdleIfQuiet(ws); // plan-3：终端关闭致工作区全静默,同样触发终扫
+    emit();
+  }
 }
 
 /** 关闭整个工作区时清理其全部终端状态（避免 map 残留）。 */

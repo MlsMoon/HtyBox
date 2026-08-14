@@ -7,11 +7,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use portable_pty::{MasterPty, PtySize};
-use tauri::ipc::Channel;
+use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::broadcast;
 
@@ -19,6 +20,16 @@ use crate::pty::{open_pty, SpawnOptions, TermId};
 
 const SCROLLBACK_CAP: usize = 1024 * 1024; // 每终端 scrollback 字节上限（1 MiB）
 const BROADCAST_CAP: usize = 2048; // 广播缓冲消息数（慢订阅者超限→Lagged，由 ws_host 重发快照对齐）
+
+// ---- plan-2 帧聚合参数(全局决策 2 默认值;plan-1 实测可微调) ----
+/// 读缓冲(原 8KB→64KB):read 按需返回不等满,不影响回显延迟,大输出 syscall 频率降 8 倍。
+const READ_BUF: usize = 64 * 1024;
+/// 聚合窗口:静默后首包立即 flush(回显零延迟);距上次 flush 不足此时长的后继包攒一帧。
+const FLUSH_WINDOW: Duration = Duration::from_millis(8);
+/// pending 达到此字节数不等窗口直接成帧(大输出直发)。
+const FLUSH_NOW_BYTES: usize = 32 * 1024;
+/// 单帧字节上限,超出拆帧(保护前端单次 write 的帧预算)。
+const MAX_FRAME_BYTES: usize = 256 * 1024;
 
 /// 终端元信息（list / rename 用）。
 #[derive(Clone)]
@@ -61,6 +72,60 @@ impl Scrollback {
     }
 }
 
+/// 帧聚合共享状态：读线程 append + 按需 notify；flusher 线程取帧发送。
+type FlushQueue = (Mutex<Vec<u8>>, Condvar);
+
+/// 本地通道 flusher（plan-2）：独占 Channel。
+/// 策略 = 首包即发（距上次 flush ≥ 窗口）+ 窗口内聚合（攒满阈值提前直发）+ 单帧拆帧上限。
+/// 低吞吐（回显/spinner）每包即时走、延迟与改造前一致；高吞吐自然合并成 32KB~256KB 帧。
+/// 退出：读线程结束置 closed → flush 余量后退出；Channel send 失败（前端关闭）立即退。
+/// 退出路径必须 `local_alive.store(false)`——恢复「本地通道死 → 停止本地复制」止损语义
+///（旧实现 local=None 的等效）；否则读线程持续 append 无人消费的 pending，内存无界增长。
+fn run_flusher(
+    queue: Arc<FlushQueue>,
+    closed: Arc<AtomicBool>,
+    local_alive: Arc<AtomicBool>,
+    ch: Channel<Response>,
+) {
+    let (lock, cond) = &*queue;
+    // 初始视为"窗口已过"：启动后第一包即发。
+    let mut last_flush = Instant::now() - FLUSH_WINDOW;
+    loop {
+        let mut p = lock.lock().unwrap();
+        // 1) 等首包（无限等；关闭且无余量才退）
+        while p.is_empty() {
+            if closed.load(Ordering::Relaxed) {
+                local_alive.store(false, Ordering::Relaxed);
+                return;
+            }
+            p = cond.wait(p).unwrap();
+        }
+        // 2) 聚合窗口：距上次 flush 不足窗口且未攒满阈值 → 等到窗口期满/攒满/关闭
+        let deadline = last_flush + FLUSH_WINDOW;
+        loop {
+            if p.len() >= FLUSH_NOW_BYTES || closed.load(Ordering::Relaxed) {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (g, _) = cond.wait_timeout(p, deadline - now).unwrap();
+            p = g;
+        }
+        // 3) 取帧发送（拆帧保护前端单次 write 帧预算）
+        let frame = std::mem::take(&mut *p);
+        drop(p);
+        for chunk in frame.chunks(MAX_FRAME_BYTES) {
+            if ch.send(Response::new(chunk.to_vec())).is_err() {
+                local_alive.store(false, Ordering::Relaxed);
+                return; // 前端通道关了（面板关闭/刷新）→ 止损 + flusher 退
+            }
+        }
+        last_flush = Instant::now();
+    }
+}
+
 struct TermEntry {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
@@ -97,11 +162,13 @@ impl TerminalCore {
     }
 
     /// 创建终端。`local`=本地前端的无损 Channel（远程创建时为 None）。
+    /// 通道负载为 `Response`(Raw 字节):tauri IPC 对 Raw ≥1024B 走 fetch 直返 ArrayBuffer、
+    /// <1024B 走 eval 内联 Uint8Array——两档前端都收 ArrayBuffer,零 JSON 膨胀(plan-2 Step 0)。
     pub fn create(
         &self,
         id: TermId,
         opts: SpawnOptions,
-        local: Option<Channel<Vec<u8>>>,
+        mut local: Option<Channel<Response>>,
         workspace_id: Option<String>,
     ) -> Result<(), String> {
         let meta = TermMeta {
@@ -117,16 +184,27 @@ impl TerminalCore {
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
         let (resize_tx, _) = broadcast::channel(BROADCAST_CAP);
 
-        // 读线程：唯一生产者，扇出 scrollback + 本地 Channel + broadcast。
+        // 读线程：唯一生产者，扇出 scrollback + 本地聚合队列 + broadcast。
         let mut reader = parts.reader;
         let sb = scrollback.clone();
         let rev = revision.clone();
         let txc = tx.clone();
         let exit_app = self.app.lock().unwrap().clone();
         let exit_id = id.clone();
-        let mut local = local;
+        let queue: Arc<FlushQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        // 本地通道存活标志(读线程与 flusher 共享):flusher 退出(前端关闭/读线程结束)即置 false,
+        // 读线程据此停止 append——止损语义,防 pending 无界增长。
+        let local_alive = Arc::new(AtomicBool::new(local.is_some()));
+        // flusher 线程：独占本地 Channel（决策 2A 每终端一条，与读线程同构）。
+        if let Some(ch) = local.take() {
+            let q = queue.clone();
+            let c = closed.clone();
+            let la = local_alive.clone();
+            std::thread::spawn(move || run_flusher(q, c, la, ch));
+        }
         std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
+            let mut buf = vec![0u8; READ_BUF];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break, // EOF / 读错误 → 子进程结束
@@ -139,16 +217,24 @@ impl TerminalCore {
                             g.push(r, &bytes);
                             r
                         };
-                        // 本地无损直通：前端通道关了(刷新)只停本地、reader 继续供远程
-                        if let Some(ch) = &local {
-                            if ch.send(bytes.clone()).is_err() {
-                                local = None;
+                        // 本地输出经帧聚合（plan-2）：空→非空唤醒发首包；攒满阈值唤醒直发;
+                        // flusher 已退(前端关闭)则跳过——止损,不再复制到无人消费的队列
+                        if local_alive.load(Ordering::Relaxed) {
+                            let (lock, cond) = &*queue;
+                            let mut p = lock.lock().unwrap();
+                            let was_empty = p.is_empty();
+                            p.extend_from_slice(&bytes);
+                            if was_empty || p.len() >= FLUSH_NOW_BYTES {
+                                cond.notify_one();
                             }
                         }
                         let _ = txc.send((r, bytes)); // 无订阅者→Err，忽略
                     }
                 }
             }
+            // 读线程结束：置位唤醒 flusher flush 余量后退出
+            closed.store(true, Ordering::Relaxed);
+            queue.1.notify_all();
             if let Some(app) = exit_app {
                 let _ = app.emit("terminal-exit", &exit_id);
             }

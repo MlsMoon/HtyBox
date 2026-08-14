@@ -39,6 +39,8 @@ export interface Settings {
   /** 标签页可选中：开=点击标签会选中它（可按 Delete/Backspace 关闭）；
    *  关(默认)=点击只切换并把焦点直接交给终端输入，标签不吃焦点，删除键自然落不到标签上 */
   tabSelectable: boolean;
+  /** 性能诊断角标(终端性能主题群 plan-1):开=左下角常驻一行 msg/s·write耗时·FPS·长任务·重扫计数；默认关 */
+  perfHud: boolean;
   /** 左栏 File/Skill/Memory/Session/Flow 分段切换条：开=仅图标(更紧凑) / 关=图标+文字(现状,默认) */
   sidebarTabIconOnly: boolean;
   /**
@@ -80,6 +82,7 @@ const DEFAULTS: Settings = {
   middleClickScroll: true,
   screenshotHotkey: true,
   tabSelectable: false,
+  perfHud: false,
   sidebarTabIconOnly: false,
   skillRootEntries: DEFAULT_ENTRIES.map((e) => ({ ...e })),
   skillRoots: DEFAULT_ENTRIES.filter((e) => e.enabled).map((e) => e.path),

@@ -27,6 +27,7 @@ import { useDoubleShift } from "./components/ui/useDoubleShift";
 import { SidebarToggleIcon, useSidebarToggle } from "./components/ui/SidebarToggle";
 import DashboardShell from "./components/htyenv/DashboardShell";
 import { getSettings, setSetting, useSettings } from "./settings";
+import { startPerfHud, stopPerfHud } from "./perf/perfHud";
 import * as previewWin from "./previewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -231,6 +232,14 @@ export default function App() {
       enabled: getSettings().screenshotHotkey,
     }).catch(() => {});
   }, []);
+
+  // 性能诊断角标(终端性能主题群 plan-1)：随设置启停，默认关
+  const perfHudOn = useSettings().perfHud;
+  useEffect(() => {
+    if (perfHudOn) startPerfHud();
+    else stopPerfHud();
+    return () => stopPerfHud();
+  }, [perfHudOn]);
 
   // 持久化已打开的工作区 + 活动工作区（退出重进复原标签栏）
   useEffect(() => {

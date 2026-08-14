@@ -17,6 +17,8 @@ import {
   beginClipboardPasteBusy,
   endClipboardPasteBusy,
 } from "../clipboardPasteBusy";
+import { getSettings } from "../settings";
+import { perfIpcMsg, perfWrite } from "../perf/perfHud";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -51,6 +53,8 @@ interface Engine {
   lastOutputAt?: number; // 最近一次收到 PTY 输出的时间戳（M7-D：静默=回合物理结束、可安全注入）
   agentKind?: string; // "claude"|"codex"|"cursor"|"shell"：决定是否把 PTY 活动上报运行状态总线
   lastPingAt?: number; // 最近一次向 agentStatus 上报活动的时刻（节流 PTY 高频输出，避免每帧都 ping）
+  pendingChunks: Uint8Array[]; // plan-2：待写 xterm 的输出块队列（rAF 合帧消费）
+  writeRaf?: number; // plan-2：已调度的合帧 rAF 句柄（在飞不重复调度）
   midScroll: () => void; // 解绑中键自动滚动（dispose 时调用；见 middleScroll.ts）
   textInputCleanup?: () => void; // 解绑 macOS WebKit 文本提交修正
 }
@@ -192,6 +196,7 @@ export function ensureEngine(
     created: false,
     launchArmed: false,
     launched: false,
+    pendingChunks: [],
     // 中键自动滚动挂宿主 el（与 paste 拦截同位置）：跟随引擎生命周期，dockview 重排不丢
     midScroll: attachMiddleScroll(term, el),
   });
@@ -211,6 +216,26 @@ function installTerminalTextInputHandler(engine: Engine): () => void {
   return () => textarea.removeEventListener("beforeinput", onBeforeInput, true);
 }
 
+/** plan-2 合帧消费：rAF 内逐块 write（不 concat 避免拷贝；xterm WriteBuffer 内部串行）。 */
+function flushChunks(termId: string): void {
+  const e = engines.get(termId);
+  if (!e) return;
+  e.writeRaf = undefined;
+  const chunks = e.pendingChunks;
+  if (!chunks.length) return;
+  e.pendingChunks = []; // 换出新数组：write 期间到达的消息入队下一帧
+  const hud = getSettings().perfHud;
+  for (const c of chunks) {
+    if (hud) {
+      const t0 = performance.now();
+      e.term.write(c);
+      perfWrite(performance.now() - t0);
+    } else {
+      e.term.write(c);
+    }
+  }
+}
+
 /** 按"当前已 fit 的真实列宽"创建后端 PTY（每个引擎只建一次）。 */
 function createPty(termId: string): void {
   const e = engines.get(termId);
@@ -221,8 +246,10 @@ function createPty(termId: string): void {
   e.lastCols = cols;
   e.lastRows = rows;
 
-  const onOutput = new Channel<number[]>();
-  onOutput.onmessage = (bytes) => {
+  // Raw 通道(plan-2 Step 0)：后端 Channel<Response> 对 ≥1024B 走 fetch 直返 ArrayBuffer、
+  // <1024B eval 内联 Uint8Array.buffer,两档这里都收 ArrayBuffer,零 JSON 膨胀。
+  const onOutput = new Channel<ArrayBuffer>();
+  onOutput.onmessage = (buf) => {
     const now = Date.now();
     e.lastOutputAt = now; // 记录输出时刻 → 供 M7-D 静默检测(物理确认)
     // 运行状态总线（agentStatus 三态）：agent 终端的 PTY 字节流活动 = 正在跑。比 OSC 标题跳动更可靠
@@ -235,7 +262,13 @@ function createPty(termId: string): void {
       e.lastPingAt = now;
       pingAgentActivity(termId);
     }
-    e.term.write(new Uint8Array(bytes));
+    const bytes = new Uint8Array(buf); // ArrayBuffer → 零拷贝视图
+    if (getSettings().perfHud) perfIpcMsg(bytes.length); // 性能探针(plan-1)，bool 短路
+    // plan-2 合帧：入队 + rAF 一次消费（在飞不重复调度）；单帧内多条 IPC 消息只触发一轮 write
+    e.pendingChunks.push(bytes);
+    if (e.writeRaf === undefined) {
+      e.writeRaf = requestAnimationFrame(() => flushChunks(termId));
+    }
   };
 
   invoke("create_terminal", {
@@ -350,6 +383,7 @@ export function disposeEngine(termId: string): void {
   if (!e) return;
   e.ro?.disconnect();
   if (e.fitTimer) clearTimeout(e.fitTimer);
+  if (e.writeRaf !== undefined) cancelAnimationFrame(e.writeRaf); // plan-2：清未消费的合帧
   e.textInputCleanup?.();
   e.midScroll(); // 解绑中键滚动；若滚动会话正属于本终端则一并清场
   if (e.created) invoke("close_terminal", { id: termId }).catch(() => {});

@@ -23,9 +23,13 @@ import {
 } from "../catalog";
 import { openTerminalCmd } from "../dockBus";
 import { launchCmdFor } from "../profiles";
+import { getSettings } from "../settings";
+import { perfRescan } from "../perf/perfHud";
+import { scheduleSessionRefresh } from "../sessionRefreshThrottle";
 import { KimiIcon } from "./ProfileIcon";
 import { searchMatch } from "../search";
 import SearchBox from "./ui/SearchBox";
+import { Pager } from "./htyenv/sections/shared";
 import ContextMenu, { MENU_SEP } from "./ui/ContextMenu";
 import TransferNotice, { type TransferNoticeValue } from "./ui/TransferNotice";
 import { getSessionTitle, setSessionTitle, onSessionTitlesChange } from "../sessionTitles";
@@ -101,8 +105,10 @@ const sessionArchiveName = (title: string, agent: SessionAgent, id: string): str
 // 在 Session 列表重命名 ↔ 在终端 Tab 重命名 改的是同一会话名，两处显示一致（见 sessionTitles.ts）。
 
 /** 「Session」页签：claude/codex 会话列表，点击复原到终端、✕ 删除（移入回收站）。 */
-export default function SessionPanel({ root, workspaceId }: { root: string; workspaceId: string }) {
-  const [agentKind, setAgentKindState] = useState<SessionAgentKind>(() => readAgent(root));
+/** plan-3 分页页长:rest 列表每页 20(Pager 单页自隐);收藏区始终全显(量少)。 */
+const SESS_PAGE_SIZE = 20;
+
+export default function SessionPanel({ root, workspaceId }: { root: string; workspaceId: string }) {  const [agentKind, setAgentKindState] = useState<SessionAgentKind>(() => readAgent(root));
   const [list, setList] = useState<SessionRef[] | null>(null);
   const loadSeq = useRef(0); // 初始/手动/watcher 重拉共用代际，旧请求不得覆盖新名称
   const setAgentKind = (a: SessionAgentKind) => {
@@ -188,8 +194,10 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
               : kind === "grok"
                 ? listGrokSessions
                 : listCursorSessions;
+    const scanT0 = getSettings().perfHud ? performance.now() : 0; // 性能探针(plan-1)：会话重扫计时
     fetcher(root)
       .then((next) => {
+        if (getSettings().perfHud) perfRescan(performance.now() - scanT0);
         if (seq !== loadSeq.current) return;
         setNativeSessionLabels(
           kind,
@@ -229,7 +237,11 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
     let un: (() => void) | undefined;
     let disposed = false;
     listen(evt, () => {
-      if (!disposed) load(agentKind, true);
+      // plan-3：agent 运行期退避为 3s trailing + 结束终扫;非运行期直通(现状灵敏度)
+      if (!disposed)
+        scheduleSessionRefresh(`${agentKind}\0${workspaceId}`, workspaceId, () =>
+          load(agentKind, true),
+        );
     }).then((u) => {
       if (disposed) u();
       else {
@@ -366,6 +378,14 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
     setFavs(next);
     saveSessFavs(root, next);
   };
+  // plan-3 分页:rest 列表每页 20(Pager 单页自隐);收藏区始终全显(量少)。筛选/搜索/工作区/agent 变化回第 1 页。
+  const [page, setPage] = useState(1);
+  const listScrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => setPage(1), [q, effectiveTagIds, agentKind, root]);
+  const onPage = (p: number) => {
+    setPage(p);
+    listScrollRef.current?.scrollTo({ top: 0 });
+  };
   const startRename = (s: SessionRef) => {
     setEditing(favKey(s));
     setDraft(displayLabel(s));
@@ -378,6 +398,9 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   };
   const favList = filtered.filter(isFav);
   const restList = filtered.filter((s) => !isFav(s));
+  const pageCount = Math.ceil(restList.length / SESS_PAGE_SIZE);
+  const curPage = Math.min(page, Math.max(1, pageCount)); // 列表缩短(删除/筛选)时收敛越界页码
+  const pagedRest = restList.slice((curPage - 1) * SESS_PAGE_SIZE, curPage * SESS_PAGE_SIZE);
   const visibleNotice: TransferNoticeValue | null = busy
     ? {
         tone: "busy",
@@ -682,7 +705,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
           </div>
         )}
       </div>
-      <div className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2.5 pb-3">
+      <div ref={listScrollRef} className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2.5 pb-3">
         {list === null && <div className="pt-6 text-center text-[11px] text-[var(--text-3)]">加载中…</div>}
         {list !== null && filtered.length === 0 && (
           <div className="pt-6 text-center text-[11px] text-[var(--text-3)]">无 {agentKind} 会话</div>
@@ -699,7 +722,8 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
             <div className="my-2.5 border-t border-[var(--border)]" />
           </div>
         )}
-        <div className="space-y-1">{restList.map(card)}</div>
+        <div className="space-y-1">{pagedRest.map(card)}</div>
+        <Pager page={curPage} pageCount={pageCount} onPage={onPage} />
       </div>
       {menu && (
         <ContextMenu

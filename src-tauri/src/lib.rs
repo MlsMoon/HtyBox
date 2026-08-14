@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use host_identity::HostIdentity;
 use pty::SpawnOptions;
 use terminal_core::TerminalCore;
-use tauri::ipc::Channel;
+use tauri::ipc::{Channel, Response};
 use tauri::{Emitter, State};
 
 struct AppState {
@@ -340,7 +340,7 @@ fn create_terminal(
     state: State<'_, AppState>,
     id: String,
     opts: SpawnOptions,
-    on_output: Channel<Vec<u8>>,
+    on_output: Channel<Response>,
 ) -> Result<(), String> {
     state.terminal.create(id, opts, Some(on_output), None)
 }

@@ -64,6 +64,8 @@ import * as previewWin from "../previewWindow";
 import { EV_READY } from "../previewProtocol";
 import { hasPrimaryShortcutModifier } from "../platformServices";
 import { getSettings } from "../settings";
+import { perfRescan } from "../perf/perfHud";
+import { scheduleSessionRefresh } from "../sessionRefreshThrottle";
 import {
   listClaudeSessions,
   listCodexSessions,
@@ -230,7 +232,9 @@ async function performNativeLabelRefresh(agentKind: AgentKind, cwd: string): Pro
               : agentKind === "grok"
                 ? listGrokSessions
                 : listCursorSessions;
+    const scanT0 = getSettings().perfHud ? performance.now() : 0; // 性能探针(plan-1)：原生名重扫计时
     const list = await fetcher(cwd);
+    if (getSettings().perfHud) perfRescan(performance.now() - scanT0);
     setNativeSessionLabels(
       agentKind,
       list.map((s) => ({ id: s.id, label: s.label })),
@@ -422,7 +426,7 @@ const saveAL = () => {
 function applyTabTitle(
   termId: string,
   agentKind: AgentKind,
-  api: { setTitle: (t: string) => void },
+  api: { setTitle: (t: string) => void; readonly title?: string | undefined },
   paramSid?: string,
 ): void {
   const isAgent = isAgentTerminal(agentKind);
@@ -445,7 +449,11 @@ function applyTabTitle(
   if (!name) return; // 尚无任何可显示名字 → 不覆盖默认"终端N"
   const role = AGENT_LABELS[termId];
   const shown = role ? `${role}（${name}）` : name;
-  api.setTitle(isAgent && prefix ? prefix + shown : shown);
+  const next = isAgent && prefix ? prefix + shown : shown;
+  // plan-3：同值跳过——避免 dockview 事件空触发 DockTab 重渲染。
+  // api.title 缺省(undefined,如自定义窄实现)时照旧设置,语义与改造前一致。
+  if (api.title !== undefined && api.title === next) return;
+  api.setTitle(next);
 }
 
 // 本次运行中由布局复原出来的终端 id → 启动时发"复原命令"（claude --resume / codex resume）。
@@ -791,7 +799,10 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     if (sessionsEvt && cwd) {
       void listen(sessionsEvt, () => {
         if (sessionsDisposed) return;
-        void refreshNativeLabels(agentKind, cwd).then(refreshTitle);
+        // plan-3：agent 运行期退避为 3s trailing + 结束终扫;非运行期直通
+        scheduleSessionRefresh(`${agentKind}\0${wsOfTerm(termId)}`, wsOfTerm(termId), () => {
+          void refreshNativeLabels(agentKind, cwd).then(refreshTitle);
+        });
       }).then((u) => {
         if (sessionsDisposed) u();
         else {
