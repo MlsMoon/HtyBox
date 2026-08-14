@@ -1240,6 +1240,18 @@ fn delete_hermes_session(id: String) -> Result<(), String> {
     sessions::delete_hermes_session(&id)
 }
 
+/// 列本工作区 Grok 会话（<GROK_HOME|~/.grok>/sessions 下按 summary.info.cwd）。
+#[tauri::command]
+fn list_grok_sessions(cwd: String) -> Vec<sessions::SessionRef> {
+    sessions::list_grok_sessions(&cwd)
+}
+
+/// 删除 Grok 会话（校验 summary 后将整个 session 目录移入回收站）。
+#[tauri::command]
+fn delete_grok_session(path: String) -> Result<(), String> {
+    sessions::delete_grok_session(&path)
+}
+
 /// 运行后捕获 agent 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
 #[tauri::command]
 fn capture_session_ids(agent: String, cwd: String, since_ms: i64) -> Vec<String> {
@@ -1526,7 +1538,7 @@ fn setup_mcp_agent(
         },
     );
     let url = format!("http://127.0.0.1:{}/mcp", state.broker.port());
-    write_mcp_json(&cwd, &url)?; // claude 读
+    write_mcp_json(&cwd, &url)?; // claude / grok 读
     write_codex_config(&cwd, &url)?; // codex 读（信任项目时）
     write_cursor_config(&cwd, &url)?; // cursor 读
     write_kimi_config(&cwd, &url)?; // kimi 读
@@ -1722,12 +1734,14 @@ pub fn run() {
             list_cursor_sessions,
             list_kimi_sessions,
             list_hermes_sessions,
+            list_grok_sessions,
             delete_claude_session,
             delete_codex_session,
             delete_opencode_session,
             delete_cursor_session,
             delete_kimi_session,
             delete_hermes_session,
+            delete_grok_session,
             capture_session_ids,
             map_agent_sessions_by_pty,
             map_claude_sessions_by_pty,

@@ -3,6 +3,7 @@ import codexIcon from "../assets/codex.svg";
 import opencodeIcon from "../assets/opencode.svg";
 import cursorIcon from "../assets/cursor.svg";
 import hermesIcon from "../assets/hermes.svg";
+import grokIcon from "../assets/grok.svg";
 
 /** Kimi 品牌图标（内联 SVG：白 K + 蓝点）。K 的 fill 走 .kimi-k，深色主题经 CSS 反转成白底黑 K（见 index.css .kimi-glyph）。 */
 export function KimiIcon({ className }: { className?: string }) {
@@ -42,6 +43,8 @@ export function ProfileIcon({ id }: { id: string }) {
     return (
       <img src={hermesIcon} alt="Hermes" className="hermes-glyph h-4 w-4" draggable={false} />
     );
+  if (id === "grok")
+    return <img src={grokIcon} alt="Grok" className="grok-glyph h-4 w-4" draggable={false} />;
   return (
     <svg
       className="h-4 w-4"

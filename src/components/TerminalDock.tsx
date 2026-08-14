@@ -36,6 +36,7 @@ import codexIcon from "../assets/codex.svg";
 import opencodeIcon from "../assets/opencode.svg";
 import cursorIcon from "../assets/cursor.svg";
 import hermesIcon from "../assets/hermes.svg";
+import grokIcon from "../assets/grok.svg";
 import { ProfileIcon, KimiIcon } from "./ProfileIcon";
 import {
   agentUnavailable,
@@ -70,6 +71,7 @@ import {
   listCursorSessions,
   listKimiSessions,
   listHermesSessions,
+  listGrokSessions,
   mapAgentSessionsByPty,
   terminalPtyPid,
 } from "../catalog";
@@ -225,7 +227,9 @@ async function performNativeLabelRefresh(agentKind: AgentKind, cwd: string): Pro
             ? listKimiSessions
             : agentKind === "hermes"
               ? listHermesSessions
-              : listCursorSessions;
+              : agentKind === "grok"
+                ? listGrokSessions
+                : listCursorSessions;
     const list = await fetcher(cwd);
     setNativeSessionLabels(
       agentKind,
@@ -468,6 +472,8 @@ function TabTypeIcon({ params }: { params: TermParams & { editorPath?: string } 
   if (params.agentKind === "kimi") return <KimiIcon className={cls} />;
   if (params.agentKind === "hermes")
     return <img src={hermesIcon} alt="" className={"hermes-glyph " + cls} draggable={false} />;
+  if (params.agentKind === "grok")
+    return <img src={grokIcon} alt="" className={"grok-glyph " + cls} draggable={false} />;
   return (
     <svg className={cls} viewBox="0 0 24 24">
       <rect x="2" y="3.5" width="20" height="17" rx="5" fill="var(--text)" />
@@ -777,7 +783,9 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
               ? "kimi-sessions-changed"
               : agentKind === "hermes"
                 ? "hermes-sessions-changed"
-                : null;
+                : agentKind === "grok"
+                  ? "grok-sessions-changed"
+                  : null;
     let sessionsUnlisten: (() => void) | undefined;
     let sessionsDisposed = false;
     if (sessionsEvt && cwd) {

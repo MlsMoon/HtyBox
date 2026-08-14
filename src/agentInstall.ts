@@ -7,8 +7,8 @@ import { Channel, invoke } from "@tauri-apps/api/core";
  * 触发时机：首个订阅方 ensureDetected()（幂等）/ 安装或更新完成后单 agent 刷新 / 手动 redetect()。
  */
 
-export type AgentId = "claude" | "codex" | "opencode" | "cursor" | "kimi" | "hermes";
-export const AGENT_IDS: AgentId[] = ["claude", "codex", "opencode", "cursor", "kimi", "hermes"];
+export type AgentId = "claude" | "codex" | "opencode" | "cursor" | "kimi" | "hermes" | "grok";
+export const AGENT_IDS: AgentId[] = ["claude", "codex", "opencode", "cursor", "kimi", "hermes", "grok"];
 
 export type AgentPhase =
   | "unknown"
@@ -60,6 +60,7 @@ let state: State = {
   cursor: { phase: "unknown" },
   kimi: { phase: "unknown" },
   hermes: { phase: "unknown" },
+  grok: { phase: "unknown" },
 };
 const listeners = new Set<() => void>();
 

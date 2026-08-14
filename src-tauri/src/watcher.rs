@@ -108,6 +108,15 @@ fn is_hermes_session_watch_path(path: &Path, hermes_home: &Path) -> bool {
     under && (name == "state.db" || name == "state.db-wal" || name == "state.db-shm")
 }
 
+/// Grok：`<GROK_HOME|~/.grok>/sessions/<cwd bucket>/<uuid>/summary.json`。
+fn is_grok_session_watch_path(path: &Path, sessions_root: &Path) -> bool {
+    let path_key = watch_path_key(path);
+    let root = watch_path_key(sessions_root)
+        .trim_end_matches('/')
+        .to_string();
+    path_key.starts_with(&format!("{root}/")) && path_key.ends_with("/summary.json")
+}
+
 /// `projects/<slug>/memory` 本身或其任意后代才是原生 Memory 变化。
 /// 同级导入 staging/old/conflict 即使内部含 `payload/memory` 也不能暴露。
 fn is_claude_memory_path(path: &Path, projects_root: &Path) -> bool {
@@ -180,6 +189,15 @@ pub fn start(app: AppHandle) {
         })
         .unwrap_or_else(|| home.join(".hermes"));
     let hermes_home_for_handler = hermes_home.clone();
+    // Grok：GROK_HOME 优先，缺省 ~/.grok（与 sessions::grok_data_root 同契约）
+    let grok_data = std::env::var("GROK_HOME")
+        .ok()
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".grok"));
+    let grok_sessions_root = grok_data.join("sessions");
+    let grok_sessions_for_handler = grok_sessions_root.clone();
 
     let handler_app = app.clone();
     let debouncer = new_debouncer(
@@ -196,6 +214,7 @@ pub fn start(app: AppHandle) {
             let mut cursor_sessions = false;
             let mut kimi_sessions = false;
             let mut hermes_sessions = false;
+            let mut grok_sessions = false;
             for e in &events {
                 let p = e.path.to_string_lossy().replace('\\', "/");
                 if p.contains("/.claude/skills/") || p.contains("/plugins/") {
@@ -226,6 +245,9 @@ pub fn start(app: AppHandle) {
                 if is_hermes_session_watch_path(&e.path, &hermes_home_for_handler) {
                     hermes_sessions = true;
                 }
+                if is_grok_session_watch_path(&e.path, &grok_sessions_for_handler) {
+                    grok_sessions = true;
+                }
             }
             if skills {
                 let _ = handler_app.emit("skills-changed", ());
@@ -250,6 +272,9 @@ pub fn start(app: AppHandle) {
             }
             if hermes_sessions {
                 let _ = handler_app.emit("hermes-sessions-changed", ());
+            }
+            if grok_sessions {
+                let _ = handler_app.emit("grok-sessions-changed", ());
             }
         },
     );
@@ -280,6 +305,8 @@ pub fn start(app: AppHandle) {
     let _ = w.watch(&kimi_sessions_root, RecursiveMode::Recursive);
     // Hermes：state.db / WAL 更新（非递归听 HERMES_HOME 根即可）
     let _ = w.watch(&hermes_home, RecursiveMode::NonRecursive);
+    // Grok：summary.json 的原生标题与 updated_at 更新
+    let _ = w.watch(&grok_sessions_root, RecursiveMode::Recursive);
 
     // 保活到进程结束：drop 会停止监听
     std::mem::forget(debouncer);
@@ -371,7 +398,7 @@ mod tests {
     use super::{
         claude_memory_watch_root, is_claude_memory_path, is_claude_session_watch_path,
         is_codex_session_index, is_codex_session_watch_path, is_cursor_session_watch_path,
-        is_opencode_session_watch_path,
+        is_grok_session_watch_path, is_opencode_session_watch_path,
     };
     use std::path::Path;
 
@@ -504,6 +531,29 @@ mod tests {
         assert!(!is_cursor_session_watch_path(
             Path::new(r"C:\Users\tester\.cursor\cli-config.json"),
             chats
+        ));
+    }
+
+    #[test]
+    fn grok_summary_under_sessions_triggers_session_refresh() {
+        let sessions = Path::new(r"C:\Users\tester\.grok\sessions");
+        assert!(is_grok_session_watch_path(
+            Path::new(
+                r"C:\Users\tester\.grok\sessions\E%3A%5Cwork\12345678-1234-4abc-8def-1234567890ab\summary.json"
+            ),
+            sessions
+        ));
+        assert!(is_grok_session_watch_path(
+            Path::new(r"c:\users\TESTER\.grok\sessions\slug\id\SUMMARY.JSON"),
+            sessions
+        ));
+        assert!(!is_grok_session_watch_path(
+            Path::new(r"C:\Users\tester\.grok\sessions\slug\id\events.jsonl"),
+            sessions
+        ));
+        assert!(!is_grok_session_watch_path(
+            Path::new(r"C:\Users\tester\.grok\config.toml"),
+            sessions
         ));
     }
 

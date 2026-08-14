@@ -1,13 +1,14 @@
 {
   "name": "htybox-app",
   "private": true,
-  "version": "1.13.7",
+  "version": "1.14.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "build:mac": "bash scripts/build-macos.sh",
     "test:platform": "node --test tests/platform-keyboard.test.ts",
+    "test:profiles": "node --test tests/profiles.test.ts",
     "preview": "vite preview",
     "tauri": "tauri",
     "gen:installer-art": "node src-tauri/installer/render-bmp.mjs"

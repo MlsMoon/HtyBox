@@ -8,12 +8,14 @@ import {
   listCursorSessions,
   listKimiSessions,
   listHermesSessions,
+  listGrokSessions,
   deleteClaudeSession,
   deleteCodexSession,
   deleteOpenCodeSession,
   deleteCursorSession,
   deleteKimiSession,
   deleteHermesSession,
+  deleteGrokSession,
   exportSessionArchive,
   importSessionArchive,
   type SessionAgent,
@@ -38,6 +40,7 @@ import codexIcon from "../assets/codex.svg";
 import opencodeIcon from "../assets/opencode.svg";
 import cursorIcon from "../assets/cursor.svg";
 import hermesIcon from "../assets/hermes.svg";
+import grokIcon from "../assets/grok.svg";
 
 const AGENTS: { k: SessionAgentKind; label: string; icon?: string }[] = [
   { k: "claude" as const, label: "Claude Code", icon: claudeIcon },
@@ -46,6 +49,7 @@ const AGENTS: { k: SessionAgentKind; label: string; icon?: string }[] = [
   { k: "cursor" as const, label: "Cursor", icon: cursorIcon },
   { k: "kimi" as const, label: "Kimi" }, // kimi 图标走内联 KimiIcon（深色需反转白底黑 K，img 做不到）
   { k: "hermes" as const, label: "Hermes", icon: hermesIcon },
+  { k: "grok" as const, label: "Grok Build", icon: grokIcon },
 ];
 
 // 会话收藏：按工作区 root 分组，存 "agentKind:id"（持久化，跨重启），收藏的置顶成区显示。
@@ -70,7 +74,7 @@ function saveSessFavs(root: string, keys: string[]): void {
 
 // Session 的 claude/codex/cursor/kimi 选择按工作区持久化（用户点名要持久化的"有状态选择"）
 type SessionAgentKind = SessionAgent;
-const AGENT_KINDS: SessionAgentKind[] = ["claude", "codex", "opencode", "cursor", "kimi", "hermes"];
+const AGENT_KINDS: SessionAgentKind[] = ["claude", "codex", "opencode", "cursor", "kimi", "hermes", "grok"];
 const AGENT_KEY = "htybox.sessionAgent.v1";
 const readAgent = (root: string): SessionAgentKind => {
   const v = getWsState<SessionAgentKind>(AGENT_KEY, root, "claude");
@@ -181,7 +185,9 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
             ? listKimiSessions
             : kind === "hermes"
               ? listHermesSessions
-              : listCursorSessions;
+              : kind === "grok"
+                ? listGrokSessions
+                : listCursorSessions;
     fetcher(root)
       .then((next) => {
         if (seq !== loadSeq.current) return;
@@ -216,7 +222,9 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
               ? "kimi-sessions-changed"
               : agentKind === "hermes"
                 ? "hermes-sessions-changed"
-                : null;
+                : agentKind === "grok"
+                  ? "grok-sessions-changed"
+                  : null;
     if (!evt) return;
     let un: (() => void) | undefined;
     let disposed = false;
@@ -330,6 +338,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
       else if (agentKind === "opencode") await deleteOpenCodeSession(s.id, root);
       else if (agentKind === "kimi") await deleteKimiSession(s.path);
       else if (agentKind === "hermes") await deleteHermesSession(s.id);
+      else if (agentKind === "grok") await deleteGrokSession(s.path);
       else await deleteCursorSession(s.path);
       // 乐观移除：直接从列表剔除该项，避免整列重载导致滚动条跳回顶部
       setList((prev) => (prev ? prev.filter((x) => x.id !== s.id) : prev));
@@ -473,6 +482,8 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
                       ? "cursor-glyph "
                       : cur.k === "hermes"
                         ? "hermes-glyph "
+                        : cur.k === "grok"
+                          ? "grok-glyph "
                         : "") + "h-4 w-4"
                 }
                 draggable={false}
@@ -512,6 +523,8 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
                               ? "cursor-glyph "
                               : a.k === "hermes"
                                 ? "hermes-glyph "
+                                : a.k === "grok"
+                                  ? "grok-glyph "
                                 : "") + "h-4 w-4"
                         }
                         draggable={false}
@@ -694,8 +707,8 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
           y={menu.y}
           items={[
             { id: "resume", label: "复原到终端" },
-            // kimi/hermes/opencode 归档导入导出本期未接入 → 隐藏其导出入口
-            ...(["kimi", "hermes", "opencode"].includes(agentKind)
+            // kimi/hermes/opencode/grok 归档导入导出本期未接入 → 隐藏其导出入口
+            ...(["kimi", "hermes", "opencode", "grok"].includes(agentKind)
               ? []
               : [{ id: "export", label: "导出会话…" }]),
             { id: "rename", label: "重命名" },

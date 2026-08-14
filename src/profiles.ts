@@ -1,4 +1,4 @@
-export type AgentKind = "claude" | "codex" | "opencode" | "cursor" | "kimi" | "hermes" | "shell";
+export type AgentKind = "claude" | "codex" | "opencode" | "cursor" | "kimi" | "hermes" | "grok" | "shell";
 
 /** 是否为真正的 agent 终端(区别于裸 shell)；未来新增 agent 类型无需再逐处补分支。
  *  写成类型谓词(k is ...)而非裸 boolean，是为了保留原 `agentKind === "claude" || agentKind === "codex"`
@@ -76,6 +76,14 @@ export const PROFILES: Profile[] = [
     // LobeHub HermesAgent colorPrimary 近似暖铜金(品牌识别点)
     dotColor: "#C4A35A",
   },
+  {
+    id: "grok",
+    label: "Grok Build",
+    agentKind: "grok",
+    shell: "powershell.exe",
+    launchCmd: "grok\r",
+    dotColor: "#111111",
+  },
 ];
 
 export const DEFAULT_PROFILE = PROFILES[0];
@@ -90,6 +98,7 @@ export const DEFAULT_PROFILE = PROFILES[0];
  * - cursor：新建 `cursor-agent`；复原 `cursor-agent --resume <id>`(与 claude 同为 flag 风格，已实测)；无 id 退回 `cursor-agent --resume`(选择器)
  * - kimi：新建 `kimi`(无位置 prompt 参数，不拼 initialPrompt)；复原 `kimi --session <id>`(flag 风格，id 形态 session_<uuid>，已实测)；无 id 退回 `kimi --session`(选择器)
  * - hermes：新建 `hermes`(不拼 initialPrompt；`-z` 是 oneshot 非交互)；复原 `hermes --resume <id>`(id=`YYYYMMDD_HHMMSS_`+6hex，已实测)；无 id 退回 `hermes -c`(continue；`--resume` 必填参数)
+ * - grok：新建 `grok`(支持位置 prompt)；复原 `grok --resume <uuid>`；无 id 退回 `grok --resume`(选择器)
  * - shell：无启动命令。
  */
 export function launchCmdFor(
@@ -156,6 +165,10 @@ export function launchCmdFor(
     if (resume) return hsid ? `hermes --resume ${hsid}\r` : "hermes -c\r";
     return `hermes${m}\r`;
   }
+  if (agent === "grok") {
+    if (resume) return sid ? `grok --resume ${sid}\r` : "grok --resume\r";
+    return `grok${m}${ip}\r`;
+  }
   return undefined;
 }
 
@@ -177,8 +190,8 @@ export function injectText(item: DragItem, agent: AgentKind): string {
   if (item.kind === "skill") {
     // cursor-agent 与 claude 同走原生 /skill-name slash-invoke(已实测确认，非文本转发)；
     // kimi 同为原生 skill 机制(/skill:<name>，与系统命令无冲突时可简写 /<name>，本会话实证)。
-    // hermes 同为 /<skill-name>(Step 0 实测)。
-    if (agent === "claude" || agent === "cursor" || agent === "kimi" || agent === "hermes")
+    // hermes/grok 同为 /<skill-name>(Step 0 实测)。
+    if (agent === "claude" || agent === "cursor" || agent === "kimi" || agent === "hermes" || agent === "grok")
       return item.invoke ?? item.path ?? ""; // /skill-name
     if (agent === "codex" || agent === "opencode") return "@" + (item.path ?? ""); // 无原生 slash-invoke，用文件路径
     return item.path ?? ""; // 裸 shell：纯路径

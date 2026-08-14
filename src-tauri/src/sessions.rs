@@ -17,6 +17,9 @@
 //! - hermes：会话 <HERMES_HOME|%LOCALAPPDATA%/hermes|~/.hermes>/state.db（SQLite `sessions` 表）；
 //!   id=`YYYYMMDD_HHMMSS_`+6hex；cwd 列匹配工作区；ts=last_activity_at|started_at（Unix 秒→ms）；
 //!   复原 `hermes --resume <id>`(已实测)；删除 SQL 删 sessions+messages（无 per-session 目录）。
+//! - grok：会话 <GROK_HOME|~/.grok>/sessions/<URL 编码 cwd|slug>/<uuid>/summary.json；
+//!   按 info.cwd 匹配工作区，标题取 generated_title→session_summary，时间为 RFC3339；
+//!   复原 `grok --resume <uuid>`；删除走整个 session 目录移入回收站。
 //! 删除统一移入回收站(trash，非交互、可恢复)——hermes 为库内行删除，无文件 trash。
 
 use std::collections::{HashMap, HashSet};
@@ -1723,6 +1726,185 @@ pub fn delete_kimi_session(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------- grok ----------------
+
+const MAX_GROK_SCAN: usize = 2000;
+
+/// Grok 数据根：`GROK_HOME` 环境变量优先，缺省 `~/.grok`。
+fn grok_data_root() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var("GROK_HOME") {
+        let value = value.trim().trim_matches('"');
+        if !value.is_empty() {
+            return Some(PathBuf::from(value));
+        }
+    }
+    home().map(|h| h.join(".grok"))
+}
+
+fn grok_summary_cwd(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("info")
+        .and_then(|info| info.get("cwd"))
+        .and_then(|cwd| cwd.as_str())
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+}
+
+fn grok_summary_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("info")
+        .and_then(|info| info.get("id"))
+        .and_then(|id| id.as_str())
+        .and_then(normalize_uuid)
+}
+
+fn grok_summary_ts(value: &serde_json::Value, key: &str) -> i64 {
+    value
+        .get(key)
+        .and_then(|ts| ts.as_str())
+        .map(rfc3339_ms)
+        .unwrap_or(0)
+}
+
+fn grok_summary_label(value: &serde_json::Value) -> String {
+    for key in ["generated_title", "session_summary"] {
+        if let Some(label) = value
+            .get(key)
+            .and_then(|entry| entry.as_str())
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            return label.chars().take(120).collect();
+        }
+    }
+    "(无标题)".into()
+}
+
+pub fn list_grok_sessions(cwd: &str) -> Vec<SessionRef> {
+    let Some(data_root) = grok_data_root() else {
+        return Vec::new();
+    };
+    list_grok_sessions_in(&data_root, cwd)
+}
+
+pub(crate) fn list_grok_sessions_in(data_root: &Path, cwd: &str) -> Vec<SessionRef> {
+    let root = data_root.join("sessions");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for entry in WalkDir::new(&root)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| entry.file_name().to_str() == Some("summary.json"))
+        .take(MAX_GROK_SCAN)
+    {
+        let summary_path = entry.path();
+        let Ok(text) = std::fs::read_to_string(summary_path) else {
+            continue;
+        };
+        let Ok(summary) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if grok_summary_cwd(&summary).map(|value| same_path(value, cwd)) != Some(true) {
+            continue;
+        }
+        let Some(session_dir) = summary_path.parent() else {
+            continue;
+        };
+        let Some(dir_id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(id) = grok_summary_id(&summary) else {
+            continue;
+        };
+        if !dir_id.eq_ignore_ascii_case(&id) {
+            continue;
+        }
+        out.push(SessionRef {
+            label: grok_summary_label(&summary),
+            id,
+            ts: grok_summary_ts(&summary, "updated_at"),
+            path: session_dir.to_string_lossy().into_owned(),
+        });
+    }
+    out.sort_by(|a, b| b.ts.cmp(&a.ts));
+    out
+}
+
+fn encode_grok_cwd_bucket(cwd: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(cwd.len());
+    for byte in cwd.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
+}
+
+fn grok_bucket_matches_cwd(bucket_dir: &Path, bucket_name: &str, cwd: &str) -> bool {
+    let marker = bucket_dir.join(".cwd");
+    if marker.is_file() {
+        return std::fs::read_to_string(marker)
+            .ok()
+            .map(|value| same_path(value.trim(), cwd))
+            == Some(true);
+    }
+    bucket_name == encode_grok_cwd_bucket(cwd)
+}
+
+/// 删除 Grok 会话：仅允许删除 sessions/<cwd bucket>/<uuid>，且目录 id、summary.info.id、
+/// bucket 与 summary.info.cwd 四者必须一致；目标整个移入回收站。
+pub fn delete_grok_session(path: &str) -> Result<(), String> {
+    let Some(data_root) = grok_data_root() else {
+        return Err("无 Grok 数据目录".into());
+    };
+    delete_grok_session_in(&data_root, path)
+}
+
+pub(crate) fn delete_grok_session_in(data_root: &Path, path: &str) -> Result<(), String> {
+    let root = data_root.join("sessions");
+    let path = canonical_existing_under(&root, Path::new(path), ExistingPathKind::Directory)?;
+    let canonical_root = root.canonicalize().map_err(|error| error.to_string())?;
+    let relative = path
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "Grok 删除路径逃逸 sessions 根".to_string())?;
+    let parts: Vec<_> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect();
+    if parts.len() != 2 {
+        return Err("Grok 删除目标必须恰为 cwd bucket/sessionId".into());
+    }
+    let bucket = parts[0];
+    let id = normalize_uuid(parts[1]).ok_or_else(|| "Grok Session ID 形态无效".to_string())?;
+    let summary_path =
+        canonical_existing_under(&path, &path.join("summary.json"), ExistingPathKind::File)?;
+    let summary = read_small_json(&summary_path, "Grok summary.json")?;
+    if grok_summary_id(&summary).as_deref() != Some(id.as_str()) {
+        return Err("Grok 删除目标目录与 summary.info.id 不一致".into());
+    }
+    let cwd =
+        grok_summary_cwd(&summary).ok_or_else(|| "Grok summary.info.cwd 缺失".to_string())?;
+    let bucket_dir = path
+        .parent()
+        .ok_or_else(|| "Grok 删除目标缺少 cwd bucket".to_string())?;
+    if !grok_bucket_matches_cwd(bucket_dir, bucket, cwd) {
+        return Err("Grok cwd bucket 与 summary.info.cwd 不一致".into());
+    }
+    trash::delete(path).map_err(|error| error.to_string())
+}
+
 // ---------------- hermes（SQLite state.db）----------------
 
 /// Hermes 数据根：`HERMES_HOME` → `%LOCALAPPDATA%/hermes`(若有 state.db) → `~/.hermes`。
@@ -1921,6 +2103,7 @@ pub fn capture_session_ids(agent: &str, cwd: &str, since_ms: i64) -> Vec<String>
         "cursor" => capture_cursor_ids(cwd, since_ms),
         "kimi" => capture_kimi_ids(cwd, since_ms),
         "hermes" => capture_hermes_ids(cwd, since_ms),
+        "grok" => capture_grok_ids(cwd, since_ms),
         _ => Vec::new(),
     }
 }
@@ -2010,8 +2193,8 @@ fn capture_claude_ids(cwd: &str, since_ms: i64) -> Vec<String> {
 
 /// 将各 PTY shell pid 映射到对应 agent 的 sessionId。
 /// - claude：`sessions/<pid>.json` 的 pid 落在 PTY 进程树内（精确）
-/// - cursor/codex/kimi/hermes：优先解析子树进程命令行里的 `--resume`/`resume`/`--session`；
-///   否则用**主进程**（index.js / codex.js / kimi.exe / hermes.exe，非 worker）创建时间 ↔ 会话 createdAt 最近邻
+/// - cursor/codex/kimi/hermes/grok：优先解析子树进程命令行里的 `--resume`/`resume`/`--session`；
+///   否则用**主进程**（index.js / codex.js / kimi.exe / hermes.exe / grok.exe，非 worker）创建时间 ↔ 会话 createdAt 最近邻
 pub fn map_agent_sessions_by_pty(
     agent: &str,
     cwd: &str,
@@ -2020,7 +2203,7 @@ pub fn map_agent_sessions_by_pty(
 ) -> Vec<PtySessionMap> {
     match agent {
         "claude" => map_claude_sessions_by_pty(cwd, since_ms, pty_pids),
-        "codex" | "opencode" | "cursor" | "kimi" | "hermes" => {
+        "codex" | "opencode" | "cursor" | "kimi" | "hermes" | "grok" => {
             map_sessions_by_agent_process(agent, cwd, since_ms, pty_pids)
         }
         _ => Vec::new(),
@@ -2071,6 +2254,7 @@ fn scan_session_times(agent: &str, cwd: &str, since_ms: i64) -> Vec<(String, i64
         "cursor" => scan_cursor_session_times(cwd, since_ms),
         "kimi" => scan_kimi_session_times(cwd, since_ms),
         "hermes" => scan_hermes_session_times(cwd, since_ms),
+        "grok" => scan_grok_session_times(cwd, since_ms),
         _ => Vec::new(),
     }
 }
@@ -2255,7 +2439,70 @@ pub(crate) fn scan_kimi_session_times_in(
     hits
 }
 
-/// cursor/codex/kimi：命令行 session id 优先，否则主进程创建时间最近邻（|Δt|<120s）。
+fn scan_grok_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
+    let Some(data_root) = grok_data_root() else {
+        return Vec::new();
+    };
+    scan_grok_session_times_in(&data_root, cwd, since_ms)
+}
+
+pub(crate) fn scan_grok_session_times_in(
+    data_root: &Path,
+    cwd: &str,
+    since_ms: i64,
+) -> Vec<(String, i64)> {
+    let root = data_root.join("sessions");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for entry in WalkDir::new(&root)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| entry.file_name().to_str() == Some("summary.json"))
+        .take(MAX_GROK_SCAN)
+    {
+        let summary_path = entry.path();
+        let Ok(text) = std::fs::read_to_string(summary_path) else {
+            continue;
+        };
+        let Ok(summary) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if grok_summary_cwd(&summary).map(|value| same_path(value, cwd)) != Some(true) {
+            continue;
+        }
+        let created = grok_summary_ts(&summary, "created_at");
+        if created < since_ms {
+            continue;
+        }
+        let Some(session_dir) = summary_path.parent() else {
+            continue;
+        };
+        let Some(dir_id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(id) = grok_summary_id(&summary) else {
+            continue;
+        };
+        if dir_id.eq_ignore_ascii_case(&id) {
+            hits.push((id, created));
+        }
+    }
+    hits.sort_by_key(|(_, created)| *created);
+    hits
+}
+
+fn capture_grok_ids(cwd: &str, since_ms: i64) -> Vec<String> {
+    scan_grok_session_times(cwd, since_ms)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// cursor/codex/kimi/hermes/grok：命令行 session id 优先，否则主进程创建时间最近邻（|Δt|<120s）。
 fn map_sessions_by_agent_process(
     agent: &str,
     cwd: &str,
@@ -2396,6 +2643,10 @@ fn extract_session_id_from_cmdline(agent: &str, cmd: &str) -> Option<String> {
             // `hermes --resume YYYYMMDD_HHMMSS_xxxxxx` / `-r`
             let raw = extract_flag_value(&lower, &["--resume", "-r"])?;
             is_hermes_session_id(raw).then(|| raw.to_string())
+        }
+        "grok" => {
+            // `grok --resume <uuid>` / `-r`
+            extract_flag_value(&lower, &["--resume", "-r"]).and_then(normalize_uuid)
         }
         _ => None,
     }
@@ -2578,6 +2829,19 @@ fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32
                     matches!(
                         snap.names.get(pid).map(|n| n.as_str()),
                         Some("hermes.exe") | Some("hermes-agent.exe")
+                    )
+                })
+                .collect();
+            pick_earliest_pid(&hits, snap)
+        }
+        "grok" => {
+            let hits: Vec<u32> = desc
+                .iter()
+                .copied()
+                .filter(|pid| {
+                    matches!(
+                        snap.names.get(pid).map(|name| name.as_str()),
+                        Some("grok.exe") | Some("grok")
                     )
                 })
                 .collect();
@@ -2908,11 +3172,13 @@ fn capture_kimi_ids(cwd: &str, since_ms: i64) -> Vec<String> {
 mod tests {
     use super::{
         canonical_existing_under, codex_label, cursor_bucket, cursor_label,
-        first_prompt_from_history, list_codex_sessions_in, list_kimi_sessions_in,
-        locate_claude_session_in, locate_codex_session_in, locate_cursor_session_in,
-        parse_codex_session_titles, query_opencode_sessions_in, scan_kimi_session_times_in,
-        validate_codex_relative_path, validate_opencode_session_id, validate_session_id,
-        ExistingPathKind, MAX_OPENCODE_SESSIONS,
+        delete_grok_session_in, encode_grok_cwd_bucket, first_prompt_from_history,
+        grok_bucket_matches_cwd, list_codex_sessions_in, list_grok_sessions_in,
+        list_kimi_sessions_in, locate_claude_session_in, locate_codex_session_in,
+        locate_cursor_session_in, parse_codex_session_titles, query_opencode_sessions_in,
+        scan_grok_session_times_in, scan_kimi_session_times_in, validate_codex_relative_path,
+        validate_opencode_session_id, validate_session_id, ExistingPathKind,
+        MAX_OPENCODE_SESSIONS,
     };
     use rusqlite::{params, Connection};
     use serde_json::{json, Value};
@@ -3628,5 +3894,108 @@ mod tests {
             }),
         );
         assert!(list_kimi_sessions_in(&ctx.home, &cwd).is_empty());
+    }
+
+    fn write_grok_summary(data_root: &Path, bucket: &str, id: &str, value: &Value) -> PathBuf {
+        let session_dir = data_root.join("sessions").join(bucket).join(id);
+        fs::create_dir_all(&session_dir).expect("create Grok session fixture");
+        fs::write(
+            session_dir.join("summary.json"),
+            serde_json::to_vec_pretty(value).expect("serialize Grok summary fixture"),
+        )
+        .expect("write Grok summary fixture");
+        session_dir
+    }
+
+    #[test]
+    fn grok_sessions_filter_label_sort_capture_and_skip_invalid_summary() {
+        let ctx = test_home();
+        let cwd = path_text(&ctx.workspace);
+        let bucket = encode_grok_cwd_bucket(&cwd);
+        write_grok_summary(
+            &ctx.home,
+            &bucket,
+            TEST_ID,
+            &json!({
+                "info": { "id": TEST_ID, "cwd": cwd },
+                "generated_title": "Grok 原生标题",
+                "session_summary": "摘要回退",
+                "created_at": "2026-08-14T08:00:00Z",
+                "updated_at": "2026-08-14T08:10:00Z"
+            }),
+        );
+        write_grok_summary(
+            &ctx.home,
+            &bucket,
+            OTHER_ID,
+            &json!({
+                "info": { "id": OTHER_ID, "cwd": path_text(&ctx.workspace) },
+                "session_summary": "仅有摘要",
+                "created_at": "2026-08-14T08:01:00Z",
+                "updated_at": "2026-08-14T08:20:00Z"
+            }),
+        );
+        let invalid_dir = ctx.home.join("sessions").join(&bucket).join("invalid");
+        fs::create_dir_all(&invalid_dir).expect("create invalid Grok fixture");
+        fs::write(invalid_dir.join("summary.json"), b"{invalid")
+            .expect("write invalid Grok fixture");
+        write_grok_summary(
+            &ctx.home,
+            "other",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            &json!({
+                "info": {
+                    "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "cwd": path_text(&ctx.other_workspace)
+                },
+                "generated_title": "其它工作区",
+                "created_at": "2026-08-14T08:02:00Z",
+                "updated_at": "2026-08-14T08:30:00Z"
+            }),
+        );
+
+        let listed = list_grok_sessions_in(&ctx.home, &path_text(&ctx.workspace));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, OTHER_ID);
+        assert_eq!(listed[0].label, "仅有摘要");
+        assert_eq!(listed[1].label, "Grok 原生标题");
+
+        let since = super::rfc3339_ms("2026-08-14T08:00:30Z");
+        let captured = scan_grok_session_times_in(&ctx.home, &path_text(&ctx.workspace), since);
+        assert_eq!(captured, vec![(OTHER_ID.to_string(), super::rfc3339_ms("2026-08-14T08:01:00Z"))]);
+    }
+
+    #[test]
+    fn grok_bucket_and_resume_command_are_strictly_validated() {
+        assert_eq!(
+            encode_grok_cwd_bucket(r"E:\UnityProject\BoardGameEditor"),
+            "E%3A%5CUnityProject%5CBoardGameEditor"
+        );
+        assert_eq!(
+            super::extract_session_id_from_cmdline("grok", &format!("grok.exe --resume {TEST_ID}"))
+                .as_deref(),
+            Some(TEST_ID)
+        );
+        assert!(super::extract_session_id_from_cmdline("grok", "grok --resume picker").is_none());
+
+        let ctx = test_home();
+        let bucket_dir = ctx.home.join("sessions").join("long-cwd-slug");
+        fs::create_dir_all(&bucket_dir).expect("create Grok slug bucket");
+        fs::write(bucket_dir.join(".cwd"), path_text(&ctx.workspace))
+            .expect("write Grok cwd marker");
+        assert!(grok_bucket_matches_cwd(
+            &bucket_dir,
+            "long-cwd-slug",
+            &path_text(&ctx.workspace)
+        ));
+        assert!(!grok_bucket_matches_cwd(
+            &bucket_dir,
+            "long-cwd-slug",
+            &path_text(&ctx.other_workspace)
+        ));
+
+        let outside = ctx.home.join("outside").join(TEST_ID);
+        fs::create_dir_all(&outside).expect("create outside Grok fixture");
+        assert!(delete_grok_session_in(&ctx.home, &path_text(&outside)).is_err());
     }
 }

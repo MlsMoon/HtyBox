@@ -83,6 +83,11 @@ const AGENTS: &[AgentSpec] = &[
         command: "hermes",
         update_args: None,
     },
+    AgentSpec {
+        id: "grok",
+        command: "grok",
+        update_args: Some(&["update"]),
+    },
 ];
 
 /// 一条命令的执行捕获:退出码(超时被杀为 None)+ 超时标记 + stdout/stderr 合并文本。
@@ -355,6 +360,7 @@ fn fetch_latest(id: &str) -> Option<String> {
         "opencode" => fetch_npm_latest("opencode-ai"),
         "kimi" => fetch_npm_latest("@moonshot-ai/kimi-code"),
         "cursor" => fetch_cursor_latest(),
+        "grok" => fetch_grok_latest(),
         _ => None,
     }
 }
@@ -378,6 +384,23 @@ fn fetch_cursor_latest() -> Option<String> {
         Ok(cap) if !cap.timed_out => parse_cursor_install_version(&cap.text),
         _ => None,
     }
+}
+
+fn fetch_grok_latest() -> Option<String> {
+    let path = fresh_path();
+    let cmd = agent_cli_command("grok", &["update", "--check", "--json"], &path);
+    match run_capture(cmd, LATEST_FETCH_TIMEOUT + Duration::from_secs(3)) {
+        Ok(cap) if !cap.timed_out && cap.code == Some(0) => parse_grok_update_json(&cap.text),
+        _ => None,
+    }
+}
+
+fn parse_grok_update_json(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text.trim())
+        .ok()?
+        .get("latestVersion")?
+        .as_str()
+        .and_then(normalize_version)
 }
 
 /// 从 Cursor win32 安装脚本解析 `$version = '…'`。
@@ -489,6 +512,21 @@ mod tests {
         assert_eq!(
             normalize_version("2026.07.23-e383d2b").as_deref(),
             Some("2026.07.23-e383d2b")
+        );
+    }
+
+    #[test]
+    fn normalize_grok_and_parse_update_check() {
+        assert_eq!(
+            normalize_version("grok 1.0.3 (1a29d5bc12)").as_deref(),
+            Some("1.0.3")
+        );
+        assert_eq!(
+            parse_grok_update_json(
+                r#"{"currentVersion":"1.0.3","latestVersion":"1.0.4","updateAvailable":true}"#
+            )
+            .as_deref(),
+            Some("1.0.4")
         );
     }
 

@@ -83,6 +83,7 @@ pub(crate) fn unix_install_agent_command(agent: &str) -> Command {
         "opencode" => "curl -fsSL https://opencode.ai/install | bash",
         "cursor" => "curl -fsSL https://cursor.com/install | bash",
         "kimi" => "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+        "grok" => "curl -fsSL https://x.ai/cli/install.sh | bash",
         _ => "false",
     };
     shell_command("sh", &["-lc"], script)

@@ -184,6 +184,11 @@ html.dark .hermes-glyph {
   filter: invert(1);
 }
 
+/* grok 图标为 LobeHub grok.svg（fill=currentColor 单色），与其他单色品牌图标同款：深色反相成白。 */
+html.dark .grok-glyph {
+  filter: invert(1);
+}
+
 /* kimi 图标为内联 SVG（白 K + 蓝点，见 ProfileIcon.tsx::KimiIcon）：浅色主题加深色圆角底 badge（白 K 才可见）；
    深色主题反转为白底 + 黑 K（fill 经 .kimi-k 切换），蓝点两主题保持品牌色（2026-07-20 用户两轮实机反馈定稿）。 */
 .kimi-glyph {

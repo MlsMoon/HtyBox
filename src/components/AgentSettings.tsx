@@ -32,6 +32,12 @@ const AGENTS: {
     desc: "Nous Hermes Agent（官方安装脚本）；本页仅检测 PATH，不提供一键安装",
     detectOnly: true,
   },
+  {
+    id: "grok",
+    name: "Grok Build",
+    command: "grok",
+    desc: "xAI 官方安装脚本（x.ai）；支持原生检测、安装和更新",
+  },
 ];
 
 const btnCls =

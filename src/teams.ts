@@ -30,6 +30,8 @@ export const DEFAULT_MODELS: Record<Exclude<AgentKind, "shell">, string[]> = {
   kimi: ["kimi-code/k3", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
   // hermes：本机 config.yaml model.default=deepseek-v4-pro；建议列表非强校验
   hermes: ["deepseek-v4-pro", "deepseek-v4-flash"],
+  // grok：模型 id 来自 `grok models`，不可使用 modelUsage 返回的内部构建统计名
+  grok: ["grok-4.6", "grok-4.5"],
 };
 
 const KEY = "htybox.teams.v1";
@@ -126,6 +128,7 @@ const VALID_AGENT_KINDS: Exclude<AgentKind, "shell">[] = [
   "cursor",
   "kimi",
   "hermes",
+  "grok",
 ];
 
 /** 解析导入 JSON（数组或单个），重新分配 id 避免与现有冲突。 */
