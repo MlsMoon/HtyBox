@@ -9,7 +9,7 @@ APP_PATH="$BUILD_ROOT/macos/$PRODUCT_NAME.app"
 DMG_PATH="$BUILD_ROOT/dmg/${PRODUCT_NAME}_$(node -p "require('$ROOT_DIR/package.json').version")_aarch64.dmg"
 
 cd "$ROOT_DIR"
-corepack pnpm exec tauri build \
+pnpm exec tauri build \
   --target "$TARGET_TRIPLE" \
   --config src-tauri/tauri.mac-dev.conf.json
 
