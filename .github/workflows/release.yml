@@ -70,6 +70,16 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+      # src-tauri 依赖仓库外的 ../../HtyBox_link；Windows 也用 bash，ln -s 才能跨平台。
+      - name: Checkout htybox_link protocol crate
+        uses: actions/checkout@v4
+        with:
+          repository: htyashes-crypto/htybox_link
+          path: HtyBox_link
+          persist-credentials: false
+      - name: Link htybox_link for Cargo path dependency
+        shell: bash
+        run: ln -sfn "${GITHUB_WORKSPACE}/HtyBox_link" "${GITHUB_WORKSPACE}/../HtyBox_link"
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:

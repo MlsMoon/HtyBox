@@ -2,9 +2,13 @@ name: macOS Apple Silicon Build
 
 on:
   pull_request:
+    branches:
+      - main
   push:
     branches:
+      - main
       - "feature/macos-adaptation"
+      - "fix/**"
   workflow_dispatch:
 
 permissions:
@@ -15,6 +19,18 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+
+      # src-tauri/Cargo.toml 依赖 ../../HtyBox_link/crates/htybox-link（仓库外路径）。
+      # checkout 只能落到 GITHUB_WORKSPACE 内，再 ln 到 Cargo 期望的兄弟目录。
+      - name: Checkout htybox_link protocol crate
+        uses: actions/checkout@v4
+        with:
+          repository: htyashes-crypto/htybox_link
+          path: HtyBox_link
+          persist-credentials: false
+
+      - name: Link htybox_link for Cargo path dependency
+        run: ln -sfn "${GITHUB_WORKSPACE}/HtyBox_link" "${GITHUB_WORKSPACE}/../HtyBox_link"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -39,12 +55,33 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build macOS package
-        run: pnpm build:mac
+        run: pnpm exec tauri build --target aarch64-apple-darwin --config src-tauri/tauri.mac-dev.conf.json
+
+      - name: Package macOS artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist-macos
+          APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/HtyBox.app"
+          DMG_DIR="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg"
+          if [[ ! -d "$APP" ]]; then
+            echo "macOS application bundle was not generated: $APP" >&2
+            ls -la src-tauri/target/aarch64-apple-darwin/release/bundle/macos || true
+            exit 1
+          fi
+          ditto -c -k --keepParent "$APP" dist-macos/HtyBox.app.zip
+          shopt -s nullglob
+          dmgs=("$DMG_DIR"/*.dmg)
+          if (( ${#dmgs[@]} == 0 )); then
+            echo "macOS disk image was not generated in $DMG_DIR" >&2
+            ls -la "$DMG_DIR" || true
+            exit 1
+          fi
+          cp "${dmgs[@]}" dist-macos/
+          ls -la dist-macos
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: htybox-macos-arm64
-          path: |
-            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app
-            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          path: dist-macos/*

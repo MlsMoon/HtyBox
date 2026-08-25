@@ -25,7 +25,7 @@ export default function WindowControls() {
     "flex h-full w-[46px] items-center justify-center text-[var(--text-2)] transition-colors";
 
   return (
-    <div className="flex h-full items-stretch">
+    <div className="flex h-full shrink-0 items-stretch self-stretch">
       <button
         onClick={() => win.minimize()}
         title="最小化"

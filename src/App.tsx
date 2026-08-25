@@ -257,6 +257,7 @@ export default function App() {
   // 应用启动后这个 effect 同样会跑一次 → 退出前开着的预览窗自动复原。
   // 依赖只取 activeId：工作区列表的其它变动不该把预览窗抢到前台。
   const wsRef = useRef(openWs);
+  const wsTabsRef = useRef<HTMLDivElement>(null);
   wsRef.current = openWs;
   useEffect(() => {
     const w = wsRef.current.find((x) => x.id === activeId) ?? null;
@@ -370,6 +371,21 @@ export default function App() {
     if (activeRef.current) setShowQuickOpen(true);
   });
 
+  // 工作区标签过多时竖向滚轮转横滚，避免把右上角窗口按钮挤出窗口。
+  // 标题栏仅在有活动工作区时挂载，故依赖 activeId 以便条出现后再绑监听。
+  useEffect(() => {
+    const el = wsTabsRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (el.scrollWidth <= el.clientWidth) return;
+      if (Math.abs(e.deltaY) < Math.abs(e.deltaX)) return;
+      el.scrollLeft += e.deltaY;
+      e.preventDefault();
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [activeId]);
+
   // 主窗被点回前台时，把当前工作区的预览窗一并提到其它应用之上——它是独立窗口，
   // 否则回到 HtyBox 时它可能还压在别的应用下面。焦点全程留在主窗：
   // 预览窗用「瞬时置顶再取消」提上来，随后主窗同样提一次，回到 主窗 > 预览窗 > 其它应用 的层序。
@@ -408,7 +424,7 @@ export default function App() {
           data-tauri-drag-region
           className="relative z-20 flex h-11 shrink-0 items-center gap-2 border-b border-[var(--border)] bg-[var(--surface)] pl-3 select-none"
         >
-          <div className="relative">
+          <div className="relative shrink-0">
             <button
               onClick={() => setActiveId(null)}
               title="返回欢迎页"
@@ -436,7 +452,11 @@ export default function App() {
           >
             <SidebarToggleIcon open={sidebarVisible} />
           </button>
-          <div className="ml-3 flex items-center gap-1.5">
+          <div
+            ref={wsTabsRef}
+            data-tauri-drag-region="false"
+            className="ml-3 flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          >
             {openWs.map((w) => {
               const isActive = w.id === activeId;
               return (
@@ -452,7 +472,7 @@ export default function App() {
                   }}
                   title={w.path}
                   className={
-                    "flex cursor-pointer items-center gap-1 rounded-md px-3 py-1 text-xs transition-colors " +
+                    "flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-3 py-1 text-xs whitespace-nowrap transition-colors " +
                     (isActive
                       ? "border border-[var(--border)] border-t-2 border-t-[var(--accent)] bg-[var(--elevated)] text-[var(--text)]"
                       : "border border-[var(--border)] text-[var(--text-2)] hover:bg-[var(--elevated)] hover:text-[var(--text)]")
@@ -463,75 +483,75 @@ export default function App() {
                 </div>
               );
             })}
-            <div className="relative">
-              <button
-                onClick={() => setShowWsPicker((v) => !v)}
-                title="打开工作区"
-                className="flex h-6 w-6 items-center justify-center rounded text-lg leading-none text-[var(--text-2)] transition-colors hover:bg-[var(--elevated)] hover:text-[var(--text)]"
-              >
-                +
-              </button>
-              {showWsPicker && (
-                <>
-                  <div className="fixed inset-0 z-[60]" {...wsPickerMask} />
-                  <div className="absolute left-0 top-full z-[61] mt-1.5 w-72 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--elevated)] py-1.5 shadow-2xl">
-                    <button
-                      onClick={pickFolder}
-                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-[12.5px] font-semibold text-[var(--text)] hover:bg-[var(--surface)]"
-                    >
-                      <svg
-                        className="h-4 w-4 shrink-0 text-[var(--accent)]"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-                      </svg>
-                      打开文件夹作为工作区…
-                    </button>
-                    {recents.length > 0 && (
-                      <>
-                        <div className="my-1 border-t border-[var(--border-soft)]" />
-                        <div className="px-3 pt-1 pb-1 text-[10px] font-semibold tracking-wider text-[var(--text-3)] uppercase">
-                          最近
-                        </div>
-                        <div className="max-h-72 overflow-y-auto">
-                          {recents.map((r) => {
-                            const isOpen = openWs.some((w) => w.path === r.path);
-                            return (
-                              <button
-                                key={r.path}
-                                onClick={() => {
-                                  openFolder(r.path);
-                                  setShowWsPicker(false);
-                                }}
-                                title={r.path}
-                                className="flex w-full flex-col gap-0.5 px-3 py-1.5 text-left hover:bg-[var(--surface)]"
-                              >
-                                <div className="flex w-full items-center gap-2">
-                                  <span className="truncate text-[12.5px] text-[var(--text)]">{r.name}</span>
-                                  {isOpen && (
-                                    <span className="ml-auto shrink-0 rounded bg-[var(--surface-hover)] px-1 py-px text-[9px] font-medium text-[var(--text-faint)]">
-                                      已打开
-                                    </span>
-                                  )}
-                                </div>
-                                <span className="truncate font-mono text-[10px] text-[var(--text-3)]">{r.path}</span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
           </div>
-          <div className="ml-auto flex items-center gap-2 pr-1">
+          <div className="relative shrink-0">
+            <button
+              onClick={() => setShowWsPicker((v) => !v)}
+              title="打开工作区"
+              className="flex h-6 w-6 items-center justify-center rounded text-lg leading-none text-[var(--text-2)] transition-colors hover:bg-[var(--elevated)] hover:text-[var(--text)]"
+            >
+              +
+            </button>
+            {showWsPicker && (
+              <>
+                <div className="fixed inset-0 z-[60]" {...wsPickerMask} />
+                <div className="absolute left-0 top-full z-[61] mt-1.5 w-72 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--elevated)] py-1.5 shadow-2xl">
+                  <button
+                    onClick={pickFolder}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-[12.5px] font-semibold text-[var(--text)] hover:bg-[var(--surface)]"
+                  >
+                    <svg
+                      className="h-4 w-4 shrink-0 text-[var(--accent)]"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                    </svg>
+                    打开文件夹作为工作区…
+                  </button>
+                  {recents.length > 0 && (
+                    <>
+                      <div className="my-1 border-t border-[var(--border-soft)]" />
+                      <div className="px-3 pt-1 pb-1 text-[10px] font-semibold tracking-wider text-[var(--text-3)] uppercase">
+                        最近
+                      </div>
+                      <div className="max-h-72 overflow-y-auto">
+                        {recents.map((r) => {
+                          const isOpen = openWs.some((w) => w.path === r.path);
+                          return (
+                            <button
+                              key={r.path}
+                              onClick={() => {
+                                openFolder(r.path);
+                                setShowWsPicker(false);
+                              }}
+                              title={r.path}
+                              className="flex w-full flex-col gap-0.5 px-3 py-1.5 text-left hover:bg-[var(--surface)]"
+                            >
+                              <div className="flex w-full items-center gap-2">
+                                <span className="truncate text-[12.5px] text-[var(--text)]">{r.name}</span>
+                                {isOpen && (
+                                  <span className="ml-auto shrink-0 rounded bg-[var(--surface-hover)] px-1 py-px text-[9px] font-medium text-[var(--text-faint)]">
+                                    已打开
+                                  </span>
+                                )}
+                              </div>
+                              <span className="truncate font-mono text-[10px] text-[var(--text-3)]">{r.path}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+          <div className="flex shrink-0 items-center gap-2 pr-1">
             <button
               onClick={() => previewWin.toggle({ id: active.id, path: active.path, name: active.name })}
               title={
