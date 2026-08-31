@@ -351,8 +351,12 @@ async function captureSessionId(
   cwd: string,
   signal: AbortSignal,
 ): Promise<void> {
-  // 约 45s：Codex 冷启动 + 首条消息落盘可能慢于旧的 12s 窗口
-  for (let i = 0; i < 30; i++) {
+  // 非 kimi：约 45s（Codex 冷启动 + 首条消息落盘可能慢于旧的 12s 窗口）。
+  // kimi：活到 sid 绑定或面板关闭 abort——0.39 子进程命令行 / state.json 时序不保证落在 45s 内。
+  let i = 0;
+  const untilBound = agentKind === "kimi";
+  while (untilBound || i < 30) {
+    i += 1;
     if (signal.aborted) return;
     await new Promise<void>((r) => {
       const t = setTimeout(r, 1500);
@@ -799,6 +803,9 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     if (sessionsEvt && cwd) {
       void listen(sessionsEvt, () => {
         if (sessionsDisposed) return;
+        if (agentKind === "kimi" && cwd && !SESSION_IDS[termId]) {
+          void assignCapturedSessions("kimi", cwd);
+        }
         // plan-3：agent 运行期退避为 3s trailing + 结束终扫;非运行期直通
         scheduleSessionRefresh(`${agentKind}\0${wsOfTerm(termId)}`, wsOfTerm(termId), () => {
           void refreshNativeLabels(agentKind, cwd).then(refreshTitle);

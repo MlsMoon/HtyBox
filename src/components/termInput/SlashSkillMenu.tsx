@@ -34,7 +34,7 @@ export default function SlashSkillMenu({
   return (
     <div
       ref={listRef}
-      className="htybox-slash-menu max-h-[220px] overflow-y-auto border-l-2 border-[var(--accent)] bg-[#1f1e1d] py-1"
+      className="htybox-slash-menu max-h-[220px] overflow-auto border-l-2 border-[var(--accent)] bg-[#1f1e1d] py-1"
       role="listbox"
       aria-label="Skill 斜杠补全"
     >
@@ -59,7 +59,7 @@ export default function SlashSkillMenu({
               (on ? "bg-[#3a2a22] text-[var(--accent)]" : "text-[#e5e2dc] hover:bg-[#2a2620]")
             }
           >
-            <span className={"w-[148px] shrink-0 truncate " + (on ? "font-bold" : "")}>
+            <span className={"shrink-0 whitespace-nowrap " + (on ? "font-bold" : "")}>
               {on ? "→ " : "  "}
               {s.invoke}
             </span>

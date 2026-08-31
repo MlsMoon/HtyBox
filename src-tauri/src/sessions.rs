@@ -2513,7 +2513,9 @@ fn map_sessions_by_agent_process(
         return Vec::new();
     }
     let sessions = scan_session_times(agent, cwd, since_ms);
-    if sessions.is_empty() {
+    // kimi 0.39：id 在子进程 `--session` 上，state.json 可能尚未过 since 扫描。
+    // 扫描空时仍走 Pass 1 命令行认领，不能整段 return。
+    if sessions.is_empty() && agent != "kimi" {
         return Vec::new();
     }
     let valid: HashSet<String> = sessions.iter().map(|(id, _)| id.clone()).collect();
@@ -2584,7 +2586,9 @@ fn map_sessions_by_agent_process(
     out
 }
 
-/// 在 PTY 子树进程命令行中找已出现在 `valid` 里的 session id。
+/// 在 PTY 子树进程命令行中找 session id。
+/// 除 kimi 外，id 必须已出现在 `valid`（since 扫描集）里。
+/// kimi：0.39 子进程命令行已带精确 `session_<uuid>`，不依赖 valid（state.json 可能尚未过 since 过滤）。
 fn session_id_from_pty_cmdline(
     agent: &str,
     pty_pid: u32,
@@ -2596,6 +2600,9 @@ fn session_id_from_pty_cmdline(
             continue;
         };
         if let Some(id) = extract_session_id_from_cmdline(agent, &cmd) {
+            if agent == "kimi" {
+                return Some(id);
+            }
             let canon = if agent == "opencode" {
                 valid.get(&id)
             } else {
@@ -2630,15 +2637,7 @@ fn extract_session_id_from_cmdline(agent: &str, cmd: &str) -> Option<String> {
                 .is_ok()
                 .then(|| value.to_string())
         }
-        "kimi" => {
-            // `kimi --session session_<uuid>`
-            let raw = extract_flag_value(&lower, &["--session", "-s"])?;
-            if raw.starts_with("session_") {
-                Some(raw.to_string())
-            } else {
-                normalize_uuid(raw).map(|u| format!("session_{u}"))
-            }
-        }
+        "kimi" => extract_kimi_session_id_from_cmdline(cmd),
         "hermes" => {
             // `hermes --resume YYYYMMDD_HHMMSS_xxxxxx` / `-r`
             let raw = extract_flag_value(&lower, &["--resume", "-r"])?;
@@ -2660,6 +2659,36 @@ fn normalize_uuid(s: &str) -> Option<String> {
             _ => b.is_ascii_hexdigit(),
         });
     ok.then(|| s.to_ascii_lowercase())
+}
+
+/// kimi 0.39：`--session <id>` / `--session=<id>` / `-S <id>`（lower 后是 `-s`）。
+/// 旗标必须是独立 token，禁止 `split("-s")` 把路径里的子串当旗标。
+fn extract_kimi_session_id_from_cmdline(cmd: &str) -> Option<String> {
+    let lower = cmd.to_ascii_lowercase();
+    let parts: Vec<&str> = lower.split_whitespace().collect();
+    for (i, raw) in parts.iter().enumerate() {
+        let tok = raw.trim_matches(|c| c == '"' || c == '\'');
+        if let Some(v) = tok.strip_prefix("--session=") {
+            return normalize_kimi_session_token(v);
+        }
+        if tok == "--session" || tok == "-s" {
+            let next = parts.get(i + 1)?;
+            let next = next.trim_matches(|c| c == '"' || c == '\'');
+            if next.starts_with('-') {
+                return None;
+            }
+            return normalize_kimi_session_token(next);
+        }
+    }
+    None
+}
+
+fn normalize_kimi_session_token(raw: &str) -> Option<String> {
+    let raw = raw.trim_matches(|c| c == '"' || c == '\'');
+    if let Some(rest) = raw.strip_prefix("session_") {
+        return normalize_uuid(rest).map(|u| format!("session_{u}"));
+    }
+    normalize_uuid(raw).map(|u| format!("session_{u}"))
 }
 
 fn extract_flag_value<'a>(cmd: &'a str, flags: &[&str]) -> Option<&'a str> {
@@ -3182,6 +3211,7 @@ mod tests {
     };
     use rusqlite::{params, Connection};
     use serde_json::{json, Value};
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
@@ -3997,5 +4027,65 @@ mod tests {
         let outside = ctx.home.join("outside").join(TEST_ID);
         fs::create_dir_all(&outside).expect("create outside Grok fixture");
         assert!(delete_grok_session_in(&ctx.home, &path_text(&outside)).is_err());
+    }
+
+    #[test]
+    fn kimi_extracts_session_flag_as_tokens_not_path_substrings() {
+        let sid = format!("session_{TEST_ID}");
+        let child = format!(
+            r#"C:\Users\admin\.kimi-code\bin\kimi.exe --session {sid}"#
+        );
+        assert_eq!(
+            super::extract_session_id_from_cmdline("kimi", &child).as_deref(),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            super::extract_session_id_from_cmdline(
+                "kimi",
+                &format!(r#"C:\Users\admin\.kimi-code\bin\kimi.exe --session={sid}"#)
+            )
+            .as_deref(),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            super::extract_session_id_from_cmdline("kimi", &format!("kimi.exe -S {sid}")).as_deref(),
+            Some(sid.as_str())
+        );
+        // 裸父进程：路径含 kimi-code，不得被 -s 子串误伤
+        assert!(super::extract_session_id_from_cmdline(
+            "kimi",
+            r#"C:\Users\admin\.kimi-code\bin\kimi.exe"#
+        )
+        .is_none());
+        assert!(super::extract_session_id_from_cmdline("kimi", "kimi --session").is_none());
+    }
+
+    #[test]
+    fn kimi_cmdline_claim_ignores_empty_valid_set() {
+        let sid = format!("session_{TEST_ID}");
+        let pty = 100u32;
+        let parent = 200u32;
+        let child = 300u32;
+        let mut snap = super::ProcSnap {
+            parents: HashMap::new(),
+            names: HashMap::new(),
+            commands: HashMap::new(),
+            started_at: HashMap::new(),
+        };
+        snap.parents.insert(parent, pty);
+        snap.parents.insert(child, parent);
+        snap.names.insert(parent, "kimi.exe".into());
+        snap.names.insert(child, "kimi.exe".into());
+        snap.commands
+            .insert(parent, r#"C:\Users\admin\.kimi-code\bin\kimi.exe"#.into());
+        snap.commands.insert(
+            child,
+            format!(r#"C:\Users\admin\.kimi-code\bin\kimi.exe --session {sid}"#),
+        );
+        let valid = HashSet::new();
+        assert_eq!(
+            super::session_id_from_pty_cmdline("kimi", pty, &snap, &valid).as_deref(),
+            Some(sid.as_str())
+        );
     }
 }
