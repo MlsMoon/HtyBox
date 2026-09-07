@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -17,6 +17,7 @@ import {
   disposeEngine,
   focusEngine,
   setEngineTitleHandler,
+  setEngineInteraction,
   refitEngine,
   injectAndSubmit,
   listEngines,
@@ -64,23 +65,15 @@ import * as previewWin from "../previewWindow";
 import { EV_READY } from "../previewProtocol";
 import { hasPrimaryShortcutModifier } from "../platformServices";
 import { getSettings } from "../settings";
-import { perfRescan } from "../perf/perfHud";
-import { scheduleSessionRefresh } from "../sessionRefreshThrottle";
+import { refreshSessionList, subscribeSessionList } from "../sessionRefreshThrottle";
+import { createSessionCaptureScheduler, waitForSessionCapturePoll } from "../sessionCaptureScheduling";
 import {
-  listClaudeSessions,
-  listCodexSessions,
-  listOpenCodeSessions,
-  listCursorSessions,
-  listKimiSessions,
-  listHermesSessions,
-  listGrokSessions,
   mapAgentSessionsByPty,
   terminalPtyPid,
 } from "../catalog";
 import { getSessionTitle, setSessionTitle, onSessionTitlesChange, splitStatusPrefix } from "../sessionTitles";
 import {
   getNativeSessionLabel,
-  setNativeSessionLabels,
   onNativeSessionLabelsChange,
 } from "../sessionNativeLabels";
 import { pingAgentActivity, clearTerm, isTermRunning, isTermFinished, onAgentStatusChange } from "../agentStatus";
@@ -116,6 +109,7 @@ type TermParams = {
 };
 
 const DRAG_MIME = "application/x-htybox-item";
+const WorkspaceInteractive = createContext(false);
 
 // 终端 id 形如 "<wsId>::t-…"，反推工作区 id（工作流模板库按工作区独立，scope 用它）
 const wsOfTerm = (termId: string): string => {
@@ -188,14 +182,18 @@ type CaptureMeta = {
   onClaimed?: (sessionId: string) => void;
 };
 const CAPTURE_META: Record<string, CaptureMeta> = {};
-// 认领临界区串行化：禁止多终端各自「抢最新」导致 SESSION_IDS 对调。
-let captureAssignTail: Promise<void> = Promise.resolve();
+const captureScheduler = createSessionCaptureScheduler();
+const captureGroupKey = (agent: AgentKind, cwd: string) => `${agent}\0${cwd}`;
 
 function abortSessionCapture(termId: string): void {
+  const meta = CAPTURE_META[termId];
   CAPTURE_CTRL[termId]?.abort();
   delete CAPTURE_CTRL[termId];
   delete CAPTURE_SINCE[termId];
   delete CAPTURE_META[termId];
+  if (meta && !listCaptureWaiters(meta.agentKind, meta.cwd).length) {
+    captureScheduler.cancel(captureGroupKey(meta.agentKind, meta.cwd));
+  }
 }
 
 /** kimi 无位置 prompt 参数：团队简报改为终端 PTY 就绪后注入。
@@ -211,52 +209,6 @@ function injectBriefWhenReady(termId: string, prompt: string): void {
       window.clearInterval(timer); // 10s 未就绪（面板被秒关等）→ 放弃注入
     }
   }, 100);
-}
-
-const nativeLabelRefreshes = new Map<string, Promise<void>>();
-
-/** 执行一次原生名刷新；调用入口按 agent+cwd 合并并发，避免每个终端重复查询同一份会话。 */
-async function performNativeLabelRefresh(agentKind: AgentKind, cwd: string): Promise<void> {
-  try {
-    const fetcher =
-      agentKind === "claude"
-        ? listClaudeSessions
-        : agentKind === "codex"
-          ? listCodexSessions
-          : agentKind === "opencode"
-            ? listOpenCodeSessions
-          : agentKind === "kimi"
-            ? listKimiSessions
-            : agentKind === "hermes"
-              ? listHermesSessions
-              : agentKind === "grok"
-                ? listGrokSessions
-                : listCursorSessions;
-    const scanT0 = getSettings().perfHud ? performance.now() : 0; // 性能探针(plan-1)：原生名重扫计时
-    const list = await fetcher(cwd);
-    if (getSettings().perfHud) perfRescan(performance.now() - scanT0);
-    setNativeSessionLabels(
-      agentKind,
-      list.map((s) => ({ id: s.id, label: s.label })),
-    );
-  } catch {
-    /* ignore */
-  }
-}
-
-/** 把当前 cwd 下该 agent 的 list label 写入原生名缓存，供 Tab 与 Session 列表同构。 */
-function refreshNativeLabels(agentKind: AgentKind, cwd: string): Promise<void> {
-  if (!cwd || !isAgentTerminal(agentKind)) return Promise.resolve();
-  const key = `${agentKind}\0${cwd}`;
-  const active = nativeLabelRefreshes.get(key);
-  if (active) return active;
-
-  const refresh = performNativeLabelRefresh(agentKind, cwd);
-  nativeLabelRefreshes.set(key, refresh);
-  void refresh.finally(() => {
-    if (nativeLabelRefreshes.get(key) === refresh) nativeLabelRefreshes.delete(key);
-  });
-  return refresh;
 }
 
 /** 同 agent+cwd 下尚未认领、捕获未中止的终端，按 CAPTURE_SINCE 升序（= 启动顺序）。 */
@@ -289,58 +241,58 @@ function bindSessionId(termId: string, agentKind: AgentKind, sid: string): void 
  * - claude：sessions/<pid>.json 落在 PTY 进程树
  * - codex/opencode/cursor/kimi：PTY 子树 agent 进程创建时间 ↔ 会话 createdAt 最近邻
  */
-async function assignCapturedSessions(agentKind: AgentKind, cwd: string): Promise<void> {
-  let release!: () => void;
-  const prev = captureAssignTail;
-  captureAssignTail = new Promise<void>((r) => {
-    release = r;
-  });
-  await prev;
+function assignCapturedSessions(agentKind: AgentKind, cwd: string): Promise<void> {
+  if (!listCaptureWaiters(agentKind, cwd).length) return Promise.resolve();
+  return captureScheduler.request(captureGroupKey(agentKind, cwd), () =>
+    performSessionCapture(agentKind, cwd));
+}
+
+async function performSessionCapture(agentKind: AgentKind, cwd: string): Promise<void> {
+  const waiters = listCaptureWaiters(agentKind, cwd);
+  if (!waiters.length) return;
+  const controllers = new Map(waiters.map((tid) => [tid, CAPTURE_CTRL[tid]]));
+  const liveWaiters = () => listCaptureWaiters(agentKind, cwd)
+    .filter((tid) => CAPTURE_CTRL[tid] === controllers.get(tid));
+  const since = Math.min(...waiters.map((t) => CAPTURE_SINCE[t] ?? Date.now()));
+  const ptyByTerm = new Map<string, number>();
+  await Promise.all(
+    waiters.map(async (tid) => {
+      try {
+        const pid = await terminalPtyPid(tid);
+        if (pid != null && pid > 0) ptyByTerm.set(tid, pid);
+      } catch {
+        /* 当前 PID 不可读时保留其他终端的认领机会，下轮继续查询。 */
+      }
+    }),
+  );
+  const ptyPids = [...new Set(liveWaiters().map((tid) => ptyByTerm.get(tid))
+    .filter((pid): pid is number => pid !== undefined))];
+  if (!ptyPids.length) return;
+  let mapped: Array<{ ptyPid: number; sessionId: string }>;
   try {
-    const waiters = listCaptureWaiters(agentKind, cwd);
-    if (!waiters.length) return;
-    const since = Math.min(...waiters.map((t) => CAPTURE_SINCE[t] ?? Date.now()));
-    const ptyByTerm = new Map<string, number>();
-    await Promise.all(
-      waiters.map(async (tid) => {
-        try {
-          const pid = await terminalPtyPid(tid);
-          if (pid != null && pid > 0) ptyByTerm.set(tid, pid);
-        } catch {
-          /* ignore */
-        }
-      }),
-    );
-    const ptyPids = [...new Set(ptyByTerm.values())];
-    if (!ptyPids.length) return;
-    let mapped: Array<{ ptyPid: number; sessionId: string }> = [];
-    try {
-      mapped = await mapAgentSessionsByPty(agentKind, cwd, since, ptyPids);
-    } catch {
-      return;
-    }
-    const live = listCaptureWaiters(agentKind, cwd);
-    const sidByPty = new Map(mapped.map((m) => [m.ptyPid, m.sessionId]));
-    const assigned: string[] = [];
-    for (const tid of live) {
-      if (SESSION_IDS[tid]) continue;
-      const pty = ptyByTerm.get(tid);
-      if (pty == null) continue;
-      const sid = sidByPty.get(pty);
-      if (!sid || CLAIMED_SIDS.has(sid)) continue;
-      bindSessionId(tid, agentKind, sid);
-      assigned.push(tid);
-    }
-    if (!assigned.length) return;
-    saveSI();
-    await refreshNativeLabels(agentKind, cwd);
-    for (const tid of assigned) {
-      const sid = SESSION_IDS[tid];
-      if (!sid) continue;
-      CAPTURE_META[tid]?.onClaimed?.(sid);
-    }
-  } finally {
-    release();
+    mapped = await mapAgentSessionsByPty(agentKind, cwd, since, ptyPids);
+  } catch {
+    return;
+  }
+  const live = liveWaiters();
+  const sidByPty = new Map(mapped.map((m) => [m.ptyPid, m.sessionId]));
+  const assigned: string[] = [];
+  for (const tid of live) {
+    if (SESSION_IDS[tid]) continue;
+    const pty = ptyByTerm.get(tid);
+    if (pty == null) continue;
+    const sid = sidByPty.get(pty);
+    if (!sid || CLAIMED_SIDS.has(sid)) continue;
+    bindSessionId(tid, agentKind, sid);
+    assigned.push(tid);
+  }
+  if (!assigned.length) return;
+  saveSI();
+  if (isAgentTerminal(agentKind)) refreshSessionList(agentKind, cwd);
+  for (const tid of assigned) {
+    const sid = SESSION_IDS[tid];
+    if (!sid) continue;
+    CAPTURE_META[tid]?.onClaimed?.(sid);
   }
 }
 
@@ -358,19 +310,7 @@ async function captureSessionId(
   while (untilBound || i < 30) {
     i += 1;
     if (signal.aborted) return;
-    await new Promise<void>((r) => {
-      const t = setTimeout(r, 1500);
-      const onAbort = () => {
-        clearTimeout(t);
-        r();
-      };
-      if (signal.aborted) {
-        clearTimeout(t);
-        r();
-        return;
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
+    await waitForSessionCapturePoll(signal, 1500);
     if (signal.aborted) return;
     if (SESSION_IDS[termId]) return;
     await assignCapturedSessions(agentKind, cwd);
@@ -468,6 +408,9 @@ const RESTORED_IDS = new Set<string>();
 const CLOSING = new Set<string>();
 export function markWorkspaceClosing(workspaceId: string): void {
   CLOSING.add(workspaceId);
+  for (const termId of Object.keys(CAPTURE_META)) {
+    if (wsOfTerm(termId) === workspaceId) abortSessionCapture(termId);
+  }
 }
 
 // Tab 类型图标（方案 B 实心彩色徽章）：ClaudeCode/Codex/Cursor/Kimi 用官方素材（codex/cursor 随主题 invert，kimi 浅色带底）；
@@ -703,8 +646,26 @@ function DockTab(props: IDockviewPanelHeaderProps<TermParams>) {
 function DockTerminal(props: IDockviewPanelProps<TermParams>) {
   const { termId, shell, agentKind = "shell", cwd, env } = props.params;
   const ref = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef(props.api);
   apiRef.current = props.api;
+  const workspaceInteractive = useContext(WorkspaceInteractive);
+  const interactiveRef = useRef(workspaceInteractive);
+  interactiveRef.current = workspaceInteractive;
+  const canInteract = useCallback(() =>
+    interactiveRef.current && ref.current?.isConnected === true &&
+    apiRef.current.isActive && apiRef.current.isVisible, []);
+  const activatePanel = useCallback(() => {
+    if (interactiveRef.current && apiRef.current.isVisible && !apiRef.current.isActive) {
+      apiRef.current.setActive();
+    }
+  }, []);
+  const focusOnActivation = useCallback(() => {
+    if (getSettings().tabSelectable || !canInteract()) return;
+    // 激活后的默认聚焦不覆盖用户刚在内置输入框等内容控件中取得的焦点。
+    if (contentRef.current?.contains(document.activeElement)) return;
+    focusEngine(termId);
+  }, [canInteract, termId]);
   // 拖入工作流但已有绑定 → 覆盖确认（覆盖=重置进度，破坏性，走确认弹窗）
   const [confirmWf, setConfirmWf] = useState<Workflow | null>(null);
   useEffect(() => {
@@ -731,6 +692,7 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
             restored ? undefined : props.params.initialPrompt, // 新建时先读协作简报
           );
     ensureEngine(termId, shell, launch, cwd, env, agentKind);
+    setEngineInteraction(termId, canInteract);
     attachEngine(termId, c);
 
     // 新建空 agent：捕获真实 session id。任务挂在模块级，effect 重跑不得 abort。
@@ -752,8 +714,8 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     // api.isVisible 且延后一帧（避开浏览器 mousedown 把焦点给可聚焦标签的默认行为）。
     const grabFocus = () => {
       if (getSettings().tabSelectable) return;
-      if (!apiRef.current.isActive || !apiRef.current.isVisible) return;
-      requestAnimationFrame(() => focusEngine(termId));
+      if (!canInteract()) return;
+      requestAnimationFrame(focusOnActivation);
     };
     const actSub = apiRef.current.onDidActiveChange(grabFocus);
     const visFocusSub = apiRef.current.onDidVisibilityChange(grabFocus);
@@ -761,7 +723,7 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     // Ctrl+Shift+I：仅当前活动终端面板唤起内置输入（自由输入切换 / 工作流输入展开）
     const onHotkey = (e: KeyboardEvent) => {
       if (!(hasPrimaryShortcutModifier(e) && e.shiftKey && !e.altKey && (e.key === "I" || e.key === "i"))) return;
-      if (!apiRef.current.isActive || !apiRef.current.isVisible) return;
+      if (!canInteract()) return;
       e.preventDefault();
       e.stopPropagation();
       emitTermInputHotkey(termId);
@@ -781,43 +743,15 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
       applyTabTitle(termId, agentKind, apiRef.current, SESSION_IDS[termId] ?? props.params.sessionId);
     const titleSub = onSessionTitlesChange(refreshTitle);
     const nativeSub = onNativeSessionLabelsChange(refreshTitle);
-    // Claude ai-title / Codex rollout·index / Cursor meta.json / Kimi state.json → 重拉原生 label，自动命名进 Tab
-    const sessionsEvt =
-      agentKind === "claude"
-        ? "claude-sessions-changed"
-        : agentKind === "codex"
-          ? "codex-sessions-changed"
-          : agentKind === "opencode"
-            ? "opencode-sessions-changed"
-          : agentKind === "cursor"
-            ? "cursor-sessions-changed"
-            : agentKind === "kimi"
-              ? "kimi-sessions-changed"
-              : agentKind === "hermes"
-                ? "hermes-sessions-changed"
-                : agentKind === "grok"
-                  ? "grok-sessions-changed"
-                  : null;
-    let sessionsUnlisten: (() => void) | undefined;
-    let sessionsDisposed = false;
-    if (sessionsEvt && cwd) {
-      void listen(sessionsEvt, () => {
-        if (sessionsDisposed) return;
-        if (agentKind === "kimi" && cwd && !SESSION_IDS[termId]) {
-          void assignCapturedSessions("kimi", cwd);
-        }
-        // plan-3：agent 运行期退避为 3s trailing + 结束终扫;非运行期直通
-        scheduleSessionRefresh(`${agentKind}\0${wsOfTerm(termId)}`, wsOfTerm(termId), () => {
-          void refreshNativeLabels(agentKind, cwd).then(refreshTitle);
-        });
-      }).then((u) => {
-        if (sessionsDisposed) u();
-        else {
-          sessionsUnlisten = u;
-          void refreshNativeLabels(agentKind, cwd).then(refreshTitle);
-        }
-      });
-    }
+    const sessionsUnlisten = isAgentTerminal(agentKind) && cwd
+      ? subscribeSessionList(agentKind, cwd, wsOfTerm(termId), {
+          onInvalidate: () => {
+            if (agentKind === "kimi" && !SESSION_IDS[termId]) {
+              void assignCapturedSessions("kimi", cwd);
+            }
+          },
+        })
+      : undefined;
     applyTabTitle(termId, agentKind, apiRef.current, sid);
 
     const onDragOver = (e: DragEvent) => {
@@ -832,6 +766,7 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
         c.classList.remove("htybox-drop");
     };
     const onDrop = (e: DragEvent) => {
+      if (!interactiveRef.current || !apiRef.current.isVisible) return;
       const raw = e.dataTransfer?.getData(DRAG_MIME);
       c.classList.remove("htybox-drop");
       if (!raw) return;
@@ -860,7 +795,6 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     c.addEventListener("drop", onDrop);
 
     return () => {
-      sessionsDisposed = true;
       sessionsUnlisten?.();
       c.removeEventListener("dragover", onDragOver);
       c.removeEventListener("dragleave", onDragLeave);
@@ -879,14 +813,25 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     // props.api 用 apiRef，不进 deps，避免 dockview 重渲染反复拆装
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [termId, shell, agentKind, cwd, env]);
+  useEffect(() => {
+    if (!workspaceInteractive) return;
+    refitEngine(termId);
+    const frame = requestAnimationFrame(focusOnActivation);
+    return () => cancelAnimationFrame(frame);
+  }, [workspaceInteractive, termId, focusOnActivation]);
   // 内边距 + 终端底色：避免 xterm 内容贴边被面板边缘裁切。
   // flex-col：xterm 宿主(flex-1，ref 仍在宿主上、RO 观察它) + 底部工作流面板；
   // 外层 relative 供 WorkflowBar 收起态浮标 absolute 定位。面板显隐引起的宿主高度变化由
   // attachEngine 的 ResizeObserver + 防抖 fit 吸收。
   return (
-    <div className="relative flex h-full w-full flex-col bg-[#1f1e1d]">
+    <div
+      ref={contentRef}
+      className="relative flex h-full w-full flex-col bg-[#1f1e1d]"
+      onPointerDownCapture={activatePanel}
+      onDropCapture={activatePanel}
+    >
       <div ref={ref} className="min-h-0 w-full flex-1 p-2" />
-      <WorkflowBar termId={termId} cwd={cwd} agentKind={agentKind} />
+      <WorkflowBar termId={termId} cwd={cwd} agentKind={agentKind} canInteract={canInteract} />
       {confirmWf && (
         <ConfirmModal
           title="覆盖当前工作流"
@@ -954,9 +899,11 @@ function addTerminalTitle(p: Profile, st: AgentState | undefined): string {
 export default function TerminalDock({
   workspaceId,
   cwd,
+  interactive,
 }: {
   workspaceId: string;
   cwd: string;
+  interactive: boolean;
 }) {
   const apiRef = useRef<DockviewApi | null>(null);
   const layoutKey = `htybox.dock.layout.${workspaceId}`;
@@ -1092,6 +1039,7 @@ export default function TerminalDock({
 
       api.onDidLayoutChange(() => {
         if (CLOSING.has(workspaceId)) return; // 关闭中：别把残缺布局写回
+        if (api.width <= 0 || api.height <= 0) return;
         try {
           localStorage.setItem(layoutKey, JSON.stringify(api.toJSON()));
         } catch {
@@ -1439,12 +1387,14 @@ export default function TerminalDock({
           if ((e.target as HTMLElement).closest(".dv-tab")) e.stopPropagation();
         }}
       >
-        <DockviewReact
-          components={components}
-          defaultTabComponent={DockTab}
-          watermarkComponent={DockWatermark}
-          onReady={onReady}
-        />
+        <WorkspaceInteractive.Provider value={interactive}>
+          <DockviewReact
+            components={components}
+            defaultTabComponent={DockTab}
+            watermarkComponent={DockWatermark}
+            onReady={onReady}
+          />
+        </WorkspaceInteractive.Provider>
       </div>
     </div>
   );

@@ -31,13 +31,118 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRef {
     pub id: String,
     pub label: String,
     pub ts: i64,      // 毫秒时间戳（排序/显示）
     pub path: String, // 会话文件路径（codex 删除用；claude 留空，按 id 查找）
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSessions {
+    pub cwd: String,
+    pub sessions: Vec<SessionRef>,
+}
+
+struct SessionBatch {
+    groups: Vec<WorkspaceSessions>,
+    workspaces: HashMap<PathBuf, Vec<usize>>,
+    paths: HashMap<String, Option<PathBuf>>,
+    #[cfg(test)]
+    scans: usize,
+}
+
+impl SessionBatch {
+    fn new(cwds: &[String]) -> Self {
+        let mut batch = Self {
+            groups: Vec::with_capacity(cwds.len()),
+            workspaces: HashMap::new(),
+            paths: HashMap::new(),
+            #[cfg(test)]
+            scans: 0,
+        };
+        for cwd in cwds {
+            let index = batch.groups.len();
+            batch.groups.push(WorkspaceSessions {
+                cwd: cwd.clone(),
+                sessions: Vec::new(),
+            });
+            if let Some(path) = batch.identity(cwd) {
+                batch.workspaces.entry(path).or_default().push(index);
+            }
+        }
+        batch
+    }
+
+    fn identity(&mut self, cwd: &str) -> Option<PathBuf> {
+        self.paths
+            .entry(cwd.to_string())
+            .or_insert_with(|| {
+                let path = Path::new(cwd);
+                reject_dot_components(path).ok()?;
+                crate::portable_archive::reject_link_or_reparse(path).ok()?;
+                path.canonicalize().ok()
+            })
+            .clone()
+    }
+
+    fn matching(&mut self, cwd: &str) -> Vec<usize> {
+        self.identity(cwd)
+            .and_then(|path| self.workspaces.get(&path).cloned())
+            .unwrap_or_default()
+    }
+
+    fn push(&mut self, targets: &[usize], session: SessionRef) {
+        for &index in targets {
+            self.groups[index].sessions.push(session.clone());
+        }
+    }
+
+    fn finish(mut self) -> Vec<WorkspaceSessions> {
+        for group in &mut self.groups {
+            group.sessions.sort_by(|left, right| right.ts.cmp(&left.ts));
+        }
+        self.groups
+    }
+
+    fn single(cwd: &str, scan: impl FnOnce(&mut Self)) -> Vec<SessionRef> {
+        let mut batch = Self::new(&[cwd.to_string()]);
+        if !batch.workspaces.is_empty() {
+            scan(&mut batch);
+        }
+        batch.finish().remove(0).sessions
+    }
+}
+
+pub fn list_agent_sessions_batch(
+    agent: &str,
+    cwds: &[String],
+) -> Result<Vec<WorkspaceSessions>, String> {
+    let source = match agent {
+        "claude" | "codex" | "cursor" => home(),
+        "opencode" => opencode_database_path().ok(),
+        "kimi" => kimi_data_root(),
+        "hermes" => hermes_state_db(),
+        "grok" => grok_data_root(),
+        _ => return Err(format!("Unsupported session agent: {agent}")),
+    };
+    let mut batch = SessionBatch::new(cwds);
+    if let Some(source) = source.filter(|_| !batch.workspaces.is_empty()) {
+        match agent {
+            "claude" => scan_claude_sessions(&source, &mut batch),
+            "codex" => scan_codex_sessions(&source, &mut batch),
+            "cursor" => scan_cursor_sessions(&source, &mut batch),
+            "opencode" => scan_opencode_sessions(&source, &mut batch),
+            "kimi" => scan_kimi_sessions(&source, &mut batch),
+            "hermes" => scan_hermes_sessions(&source, &mut batch),
+            "grok" => scan_grok_sessions(&source, &mut batch),
+            _ => unreachable!(),
+        }
+    }
+    Ok(batch.finish())
 }
 
 fn home() -> Option<PathBuf> {
@@ -94,11 +199,10 @@ fn opencode_database_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "无法定位 OpenCode 数据目录".into())
 }
 
-fn query_opencode_sessions_in(
+fn visit_opencode_sessions_in(
     database: &Path,
-    cwd: &str,
-) -> Result<Vec<OpenCodeSession>, String> {
-    let workspace = canonical_workspace(cwd)?;
+    mut visit: impl FnMut(OpenCodeSession) -> bool,
+) -> Result<(), String> {
     let metadata = crate::portable_archive::reject_link_or_reparse(database)?;
     if !metadata.is_file() {
         return Err("OpenCode 会话数据库不是普通文件".into());
@@ -133,25 +237,30 @@ fn query_opencode_sessions_in(
         })
         .map_err(|error| format!("查询 OpenCode 会话失败：{error}"))?;
 
-    let mut sessions = Vec::new();
-    let mut directory_matches = HashMap::<String, bool>::new();
     for row in rows {
         let session = row.map_err(|error| format!("读取 OpenCode 会话失败：{error}"))?;
+        if !visit(session) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn query_opencode_sessions_in(database: &Path, cwd: &str) -> Result<Vec<OpenCodeSession>, String> {
+    let workspace = canonical_workspace(cwd)?;
+    let mut sessions = Vec::new();
+    let mut directory_matches = HashMap::<String, bool>::new();
+    visit_opencode_sessions_in(database, |session| {
         let matches_workspace = *directory_matches
             .entry(session.directory.clone())
             .or_insert_with(|| {
                 path_matches_workspace(&session.directory, &workspace).unwrap_or(false)
             });
-        if validate_opencode_session_id(&session.id).is_err()
-            || !matches_workspace
-        {
-            continue;
+        if validate_opencode_session_id(&session.id).is_ok() && matches_workspace {
+            sessions.push(session);
         }
-        sessions.push(session);
-        if sessions.len() >= MAX_OPENCODE_SESSIONS {
-            break;
-        }
-    }
+        sessions.len() < MAX_OPENCODE_SESSIONS
+    })?;
     Ok(sessions)
 }
 
@@ -160,24 +269,59 @@ fn query_opencode_sessions(cwd: &str) -> Result<Vec<OpenCodeSession>, String> {
 }
 
 pub fn list_opencode_sessions(cwd: &str) -> Vec<SessionRef> {
-    let Ok(sessions) = query_opencode_sessions(cwd) else {
+    let Ok(database) = opencode_database_path() else {
         return Vec::new();
     };
-    let mut refs: Vec<_> = sessions
-        .into_iter()
-        .map(|session| SessionRef {
-            id: session.id,
-            label: if session.title.trim().is_empty() {
-                "(无标题)".into()
-            } else {
-                session.title
-            },
-            ts: session.updated.max(session.created),
-            path: String::new(),
-        })
-        .collect();
-    refs.sort_by(|left, right| right.ts.cmp(&left.ts));
-    refs
+    SessionBatch::single(cwd, |batch| scan_opencode_sessions(&database, batch))
+}
+
+fn scan_opencode_sessions(database: &Path, batch: &mut SessionBatch) {
+    batch.workspaces.retain(|path, _| path.is_dir());
+    if batch.workspaces.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    {
+        batch.scans += 1;
+    }
+    let result = visit_opencode_sessions_in(database, |session| {
+        if validate_opencode_session_id(&session.id).is_err() {
+            return true;
+        }
+        let targets: Vec<_> = batch
+            .matching(&session.directory)
+            .into_iter()
+            .filter(|&index| batch.groups[index].sessions.len() < MAX_OPENCODE_SESSIONS)
+            .collect();
+        if !targets.is_empty() {
+            batch.push(
+                &targets,
+                SessionRef {
+                    id: session.id,
+                    label: if session.title.trim().is_empty() {
+                        "(无标题)".into()
+                    } else {
+                        session.title
+                    },
+                    ts: session.updated.max(session.created),
+                    path: String::new(),
+                },
+            );
+        }
+        batch
+            .workspaces
+            .values()
+            .flatten()
+            .any(|&index| batch.groups[index].sessions.len() < MAX_OPENCODE_SESSIONS)
+    });
+    if result.is_err() {
+        // A full group would have stopped before this row in the single-workspace query.
+        for group in &mut batch.groups {
+            if group.sessions.len() < MAX_OPENCODE_SESSIONS {
+                group.sessions.clear();
+            }
+        }
+    }
 }
 
 pub fn delete_opencode_session(id: &str, cwd: &str) -> Result<(), String> {
@@ -643,13 +787,20 @@ pub fn list_claude_sessions(cwd: &str) -> Vec<SessionRef> {
 }
 
 pub(crate) fn list_claude_sessions_in(home_dir: &Path, cwd: &str) -> Vec<SessionRef> {
+    SessionBatch::single(cwd, |batch| scan_claude_sessions(home_dir, batch))
+}
+
+fn scan_claude_sessions(home_dir: &Path, batch: &mut SessionBatch) {
+    #[cfg(test)]
+    {
+        batch.scans += 1;
+    }
     let h = home_dir;
     let Ok(f) = std::fs::File::open(h.join(".claude").join("history.jsonl")) else {
-        return Vec::new();
+        return;
     };
-    // sessionId -> (label, ts, label_still_slash)
-    let mut map: HashMap<String, (String, i64, bool)> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    let mut map: HashMap<(usize, String), (String, i64, bool)> = HashMap::new();
+    let mut order = Vec::new();
     for line in BufReader::new(f).lines().map_while(Result::ok) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
@@ -657,7 +808,8 @@ pub(crate) fn list_claude_sessions_in(home_dir: &Path, cwd: &str) -> Vec<Session
         let Some(project) = v.get("project").and_then(|p| p.as_str()) else {
             continue;
         };
-        if !same_path(project, cwd) {
+        let targets = batch.matching(project);
+        if targets.is_empty() {
             continue;
         }
         let Some(id) = v.get("sessionId").and_then(|s| s.as_str()) else {
@@ -671,44 +823,51 @@ pub(crate) fn list_claude_sessions_in(home_dir: &Path, cwd: &str) -> Vec<Session
             .to_string();
         let ts = v.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
         let is_slash = display.is_empty() || display.starts_with('/');
-        match map.entry(id.to_string()) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                order.push(id.to_string());
-                slot.insert((display, ts, is_slash));
-            }
-            std::collections::hash_map::Entry::Occupied(mut slot) => {
-                let cur = slot.get_mut();
-                if ts > cur.1 {
-                    cur.1 = ts;
+        for target in targets {
+            let key = (target, id.to_string());
+            match map.entry(key.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    order.push(key);
+                    slot.insert((display.clone(), ts, is_slash));
                 }
-                if cur.2 && !is_slash {
-                    cur.0 = display;
-                    cur.2 = false;
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let cur = slot.get_mut();
+                    if ts > cur.1 {
+                        cur.1 = ts;
+                    }
+                    if cur.2 && !is_slash {
+                        cur.0 = display.clone();
+                        cur.2 = false;
+                    }
                 }
             }
         }
     }
     // sessionId -> <id>.jsonl 路径映射，标题优先取会话内最新 ai-title，无则回退 history 的 display。
     let files = session_files(&h);
-    let mut out: Vec<SessionRef> = order
-        .into_iter()
-        .filter_map(|id| {
-            let transcript = files.get(&id)?;
-            map.get(&id).map(|(display, ts, _)| {
-                let label = read_ai_title(transcript)
-                    .or_else(|| (!display.is_empty()).then(|| display.clone()))
-                    .unwrap_or_else(|| "(无标题)".into());
-                SessionRef {
-                    label,
-                    id: id.clone(),
-                    ts: *ts,
-                    path: transcript.to_string_lossy().into_owned(),
-                }
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| b.ts.cmp(&a.ts));
-    out
+    let mut titles = HashMap::new();
+    for key in order {
+        let (target, id) = (key.0, &key.1);
+        let Some(transcript) = files.get(id) else {
+            continue;
+        };
+        let (display, ts, _) = &map[&key];
+        let label = titles
+            .entry(id.clone())
+            .or_insert_with(|| read_ai_title(transcript))
+            .clone()
+            .or_else(|| (!display.is_empty()).then(|| display.clone()))
+            .unwrap_or_else(|| "(无标题)".into());
+        batch.push(
+            &[target],
+            SessionRef {
+                label,
+                id: id.clone(),
+                ts: *ts,
+                path: transcript.to_string_lossy().into_owned(),
+            },
+        );
+    }
 }
 
 /// 建 sessionId -> <id>.jsonl 路径映射（遍历 ~/.claude/projects/*/*.jsonl）。
@@ -1075,10 +1234,18 @@ pub fn list_codex_sessions(cwd: &str) -> Vec<SessionRef> {
 }
 
 pub(crate) fn list_codex_sessions_in(home_dir: &Path, cwd: &str) -> Vec<SessionRef> {
+    SessionBatch::single(cwd, |batch| scan_codex_sessions(home_dir, batch))
+}
+
+fn scan_codex_sessions(home_dir: &Path, batch: &mut SessionBatch) {
+    #[cfg(test)]
+    {
+        batch.scans += 1;
+    }
     let h = home_dir;
     let root = h.join(".codex").join("sessions");
     if !root.is_dir() {
-        return Vec::new();
+        return;
     }
     let native_titles = read_codex_session_titles(&h);
     let mut files: Vec<PathBuf> = WalkDir::new(&root)
@@ -1097,25 +1264,27 @@ pub(crate) fn list_codex_sessions_in(home_dir: &Path, cwd: &str) -> Vec<SessionR
     files.sort_by(|a, b| b.file_name().cmp(&a.file_name())); // 文件名含 ISO 时间 → 倒序=最近优先
     files.truncate(MAX_CODEX_SCAN);
 
-    let mut out = Vec::new();
     for p in files {
-        let head = read_head_lines(&p, 30);
-        if head.is_empty() {
+        let Ok(file) = std::fs::File::open(&p) else {
             continue;
-        }
-        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&head[0]) else {
+        };
+        let mut lines = BufReader::new(file).lines().map_while(Result::ok);
+        let Some(first) = lines.next() else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&first) else {
             continue;
         };
         if meta.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
             continue;
         }
         let payload = meta.get("payload");
-        if payload
+        let targets = payload
             .and_then(|p| p.get("cwd"))
             .and_then(|c| c.as_str())
-            .map(|c| same_path(c, cwd))
-            != Some(true)
-        {
+            .map(|cwd| batch.matching(cwd))
+            .unwrap_or_default();
+        if targets.is_empty() {
             continue;
         }
         let id = payload
@@ -1128,8 +1297,8 @@ pub(crate) fn list_codex_sessions_in(home_dir: &Path, cwd: &str) -> Vec<SessionR
         }
         // 标题=首条"真实用户消息"：response_item + role=user，跳过 codex 的系统注入(< 标签块 / # AGENTS.md)
         let mut label = String::new();
-        'outer: for l in head.iter().skip(1) {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else {
+        'outer: for l in lines.take(29) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) else {
                 continue;
             };
             if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
@@ -1160,15 +1329,16 @@ pub(crate) fn list_codex_sessions_in(home_dir: &Path, cwd: &str) -> Vec<SessionR
                 break 'outer;
             }
         }
-        out.push(SessionRef {
-            label: codex_label(native_titles.get(&id), label),
-            id,
-            ts: mtime_ms(&p),
-            path: p.to_string_lossy().into_owned(),
-        });
+        batch.push(
+            &targets,
+            SessionRef {
+                label: codex_label(native_titles.get(&id), label),
+                id,
+                ts: mtime_ms(&p),
+                path: p.to_string_lossy().into_owned(),
+            },
+        );
     }
-    out.sort_by(|a, b| b.ts.cmp(&a.ts));
-    out
 }
 
 /// 删除 codex 会话：移入回收站（仅限 ~/.codex/sessions 内）。
@@ -1430,12 +1600,19 @@ pub fn list_cursor_sessions(cwd: &str) -> Vec<SessionRef> {
 }
 
 pub(crate) fn list_cursor_sessions_in(home_dir: &Path, cwd: &str) -> Vec<SessionRef> {
+    SessionBatch::single(cwd, |batch| scan_cursor_sessions(home_dir, batch))
+}
+
+fn scan_cursor_sessions(home_dir: &Path, batch: &mut SessionBatch) {
+    #[cfg(test)]
+    {
+        batch.scans += 1;
+    }
     let h = home_dir;
     let root = h.join(".cursor").join("chats");
     if !root.is_dir() {
-        return Vec::new();
+        return;
     }
-    let mut out = Vec::new();
     for entry in WalkDir::new(&root)
         .max_depth(4)
         .into_iter()
@@ -1457,7 +1634,8 @@ pub(crate) fn list_cursor_sessions_in(home_dir: &Path, cwd: &str) -> Vec<Session
         let Some(meta_cwd) = v.get("cwd").and_then(|value| value.as_str()) else {
             continue;
         };
-        if !same_path(meta_cwd, cwd) {
+        let targets = batch.matching(meta_cwd);
+        if targets.is_empty() {
             continue;
         }
         if v.get("hasConversation").and_then(|b| b.as_bool()) != Some(true) {
@@ -1493,15 +1671,16 @@ pub(crate) fn list_cursor_sessions_in(home_dir: &Path, cwd: &str) -> Vec<Session
         let ts = v.get("updatedAtMs").and_then(|t| t.as_i64()).unwrap_or(0);
         let native_title = v.get("title").and_then(|t| t.as_str());
         let label = cursor_label(native_title, read_cursor_first_prompt(chat_dir));
-        out.push(SessionRef {
-            label,
-            id: id.to_string(),
-            ts,
-            path: chat_dir.to_string_lossy().into_owned(),
-        });
+        batch.push(
+            &targets,
+            SessionRef {
+                label,
+                id: id.to_string(),
+                ts,
+                path: chat_dir.to_string_lossy().into_owned(),
+            },
+        );
     }
-    out.sort_by(|a, b| b.ts.cmp(&a.ts));
-    out
 }
 
 /// 删除 cursor 会话：整个 chat 目录移入回收站（仅限 ~/.cursor/chats 内；chat-id 无法从目录结构反查，故按 path 删除）。
@@ -1622,11 +1801,18 @@ pub fn list_kimi_sessions(cwd: &str) -> Vec<SessionRef> {
 }
 
 pub(crate) fn list_kimi_sessions_in(data_root: &Path, cwd: &str) -> Vec<SessionRef> {
+    SessionBatch::single(cwd, |batch| scan_kimi_sessions(data_root, batch))
+}
+
+fn scan_kimi_sessions(data_root: &Path, batch: &mut SessionBatch) {
+    #[cfg(test)]
+    {
+        batch.scans += 1;
+    }
     let root = data_root.join("sessions");
     if !root.is_dir() {
-        return Vec::new();
+        return;
     }
-    let mut out = Vec::new();
     for entry in WalkDir::new(&root)
         .max_depth(3)
         .into_iter()
@@ -1645,7 +1831,10 @@ pub(crate) fn list_kimi_sessions_in(data_root: &Path, cwd: &str) -> Vec<SessionR
         if kimi_is_archived(&v) {
             continue;
         }
-        if kimi_session_workdir(&v).map(|value| same_path(value, cwd)) != Some(true) {
+        let targets = kimi_session_workdir(&v)
+            .map(|cwd| batch.matching(cwd))
+            .unwrap_or_default();
+        if targets.is_empty() {
             continue;
         }
         let Some(session_dir) = p.parent() else {
@@ -1660,15 +1849,16 @@ pub(crate) fn list_kimi_sessions_in(data_root: &Path, cwd: &str) -> Vec<SessionR
             .map(|s| s.chars().take(80).collect());
         let label = cursor_label(v.get("title").and_then(|value| value.as_str()), fallback);
         let ts = kimi_ts_ms(&v, "updatedAt");
-        out.push(SessionRef {
-            label,
-            id: id.to_string(),
-            ts,
-            path: session_dir.to_string_lossy().into_owned(),
-        });
+        batch.push(
+            &targets,
+            SessionRef {
+                label,
+                id: id.to_string(),
+                ts,
+                path: session_dir.to_string_lossy().into_owned(),
+            },
+        );
     }
-    out.sort_by(|a, b| b.ts.cmp(&a.ts));
-    out
 }
 
 /// 删除 kimi 会话：整个 session 目录移入回收站（仅限 <数据根>/sessions 内），
@@ -1788,11 +1978,18 @@ pub fn list_grok_sessions(cwd: &str) -> Vec<SessionRef> {
 }
 
 pub(crate) fn list_grok_sessions_in(data_root: &Path, cwd: &str) -> Vec<SessionRef> {
+    SessionBatch::single(cwd, |batch| scan_grok_sessions(data_root, batch))
+}
+
+fn scan_grok_sessions(data_root: &Path, batch: &mut SessionBatch) {
+    #[cfg(test)]
+    {
+        batch.scans += 1;
+    }
     let root = data_root.join("sessions");
     if !root.is_dir() {
-        return Vec::new();
+        return;
     }
-    let mut out = Vec::new();
     for entry in WalkDir::new(&root)
         .max_depth(3)
         .into_iter()
@@ -1808,7 +2005,10 @@ pub(crate) fn list_grok_sessions_in(data_root: &Path, cwd: &str) -> Vec<SessionR
         let Ok(summary) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
-        if grok_summary_cwd(&summary).map(|value| same_path(value, cwd)) != Some(true) {
+        let targets = grok_summary_cwd(&summary)
+            .map(|cwd| batch.matching(cwd))
+            .unwrap_or_default();
+        if targets.is_empty() {
             continue;
         }
         let Some(session_dir) = summary_path.parent() else {
@@ -1823,15 +2023,16 @@ pub(crate) fn list_grok_sessions_in(data_root: &Path, cwd: &str) -> Vec<SessionR
         if !dir_id.eq_ignore_ascii_case(&id) {
             continue;
         }
-        out.push(SessionRef {
-            label: grok_summary_label(&summary),
-            id,
-            ts: grok_summary_ts(&summary, "updated_at"),
-            path: session_dir.to_string_lossy().into_owned(),
-        });
+        batch.push(
+            &targets,
+            SessionRef {
+                label: grok_summary_label(&summary),
+                id,
+                ts: grok_summary_ts(&summary, "updated_at"),
+                path: session_dir.to_string_lossy().into_owned(),
+            },
+        );
     }
-    out.sort_by(|a, b| b.ts.cmp(&a.ts));
-    out
 }
 
 fn encode_grok_cwd_bucket(cwd: &str) -> String {
@@ -1963,14 +2164,22 @@ pub fn list_hermes_sessions(cwd: &str) -> Vec<SessionRef> {
 }
 
 pub(crate) fn list_hermes_sessions_in(db: &Path, cwd: &str) -> Vec<SessionRef> {
+    SessionBatch::single(cwd, |batch| scan_hermes_sessions(db, batch))
+}
+
+fn scan_hermes_sessions(db: &Path, batch: &mut SessionBatch) {
+    #[cfg(test)]
+    {
+        batch.scans += 1;
+    }
     let Ok(conn) = open_hermes_db_ro(db) else {
-        return Vec::new();
+        return;
     };
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, title, cwd, COALESCE(last_activity_at, started_at, 0), COALESCE(archived, 0)
          FROM sessions",
     ) else {
-        return Vec::new();
+        return;
     };
     let Ok(rows) = stmt.query_map([], |row| {
         Ok((
@@ -1981,9 +2190,8 @@ pub(crate) fn list_hermes_sessions_in(db: &Path, cwd: &str) -> Vec<SessionRef> {
             row.get::<_, i64>(4)?,
         ))
     }) else {
-        return Vec::new();
+        return;
     };
-    let mut out = Vec::new();
     for row in rows.flatten() {
         let (id, title, sess_cwd, act, archived) = row;
         if archived != 0 || !is_hermes_session_id(&id) {
@@ -1992,7 +2200,8 @@ pub(crate) fn list_hermes_sessions_in(db: &Path, cwd: &str) -> Vec<SessionRef> {
         let Some(sc) = sess_cwd.as_deref().filter(|s| !s.is_empty()) else {
             continue;
         };
-        if !same_path(sc, cwd) {
+        let targets = batch.matching(sc);
+        if targets.is_empty() {
             continue;
         }
         let label = title
@@ -2001,15 +2210,16 @@ pub(crate) fn list_hermes_sessions_in(db: &Path, cwd: &str) -> Vec<SessionRef> {
             .filter(|s| !s.is_empty())
             .map(|s| s.chars().take(80).collect())
             .unwrap_or_else(|| id.clone());
-        out.push(SessionRef {
-            id: id.clone(),
-            label,
-            ts: hermes_ts_ms(act),
-            path: id,
-        });
+        batch.push(
+            &targets,
+            SessionRef {
+                id: id.clone(),
+                label,
+                ts: hermes_ts_ms(act),
+                path: id,
+            },
+        );
     }
-    out.sort_by(|a, b| b.ts.cmp(&a.ts));
-    out
 }
 
 /// 删除 hermes 会话：校验 id 后从 state.db 删除 messages + sessions 行。
@@ -3247,6 +3457,68 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    fn assert_shared_batch(
+        ctx: &TestHome,
+        source: &Path,
+        scan: fn(&Path, &mut super::SessionBatch),
+    ) -> Vec<super::WorkspaceSessions> {
+        let cwd = path_text(&ctx.workspace);
+        let cwds = vec![
+            cwd.clone(),
+            path_text(&ctx.other_workspace),
+            path_text(&ctx.home.join("missing-workspace")),
+            cwd.clone(),
+            cwd.replace('\\', "/"),
+        ];
+        let mut batch = super::SessionBatch::new(&cwds);
+        let identities = batch.paths.len();
+        scan(source, &mut batch);
+        assert_eq!(
+            batch.scans, 1,
+            "one source traversal for every requested workspace"
+        );
+        assert_eq!(
+            batch.paths.len(),
+            identities,
+            "repeated source cwd reuses this batch identity"
+        );
+        let groups = batch.finish();
+        for (group, cwd) in groups.iter().zip(&cwds) {
+            assert_eq!(&group.cwd, cwd);
+            assert_eq!(
+                group.sessions,
+                super::SessionBatch::single(cwd, |b| scan(source, b))
+            );
+        }
+        assert!(groups[2].sessions.is_empty());
+        assert_eq!(groups[0].sessions, groups[3].sessions);
+        assert_eq!(groups[0].sessions, groups[4].sessions);
+        groups
+    }
+
+    #[test]
+    fn session_batch_keeps_path_identity_and_rejects_missing_or_dot_paths() {
+        let ctx = test_home();
+        let cwd = path_text(&ctx.workspace);
+        let sibling = ctx.workspace.with_file_name("workspace-suffix");
+        fs::create_dir(&sibling).unwrap();
+        let mut batch = super::SessionBatch::new(&[cwd.clone(), cwd.clone()]);
+        assert_eq!(batch.matching(&cwd), vec![0, 1]);
+        assert_eq!(batch.matching(&cwd.replace('\\', "/")), vec![0, 1]);
+        assert!(batch.matching(&path_text(&sibling)).is_empty());
+        assert!(batch.matching(&format!("{cwd}/../workspace")).is_empty());
+        assert!(batch
+            .matching(&path_text(&ctx.home.join("missing")))
+            .is_empty());
+        let checked = batch.paths.len();
+        assert_eq!(batch.matching(&cwd), vec![0, 1]);
+        assert_eq!(batch.paths.len(), checked);
+        assert!(super::list_agent_sessions_batch("unsupported", &[]).is_err());
+        assert!(super::list_agent_sessions_batch("codex", &[])
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn opencode_sessions_read_sqlite_filter_sort_and_bound_results() {
         let ctx = test_home();
@@ -3301,6 +3573,25 @@ mod tests {
         assert_eq!(sessions[0].id, format!("ses_valid{MAX_OPENCODE_SESSIONS}"));
         assert_eq!(sessions[0].title, format!("session {MAX_OPENCODE_SESSIONS}"));
         assert_eq!(sessions[0].updated, MAX_OPENCODE_SESSIONS as i64);
+        let groups = assert_shared_batch(&ctx, &database, super::scan_opencode_sessions);
+        assert_eq!(groups[0].sessions.len(), MAX_OPENCODE_SESSIONS);
+        assert_eq!(groups[1].sessions.len(), 1);
+        assert_eq!(groups[1].sessions[0].id, "ses_other");
+        assert!(groups[0]
+            .sessions
+            .iter()
+            .all(|session| session.path.is_empty()));
+        assert_eq!(
+            groups[0]
+                .sessions
+                .iter()
+                .map(|session| &session.id)
+                .collect::<Vec<_>>(),
+            sessions
+                .iter()
+                .map(|session| &session.id)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(sessions.last().map(|session| session.created), Some(1));
         assert!(validate_opencode_session_id("ses_validABC123").is_ok());
         assert!(validate_opencode_session_id("ses_bad-token").is_err());
@@ -3342,6 +3633,158 @@ mod tests {
             .join("\n");
         text.push('\n');
         fs::write(path, text).expect("write JSONL fixture");
+    }
+
+    #[test]
+    fn claude_batch_shares_history_titles_and_skips_duplicate_transcripts() {
+        let ctx = test_home();
+        let root = ctx.home.join(".claude");
+        let transcript = root.join("projects").join("a").join(format!("{TEST_ID}.jsonl"));
+        write_json_lines(
+            &transcript,
+            &[json!({"type":"ai-title", "aiTitle":"native"})],
+        );
+        write_json_lines(
+            &root.join("projects").join("b").join(format!("{OTHER_ID}.jsonl")),
+            &[],
+        );
+        let cwd = path_text(&ctx.workspace);
+        let other = path_text(&ctx.other_workspace);
+        write_json_lines(
+            &root.join("history.jsonl"),
+            &[
+                json!({"sessionId":TEST_ID,"project":cwd,"display":"/command","timestamp":1}),
+                json!({"sessionId":TEST_ID,"project":cwd,"display":"first prompt","timestamp":2}),
+                json!({"sessionId":TEST_ID,"project":cwd,"display":"later prompt","timestamp":3}),
+                json!({"sessionId":OTHER_ID,"project":other,"display":"other prompt","timestamp":10}),
+            ],
+        );
+        let groups = assert_shared_batch(&ctx, &ctx.home, super::scan_claude_sessions);
+        assert_eq!(groups[0].sessions[0].label, "native");
+        assert_eq!(groups[0].sessions[0].ts, 3);
+        assert_eq!(groups[0].sessions[0].path, path_text(&transcript));
+        assert_eq!(groups[1].sessions[0].id, OTHER_ID);
+        assert_eq!(groups[1].sessions[0].label, "other prompt");
+        write_json_lines(
+            &transcript,
+            &[json!({"type":"ai-title", "aiTitle":"renamed"})],
+        );
+        assert_eq!(
+            super::list_claude_sessions_in(&ctx.home, &cwd)[0].label,
+            "renamed"
+        );
+        write_json_lines(&transcript, &[]);
+        assert_eq!(
+            super::list_claude_sessions_in(&ctx.home, &cwd)[0].label,
+            "first prompt"
+        );
+        write_json_lines(
+            &root
+                .join("projects")
+                .join("duplicate")
+                .join(format!("{TEST_ID}.jsonl")),
+            &[],
+        );
+        assert!(super::list_claude_sessions_in(&ctx.home, &cwd).is_empty());
+        assert_eq!(super::list_claude_sessions_in(&ctx.home, &other).len(), 1);
+    }
+
+    #[test]
+    fn codex_batch_shares_rollouts_and_observes_updated_native_titles() {
+        let ctx = test_home();
+        write_codex_rollout(&ctx, ["2026", "07", "11"], &ctx.workspace);
+        let other = write_codex_rollout(&ctx, ["2026", "07", "12"], &ctx.other_workspace);
+        write_json_lines(
+            &other,
+            &[
+                json!({"type":"session_meta","payload":{"id":OTHER_ID,"cwd":path_text(&ctx.other_workspace)}}),
+                json!({"type":"response_item","payload":{"role":"user","content":[
+                {"type":"input_text","text":"# AGENTS.md injected"}]}}),
+                json!({"type":"response_item","payload":{"role":"user","content":[
+                {"type":"input_text","text":"actual prompt"}]}}),
+            ],
+        );
+        let groups = assert_shared_batch(&ctx, &ctx.home, super::scan_codex_sessions);
+        assert_eq!(groups[0].sessions[0].id, TEST_ID);
+        assert_eq!(groups[0].sessions[0].label, "native title");
+        assert_eq!(groups[1].sessions[0].id, OTHER_ID);
+        assert_eq!(groups[1].sessions[0].label, "actual prompt");
+        write_json_lines(
+            &ctx.home.join(".codex/session_index.jsonl"),
+            &[json!({"id":TEST_ID,"thread_name":"updated title"})],
+        );
+        assert_eq!(
+            super::list_codex_sessions_in(&ctx.home, &path_text(&ctx.workspace))[0].label,
+            "updated title"
+        );
+    }
+
+    #[test]
+    fn codex_batch_preserves_global_latest_file_limit_before_workspace_filtering() {
+        let ctx = test_home();
+        let root = ctx.home.join(".codex/sessions/2026/09/07");
+        for index in 0..=super::MAX_CODEX_SCAN {
+            let cwd = if index == 0 {
+                &ctx.workspace
+            } else {
+                &ctx.other_workspace
+            };
+            write_json_lines(
+                &root.join(format!("rollout-{index:04}.jsonl")),
+                &[json!({"type":"session_meta","payload":{
+                    "id":format!("session{index}"), "cwd":path_text(cwd)}})],
+            );
+        }
+        let groups = assert_shared_batch(&ctx, &ctx.home, super::scan_codex_sessions);
+        assert!(
+            groups[0].sessions.is_empty(),
+            "oldest file stays outside the global cap"
+        );
+        assert_eq!(groups[1].sessions.len(), super::MAX_CODEX_SCAN);
+        assert!(groups[1]
+            .sessions
+            .iter()
+            .all(|session| session.id != "session0"));
+    }
+
+    #[test]
+    fn opencode_batch_does_not_reject_completed_workspace_when_later_sql_row_is_invalid() {
+        let ctx = test_home();
+        let db = ctx.home.join("opencode.db");
+        let mut conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT, title TEXT, directory TEXT,
+            time_created INTEGER, time_updated INTEGER)",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        for index in 0..MAX_OPENCODE_SESSIONS {
+            tx.execute(
+                "INSERT INTO session VALUES (?1,'valid',?2,1,?3)",
+                params![
+                    format!("ses_valid{index}"),
+                    path_text(&ctx.workspace),
+                    index as i64 + 1
+                ],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "INSERT INTO session VALUES ('ses_other','other',?1,1,9999)",
+            [path_text(&ctx.other_workspace)],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO session VALUES ('ses_broken',NULL,?1,0,0)",
+            [path_text(&ctx.other_workspace)],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let groups = assert_shared_batch(&ctx, &db, super::scan_opencode_sessions);
+        assert_eq!(groups[0].sessions.len(), MAX_OPENCODE_SESSIONS);
+        assert!(groups[1].sessions.is_empty());
+        assert!(query_opencode_sessions_in(&db, &path_text(&ctx.workspace)).is_ok());
+        assert!(query_opencode_sessions_in(&db, &path_text(&ctx.other_workspace)).is_err());
     }
 
     fn write_claude_fixture(ctx: &TestHome, record_id: &str, record_cwd: &Path) -> PathBuf {
@@ -3416,6 +3859,116 @@ mod tests {
             "title": "Cursor title",
             "cwd": path_text(cwd)
         })
+    }
+
+    #[test]
+    fn cursor_batch_shares_metadata_and_keeps_workspace_buckets() {
+        let ctx = test_home();
+        let cwd = path_text(&ctx.workspace);
+        write_cursor_fixture(
+            &ctx,
+            &cursor_bucket(&cwd),
+            &cursor_meta(&ctx.workspace),
+            None,
+            true,
+        );
+        let other_cwd = path_text(&ctx.other_workspace);
+        let mut other_meta = cursor_meta(&ctx.other_workspace);
+        other_meta["title"] = json!("other title");
+        write_cursor_fixture(&ctx, &cursor_bucket(&other_cwd), &other_meta, None, true);
+        let groups = assert_shared_batch(&ctx, &ctx.home, super::scan_cursor_sessions);
+        assert_eq!(groups[0].sessions.len(), 1);
+        assert_eq!(groups[0].sessions[0].label, "Cursor title");
+        assert_eq!(groups[1].sessions.len(), 1);
+        assert_eq!(groups[1].sessions[0].label, "other title");
+        assert_ne!(groups[0].sessions[0].path, groups[1].sessions[0].path);
+    }
+
+    #[test]
+    fn kimi_and_grok_batches_share_sources_with_distinct_workspaces() {
+        let ctx = test_home();
+        let cwd = path_text(&ctx.workspace);
+        let other = path_text(&ctx.other_workspace);
+        write_kimi_state(
+            &ctx.home,
+            "one",
+            KIMI_V1_ID,
+            &json!({
+            "workDir":cwd, "title":"first kimi", "updatedAt":"2026-08-06T14:30:35Z"}),
+        );
+        write_kimi_state(
+            &ctx.home,
+            "two",
+            KIMI_V2_ID,
+            &json!({
+            "cwd":other, "title":"second kimi", "updatedAt":KIMI_V2_UPDATED_MS}),
+        );
+        let groups = assert_shared_batch(&ctx, &ctx.home, super::scan_kimi_sessions);
+        assert_eq!(groups[0].sessions[0].id, KIMI_V1_ID);
+        assert_eq!(groups[1].sessions[0].id, KIMI_V2_ID);
+        write_grok_summary(
+            &ctx.home,
+            "one",
+            TEST_ID,
+            &json!({
+            "info":{"id":TEST_ID,"cwd":cwd}, "generated_title":"first grok",
+            "updated_at":"2026-08-14T08:10:00Z"}),
+        );
+        write_grok_summary(
+            &ctx.home,
+            "two",
+            OTHER_ID,
+            &json!({
+            "info":{"id":OTHER_ID,"cwd":other}, "session_summary":"second grok",
+            "updated_at":"2026-08-14T08:20:00Z"}),
+        );
+        let groups = assert_shared_batch(&ctx, &ctx.home, super::scan_grok_sessions);
+        assert_eq!(groups[0].sessions[0].id, TEST_ID);
+        assert_eq!(groups[0].sessions[0].label, "first grok");
+        assert_eq!(groups[1].sessions[0].id, OTHER_ID);
+        assert_eq!(groups[1].sessions[0].label, "second grok");
+    }
+
+    #[test]
+    fn hermes_batch_shares_query_and_preserves_labels_timestamps_and_archived_filter() {
+        let ctx = test_home();
+        let db = ctx.home.join("state.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, title TEXT, cwd TEXT,
+            last_activity_at REAL, started_at REAL, archived INTEGER)",
+        )
+        .unwrap();
+        for (id, title, cwd, activity, archived) in [
+            (
+                "20260807_044312_9b9292",
+                "  native title  ",
+                &ctx.workspace,
+                Some(2.5),
+                0,
+            ),
+            ("20260807_044313_abcdef", " ", &ctx.other_workspace, None, 0),
+            (
+                "20260807_044314_abcdef",
+                "archived",
+                &ctx.workspace,
+                Some(9.0),
+                1,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions VALUES (?1,?2,?3,?4,1,?5)",
+                params![id, title, path_text(cwd), activity, archived],
+            )
+            .unwrap();
+        }
+        let groups = assert_shared_batch(&ctx, &db, super::scan_hermes_sessions);
+        assert_eq!(groups[0].sessions.len(), 1);
+        assert_eq!(groups[0].sessions[0].label, "native title");
+        assert_eq!(groups[0].sessions[0].ts, 2500);
+        assert_eq!(groups[0].sessions[0].path, "20260807_044312_9b9292");
+        assert_eq!(groups[1].sessions[0].label, "20260807_044313_abcdef");
+        assert_eq!(groups[1].sessions[0].ts, 1000);
     }
 
     fn write_cursor_fixture(

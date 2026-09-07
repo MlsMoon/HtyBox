@@ -21,6 +21,7 @@ import UpdateModal from "./components/UpdateModal";
 import HtyBoxLogo from "./components/ui/HtyBoxLogo";
 import { checkForUpdate, getSkippedVersion, setSkippedVersion, type Update } from "./updater";
 import { getWsState, setWsState } from "./wsState";
+import { clearWorkspaceSessionRefresh } from "./sessionRefreshThrottle";
 import { onAgentStatusChange, workspaceStatus, setActiveWorkspace, clearWorkspace, type WsStatus } from "./agentStatus";
 import { useMaskDismiss } from "./components/ui/maskDismiss";
 import { useDoubleShift } from "./components/ui/useDoubleShift";
@@ -339,6 +340,7 @@ export default function App() {
   const closeWs = (id: string) => {
     // 标记关闭中：卸载期间别把残缺布局写回；但【保留】布局键 → 重新打开可复原终端
     markWorkspaceClosing(id);
+    clearWorkspaceSessionRefresh(id);
     previewWin.closeForWorkspace(id); // 工作区没了，它的内容预览窗口也一并收掉（并清记忆）
     disposeByPrefix(id + "::"); // 结束该工作区全部终端（PTY）
     clearWorkspace(id); // 清该工作区运行状态总线
@@ -617,21 +619,21 @@ export default function App() {
             <div className="relative h-full w-full">
               {openWs
                 .filter((w) => opened.has(w.id))
-                .map((w) => (
-                  <div
-                    key={w.id}
-                    className={
-                      // 不用 display:none：非活动用 opacity-0+低层级。opacity-0 仍与视口相交，
-                      // xterm 内置 IntersectionObserver 不会暂停它 → 终端常驻渲染、切回不空白。
-                      "absolute inset-0 " +
-                      (w.id === activeId
-                        ? "z-10"
-                        : "z-0 opacity-0 pointer-events-none")
-                    }
-                  >
-                    <TerminalDock workspaceId={w.id} cwd={w.path} />
-                  </div>
-                ))}
+                .map((w) => {
+                  const interactive = w.id === activeId && !dashMode;
+                  return (
+                    <div
+                      key={w.id}
+                      data-workspace-id={w.id}
+                      className={"absolute inset-0 " + (interactive ? "z-10" : "z-0 pointer-events-none")}
+                      inert={!interactive}
+                      // 保留后台布局尺寸供新 PTY 初始化；离屏让 xterm 暂停绘制，inert 隔离输入。
+                      style={interactive ? undefined : { transform: "translateX(calc(-100vw - 100%))" }}
+                    >
+                      <TerminalDock workspaceId={w.id} cwd={w.path} interactive={interactive} />
+                    </div>
+                  );
+                })}
             </div>
           </Allotment.Pane>
         </Allotment>

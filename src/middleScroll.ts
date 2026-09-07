@@ -191,6 +191,7 @@ function startSession(term: Terminal, x: number, y: number): void {
 export function attachMiddleScroll(
   term: Terminal,
   host: HTMLElement,
+  focus: () => void,
 ): () => void {
   const onDown = (e: MouseEvent) => {
     if (e.button !== 1) return;
@@ -200,7 +201,7 @@ export function attachMiddleScroll(
     // 拦下这次中键：阻止 Chromium 潜在原生 autoscroll 与默认焦点路径，会话自己接管
     e.preventDefault();
     e.stopPropagation();
-    term.focus(); // preventDefault 阻止了默认聚焦，补上与点击终端一致的语义
+    focus(); // preventDefault 阻止了默认聚焦，交给终端的统一资格检查
     startSession(term, e.clientX, e.clientY);
   };
   host.addEventListener("mousedown", onDown, true);

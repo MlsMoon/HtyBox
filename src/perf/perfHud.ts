@@ -2,9 +2,9 @@
 //
 // 观测维度(全部 bool 短路,开关关闭时 hot path 零开销):
 //   IPC 输出:msg/s、KB/s(terminalEngine onmessage 打点)
-//   渲染负担:term.write 单次耗时均值/峰值、write 调用/s
+//   写入排队:term.write 同步入队耗时均值/峰值、write 调用/s，不含异步解析/绘制
 //   主线程健康:长任务(PerformanceObserver longtask)计数/最长、FPS(rAF 采样)
-//   会话风暴:重扫次数/耗时(SessionPanel load + TerminalDock refreshNativeLabels 打点)
+//   会话风暴:共享刷新调度的实际批扫描次数/耗时
 //
 // 设计纪律:开关默认关(「偶用能力默认关」);HUD 1s 直更 DOM 文本,不与终端渲染争主线程;
 // 探针只观测不改行为(不动 Channel 消息流/term.write 时序)。plan-2/3 复用同一打点做验收对照。
@@ -39,14 +39,14 @@ export function perfIpcMsg(bytes: number): void {
   c.ipcBytes += bytes;
 }
 
-/** 打点:term.write 单次耗时(ms)。hot path,调用方须先短路。 */
+/** 打点:term.write 同步入队耗时(ms)。hot path,调用方须先短路。 */
 export function perfWrite(ms: number): void {
   c.writes += 1;
   c.writeMs += ms;
   if (ms > c.writeMax) c.writeMax = ms;
 }
 
-/** 打点:一次会话重扫(SessionPanel load / refreshNativeLabels)耗时(ms)。 */
+/** 打点:一次共享会话批扫描耗时(ms)。 */
 export function perfRescan(ms: number): void {
   c.rescans += 1;
   c.rescanMs += ms;

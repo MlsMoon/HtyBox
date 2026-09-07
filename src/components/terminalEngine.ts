@@ -57,9 +57,14 @@ interface Engine {
   writeRaf?: number; // plan-2：已调度的合帧 rAF 句柄（在飞不重复调度）
   midScroll: () => void; // 解绑中键自动滚动（dispose 时调用；见 middleScroll.ts）
   textInputCleanup?: () => void; // 解绑 macOS WebKit 文本提交修正
+  canInteract?: () => boolean;
 }
 
 const engines = new Map<string, Engine>();
+
+function isEngineInteractive(engine: Engine | undefined): engine is Engine {
+  return !!engine?.el.isConnected && engine.canInteract?.() === true;
+}
 
 /**
  * 把粘贴文本规范化换行 + 成对 bracketed-paste 包裹，让 claude/codex 折叠成 [Pasted text +N lines]。
@@ -120,7 +125,7 @@ export function ensureEngine(
 
   // 程序通过 OSC 设标题时回调（Tab 自动命名）
   term.onTitleChange((title) => engines.get(termId)?.onTitle?.(title));
-  // 前端 → 后端：用户输入（PTY 未建时后端忽略）
+  // 用户输入与终端协议响应共用 onData；后台 DSR 等响应也必须回到 PTY。
   term.onData((data) =>
     invoke("write_terminal", { id: termId, data }).catch(() => {}),
   );
@@ -133,22 +138,26 @@ export function ensureEngine(
   //   （ConPTY 探针实证），勿再走键盘注入路线。
   // · Ctrl/Cmd+C → 有选区复制并清选区；Ctrl+C 无选区放行(=SIGINT)，Cmd+C 无选区不发送。
   term.attachCustomKeyEventHandler((e) => {
+    if (!isEngineInteractive(engines.get(termId))) return false;
     if (e.type !== "keydown" || !hasPrimaryShortcutModifier(e) || e.altKey) return true;
     if (e.key === "v" || e.key === "V") {
       const pasteClipImage = () => {
+        if (!isEngineInteractive(engines.get(termId))) return;
         if (!isAgentTerminal(agentKind)) return;
         const ws = engines.get(termId)?.cwd;
         if (!ws) return;
         beginClipboardPasteBusy();
         invoke<string>("save_clipboard_image", { workspaceDir: ws })
-          .then((p) =>
-            invoke("write_terminal", { id: termId, data: "@" + p + " " }),
-          )
+          .then((p) => {
+            if (!isEngineInteractive(engines.get(termId))) return;
+            return invoke("write_terminal", { id: termId, data: "@" + p + " " });
+          })
           .catch(() => {}) // 剪贴板无图 → 静默
           .finally(() => endClipboardPasteBusy());
       };
       readClipboardText()
         .then((raw) => {
+          if (!isEngineInteractive(engines.get(termId))) return;
           if (raw)
             invoke("write_terminal", {
               id: termId,
@@ -198,7 +207,7 @@ export function ensureEngine(
     launched: false,
     pendingChunks: [],
     // 中键自动滚动挂宿主 el（与 paste 拦截同位置）：跟随引擎生命周期，dockview 重排不丢
-    midScroll: attachMiddleScroll(term, el),
+    midScroll: attachMiddleScroll(term, el, () => focusEngine(termId)),
   });
 }
 
@@ -206,6 +215,11 @@ function installTerminalTextInputHandler(engine: Engine): () => void {
   const textarea = engine.term.textarea;
   if (!textarea) return () => {};
   const onBeforeInput = (event: InputEvent) => {
+    if (!isEngineInteractive(engine)) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     const data = macosTerminalTextInputData(event);
     if (data === undefined) return;
     event.preventDefault();
@@ -330,7 +344,7 @@ function doFit(termId: string): void {
     } catch {
       /* ignore */
     }
-    e.term.focus();
+    focusEngine(termId);
   }
   try {
     e.fit.fit();
@@ -364,7 +378,7 @@ export function attachEngine(termId: string, container: HTMLElement): void {
   const ro = new ResizeObserver(() => scheduleFit(termId));
   ro.observe(container);
   e.ro = ro;
-  if (e.opened) e.term.focus();
+  if (e.opened) focusEngine(termId);
 }
 
 /** 从容器移出（保留 xterm + PTY，供重新挂载）。 */
@@ -373,6 +387,7 @@ export function detachEngine(termId: string): void {
   if (!e) return;
   e.ro?.disconnect();
   e.ro = undefined;
+  e.canInteract = undefined;
   if (e.fitTimer) clearTimeout(e.fitTimer);
   e.el.parentElement?.removeChild(e.el);
 }
@@ -392,9 +407,19 @@ export function disposeEngine(termId: string): void {
   engines.delete(termId);
 }
 
-/** 让某终端获得键盘焦点（拖拽注入后调用）。 */
+/** 面板挂载时注册实时交互资格；引擎保活期间不保留已卸载面板的闭包。 */
+export function setEngineInteraction(
+  termId: string,
+  canInteract: (() => boolean) | undefined,
+): void {
+  const e = engines.get(termId);
+  if (e) e.canInteract = canInteract;
+}
+
+/** 让当前可交互的终端获得键盘焦点（后台程序化注入不依赖焦点）。 */
 export function focusEngine(termId: string): void {
-  engines.get(termId)?.term.focus();
+  const e = engines.get(termId);
+  if (isEngineInteractive(e)) e.term.focus();
 }
 
 /**
@@ -414,7 +439,7 @@ export function autoInjectWhenQuiet(
     const quiet = Date.now() - (e.lastOutputAt ?? 0);
     if (quiet >= quietNeed || Date.now() >= deadline) {
       invoke("write_terminal", { id: termId, data }).catch(() => {});
-      e.term.focus();
+      focusEngine(termId);
       return;
     }
     window.setTimeout(tick, 300);

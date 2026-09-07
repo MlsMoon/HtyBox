@@ -163,6 +163,12 @@ export const deleteHermesSession = (id: string) =>
   invoke<void>("delete_hermes_session", { id });
 export const listGrokSessions = (cwd: string) =>
   invoke<SessionRef[]>("list_grok_sessions", { cwd });
+export interface WorkspaceSessions {
+  cwd: string;
+  sessions: SessionRef[];
+}
+export const listAgentSessionsBatch = (agent: SessionAgent, cwds: string[]) =>
+  invoke<WorkspaceSessions[]>("list_agent_sessions_batch", { agent, cwds });
 export const deleteGrokSession = (path: string) =>
   invoke<void>("delete_grok_session", { path });
 export const exportSessionArchive = (

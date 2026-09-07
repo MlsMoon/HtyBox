@@ -1170,20 +1170,26 @@ fn count_workspace_files(
 
 /// M9：列本工作区 claude 会话（取自 ~/.claude/history.jsonl，按 project==cwd）。
 #[tauri::command]
-fn list_claude_sessions(cwd: String) -> Vec<sessions::SessionRef> {
-    sessions::list_claude_sessions(&cwd)
+async fn list_claude_sessions(cwd: String) -> Result<Vec<sessions::SessionRef>, String> {
+    tauri::async_runtime::spawn_blocking(move || sessions::list_claude_sessions(&cwd))
+        .await
+        .map_err(|error| format!("Claude 会话扫描任务失败：{error}"))
 }
 
 /// M9：列本工作区 codex 会话（~/.codex/sessions 按 session_meta.cwd）。
 #[tauri::command]
-fn list_codex_sessions(cwd: String) -> Vec<sessions::SessionRef> {
-    sessions::list_codex_sessions(&cwd)
+async fn list_codex_sessions(cwd: String) -> Result<Vec<sessions::SessionRef>, String> {
+    tauri::async_runtime::spawn_blocking(move || sessions::list_codex_sessions(&cwd))
+        .await
+        .map_err(|error| format!("Codex 会话扫描任务失败：{error}"))
 }
 
 /// 列本工作区 OpenCode 会话（只读查询原生 SQLite `opencode.db`，按 directory 过滤）。
 #[tauri::command]
-fn list_opencode_sessions(cwd: String) -> Vec<sessions::SessionRef> {
-    sessions::list_opencode_sessions(&cwd)
+async fn list_opencode_sessions(cwd: String) -> Result<Vec<sessions::SessionRef>, String> {
+    tauri::async_runtime::spawn_blocking(move || sessions::list_opencode_sessions(&cwd))
+        .await
+        .map_err(|error| format!("OpenCode 会话扫描任务失败：{error}"))
 }
 
 /// M9：删除 claude 会话（删 <id>.jsonl 入回收站）。
@@ -1206,8 +1212,10 @@ fn delete_opencode_session(id: String, cwd: String) -> Result<(), String> {
 
 /// 列本工作区 cursor 会话（~/.cursor/chats 按 meta.json.cwd）。
 #[tauri::command]
-fn list_cursor_sessions(cwd: String) -> Vec<sessions::SessionRef> {
-    sessions::list_cursor_sessions(&cwd)
+async fn list_cursor_sessions(cwd: String) -> Result<Vec<sessions::SessionRef>, String> {
+    tauri::async_runtime::spawn_blocking(move || sessions::list_cursor_sessions(&cwd))
+        .await
+        .map_err(|error| format!("Cursor 会话扫描任务失败：{error}"))
 }
 
 /// 删除 cursor 会话（删整个 chat 目录入回收站）。
@@ -1218,8 +1226,10 @@ fn delete_cursor_session(path: String) -> Result<(), String> {
 
 /// 列本工作区 kimi 会话（<KIMI_CODE_HOME|~/.kimi-code>/sessions 按 state.json 的 workDir|cwd）。
 #[tauri::command]
-fn list_kimi_sessions(cwd: String) -> Vec<sessions::SessionRef> {
-    sessions::list_kimi_sessions(&cwd)
+async fn list_kimi_sessions(cwd: String) -> Result<Vec<sessions::SessionRef>, String> {
+    tauri::async_runtime::spawn_blocking(move || sessions::list_kimi_sessions(&cwd))
+        .await
+        .map_err(|error| format!("Kimi 会话扫描任务失败：{error}"))
 }
 
 /// 删除 kimi 会话（删整个 session 目录入回收站 + session_index.jsonl 剔行）。
@@ -1230,8 +1240,10 @@ fn delete_kimi_session(path: String) -> Result<(), String> {
 
 /// 列本工作区 hermes 会话（HERMES_HOME/state.db 的 sessions 表按 cwd）。
 #[tauri::command]
-fn list_hermes_sessions(cwd: String) -> Vec<sessions::SessionRef> {
-    sessions::list_hermes_sessions(&cwd)
+async fn list_hermes_sessions(cwd: String) -> Result<Vec<sessions::SessionRef>, String> {
+    tauri::async_runtime::spawn_blocking(move || sessions::list_hermes_sessions(&cwd))
+        .await
+        .map_err(|error| format!("Hermes 会话扫描任务失败：{error}"))
 }
 
 /// 删除 hermes 会话（按 id 从 state.db 删 messages+sessions 行）。
@@ -1242,8 +1254,20 @@ fn delete_hermes_session(id: String) -> Result<(), String> {
 
 /// 列本工作区 Grok 会话（<GROK_HOME|~/.grok>/sessions 下按 summary.info.cwd）。
 #[tauri::command]
-fn list_grok_sessions(cwd: String) -> Vec<sessions::SessionRef> {
-    sessions::list_grok_sessions(&cwd)
+async fn list_grok_sessions(cwd: String) -> Result<Vec<sessions::SessionRef>, String> {
+    tauri::async_runtime::spawn_blocking(move || sessions::list_grok_sessions(&cwd))
+        .await
+        .map_err(|error| format!("Grok 会话扫描任务失败：{error}"))
+}
+
+#[tauri::command]
+async fn list_agent_sessions_batch(
+    agent: String,
+    cwds: Vec<String>,
+) -> Result<Vec<sessions::WorkspaceSessions>, String> {
+    tauri::async_runtime::spawn_blocking(move || sessions::list_agent_sessions_batch(&agent, &cwds))
+        .await
+        .map_err(|error| format!("批量会话扫描任务失败：{error}"))?
 }
 
 /// 删除 Grok 会话（校验 summary 后将整个 session 目录移入回收站）。
@@ -1254,29 +1278,39 @@ fn delete_grok_session(path: String) -> Result<(), String> {
 
 /// 运行后捕获 agent 在 cwd 下、启动时刻之后新生成的会话 id（前端关联终端用）。
 #[tauri::command]
-fn capture_session_ids(agent: String, cwd: String, since_ms: i64) -> Vec<String> {
-    sessions::capture_session_ids(&agent, &cwd, since_ms)
+async fn capture_session_ids(agent: String, cwd: String, since_ms: i64) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || sessions::capture_session_ids(&agent, &cwd, since_ms))
+        .await
+        .map_err(|error| format!("会话捕获任务失败：{error}"))
 }
 
 /// 按 PTY 精确认领 session：claude 走 sessions/<pid>.json；其他 Agent 走子树进程创建时间↔会话 createdAt。
 #[tauri::command]
-fn map_agent_sessions_by_pty(
+async fn map_agent_sessions_by_pty(
     agent: String,
     cwd: String,
     since_ms: i64,
     pty_pids: Vec<u32>,
-) -> Vec<sessions::PtySessionMap> {
-    sessions::map_agent_sessions_by_pty(&agent, &cwd, since_ms, &pty_pids)
+) -> Result<Vec<sessions::PtySessionMap>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        sessions::map_agent_sessions_by_pty(&agent, &cwd, since_ms, &pty_pids)
+    })
+    .await
+    .map_err(|error| format!("会话认领任务失败：{error}"))
 }
 
 /// 兼容旧前端：等同 `map_agent_sessions_by_pty("claude", …)`。
 #[tauri::command]
-fn map_claude_sessions_by_pty(
+async fn map_claude_sessions_by_pty(
     cwd: String,
     since_ms: i64,
     pty_pids: Vec<u32>,
-) -> Vec<sessions::PtySessionMap> {
-    sessions::map_claude_sessions_by_pty(&cwd, since_ms, &pty_pids)
+) -> Result<Vec<sessions::PtySessionMap>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        sessions::map_claude_sessions_by_pty(&cwd, since_ms, &pty_pids)
+    })
+    .await
+    .map_err(|error| format!("Claude 会话认领任务失败：{error}"))
 }
 
 /// M7-A：返回本地 MCP broker 的端点 URL（agent 的 .mcp.json 指向它）。
@@ -1735,6 +1769,7 @@ pub fn run() {
             list_kimi_sessions,
             list_hermes_sessions,
             list_grok_sessions,
+            list_agent_sessions_batch,
             delete_claude_session,
             delete_codex_session,
             delete_opencode_session,

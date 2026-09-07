@@ -1,14 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
-  listClaudeSessions,
-  listCodexSessions,
-  listOpenCodeSessions,
-  listCursorSessions,
-  listKimiSessions,
-  listHermesSessions,
-  listGrokSessions,
   deleteClaudeSession,
   deleteCodexSession,
   deleteOpenCodeSession,
@@ -23,9 +15,7 @@ import {
 } from "../catalog";
 import { openTerminalCmd } from "../dockBus";
 import { launchCmdFor } from "../profiles";
-import { getSettings } from "../settings";
-import { perfRescan } from "../perf/perfHud";
-import { scheduleSessionRefresh } from "../sessionRefreshThrottle";
+import { refreshSessionList, subscribeSessionList } from "../sessionRefreshThrottle";
 import { KimiIcon } from "./ProfileIcon";
 import { searchMatch } from "../search";
 import SearchBox from "./ui/SearchBox";
@@ -33,7 +23,6 @@ import { Pager } from "./htyenv/sections/shared";
 import ContextMenu, { MENU_SEP } from "./ui/ContextMenu";
 import TransferNotice, { type TransferNoticeValue } from "./ui/TransferNotice";
 import { getSessionTitle, setSessionTitle, onSessionTitlesChange } from "../sessionTitles";
-import { setNativeSessionLabels } from "../sessionNativeLabels";
 import { getWsState, setWsState } from "../wsState";
 import { getSessionTags, getSessionTagIds, useTagStore, clearSession, sessionKey } from "../sessionTags";
 import { tagDot } from "../tagColors";
@@ -110,7 +99,7 @@ const SESS_PAGE_SIZE = 20;
 
 export default function SessionPanel({ root, workspaceId }: { root: string; workspaceId: string }) {  const [agentKind, setAgentKindState] = useState<SessionAgentKind>(() => readAgent(root));
   const [list, setList] = useState<SessionRef[] | null>(null);
-  const loadSeq = useRef(0); // 初始/手动/watcher 重拉共用代际，旧请求不得覆盖新名称
+  const loadSeq = useRef(0); // 订阅代际：切工作区/Agent 后旧回调不得覆盖当前列表
   const setAgentKind = (a: SessionAgentKind) => {
     if (a === agentKind) return;
     loadSeq.current += 1;
@@ -174,86 +163,33 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
   effectiveTagIdsRef.current = effectiveTagIds;
 
   const load = useCallback((kind: SessionAgentKind, silent = false) => {
-    const seq = ++loadSeq.current;
-    if (!silent) setList(null);
+    if (!silent && kind === agentKind) setList(null);
     if (!root) {
-      if (seq === loadSeq.current) setList([]);
+      setList([]);
       return;
     }
-    const fetcher =
-      kind === "claude"
-        ? listClaudeSessions
-        : kind === "codex"
-          ? listCodexSessions
-          : kind === "opencode"
-            ? listOpenCodeSessions
-          : kind === "kimi"
-            ? listKimiSessions
-            : kind === "hermes"
-              ? listHermesSessions
-              : kind === "grok"
-                ? listGrokSessions
-                : listCursorSessions;
-    const scanT0 = getSettings().perfHud ? performance.now() : 0; // 性能探针(plan-1)：会话重扫计时
-    fetcher(root)
-      .then((next) => {
-        if (getSettings().perfHud) perfRescan(performance.now() - scanT0);
-        if (seq !== loadSeq.current) return;
-        setNativeSessionLabels(
-          kind,
-          next.map((s) => ({ id: s.id, label: s.label })),
-        );
-        setList(next);
-      })
-      .catch(() => {
-        if (seq === loadSeq.current) {
-          setList((prev) => (silent && prev !== null ? prev : []));
-        }
-      });
-  }, [root]);
+    refreshSessionList(kind, root);
+  }, [root, agentKind]);
   useEffect(() => {
-    load(agentKind);
-  }, [agentKind, load]);
-  // Claude ai-title / Codex index·rollout / Cursor meta.json / Kimi state.json 落盘后，后端 watcher 发事件；
-  // Session 页签静默重拉（不置 loading，避免列表闪烁/滚动位置跳回顶部）。
-  useEffect(() => {
-    const evt =
-      agentKind === "claude"
-        ? "claude-sessions-changed"
-        : agentKind === "codex"
-          ? "codex-sessions-changed"
-          : agentKind === "opencode"
-            ? "opencode-sessions-changed"
-          : agentKind === "cursor"
-            ? "cursor-sessions-changed"
-            : agentKind === "kimi"
-              ? "kimi-sessions-changed"
-              : agentKind === "hermes"
-                ? "hermes-sessions-changed"
-                : agentKind === "grok"
-                  ? "grok-sessions-changed"
-                  : null;
-    if (!evt) return;
-    let un: (() => void) | undefined;
-    let disposed = false;
-    listen(evt, () => {
-      // plan-3：agent 运行期退避为 3s trailing + 结束终扫;非运行期直通(现状灵敏度)
-      if (!disposed)
-        scheduleSessionRefresh(`${agentKind}\0${workspaceId}`, workspaceId, () =>
-          load(agentKind, true),
-        );
-    }).then((u) => {
-      if (disposed) u();
-      else {
-        un = u;
-        load(agentKind, true); // 注册完成后补拉一次，关闭首次 load 与 listener 就绪间的丢事件窗口
-      }
+    const seq = ++loadSeq.current;
+    setList(null);
+    if (!root) {
+      setList([]);
+      return;
+    }
+    const unsubscribe = subscribeSessionList(agentKind, root, workspaceId, {
+      onData: (next) => {
+        if (seq === loadSeq.current) setList(next);
+      },
+      onError: () => {
+        if (seq === loadSeq.current) setList((previous) => previous ?? []);
+      },
     });
     return () => {
-      disposed = true;
-      un?.();
+      unsubscribe();
+      if (seq === loadSeq.current) loadSeq.current += 1;
     };
-  }, [agentKind, load]);
+  }, [agentKind, root, workspaceId]);
 
   const resume = (s: SessionRef) => {
     // 复原命令统一收敛到 launchCmdFor（决策3），不再手搓字符串——三种 agent 只用改一处。
@@ -344,6 +280,7 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
     }
   };
   const del = async (s: SessionRef) => {
+    const seq = loadSeq.current;
     try {
       if (agentKind === "claude") await deleteClaudeSession(s.id);
       else if (agentKind === "codex") await deleteCodexSession(s.path);
@@ -353,10 +290,15 @@ export default function SessionPanel({ root, workspaceId }: { root: string; work
       else if (agentKind === "grok") await deleteGrokSession(s.path);
       else await deleteCursorSession(s.path);
       // 乐观移除：直接从列表剔除该项，避免整列重载导致滚动条跳回顶部
-      setList((prev) => (prev ? prev.filter((x) => x.id !== s.id) : prev));
+      if (seq === loadSeq.current) {
+        setList((prev) => (prev ? prev.filter((x) => x.id !== s.id) : prev));
+      }
+      refreshSessionList(agentKind, root);
       clearSession(sessionKey(agentKind, s.id)); // 删除会话 → 清其 tag 关联（词表保留，供他会话用）
     } catch (error) {
-      setNotice({ tone: "error", message: `删除会话失败：${String(error)}` });
+      if (seq === loadSeq.current) {
+        setNotice({ tone: "error", message: `删除会话失败：${String(error)}` });
+      }
     }
   };
   const favKey = (s: SessionRef) => `${agentKind}:${s.id}`;

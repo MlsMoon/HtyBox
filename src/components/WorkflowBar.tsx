@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { focusEngine, injectAndSubmit } from "./terminalEngine";
 import { injectText, type AgentKind, type DragItem } from "../profiles";
@@ -50,10 +50,11 @@ function applyCaret(
   setText: (t: string) => void,
   ta: HTMLTextAreaElement | null | undefined,
   next: { text: string; cursor: number },
+  canInteract: () => boolean,
 ) {
   setText(next.text);
   requestAnimationFrame(() => {
-    if (!ta) return;
+    if (!ta?.isConnected || !canInteract()) return;
     ta.focus();
     ta.setSelectionRange(next.cursor, next.cursor);
   });
@@ -107,10 +108,12 @@ export default function WorkflowBar({
   termId,
   cwd,
   agentKind,
+  canInteract,
 }: {
   termId: string;
   cwd?: string;
   agentKind?: AgentKind;
+  canInteract: () => boolean;
 }) {
   const run = useRun(termId);
   const settings = useSettings();
@@ -131,6 +134,9 @@ export default function WorkflowBar({
   const [caret, setCaret] = useState(0);
   const [activeSeg, setActiveSeg] = useState<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const focusInput = useCallback(() => {
+    if (canInteract() && taRef.current?.isConnected) taRef.current.focus();
+  }, [canInteract]);
   const ranThisStage = useRef(false);
   const autoExecRef = useRef(-1);
   const autoAdvRef = useRef(-1);
@@ -174,23 +180,23 @@ export default function WorkflowBar({
   useEffect(() => {
     if (!run && freeOpen && focusFreeRef.current) {
       focusFreeRef.current = false;
-      requestAnimationFrame(() => taRef.current?.focus());
+      requestAnimationFrame(focusInput);
     }
-  }, [run, freeOpen]);
+  }, [run, freeOpen, focusInput]);
 
   // 快捷键：无 run → 切换自由输入；有 run → 展开工作流输入并聚焦
   useEffect(() => {
     return onTermInputHotkey((id) => {
-      if (id !== termId) return;
+      if (id !== termId || !canInteract()) return;
       if (!run) {
         const next = toggleFreeInput(termId);
         if (next) focusFreeRef.current = true;
         return;
       }
       setInputOverride(true);
-      requestAnimationFrame(() => taRef.current?.focus());
+      requestAnimationFrame(focusInput);
     });
-  }, [termId, run]);
+  }, [termId, run, canInteract, focusInput]);
 
   // 换阶段：清分段输入与暂存（主输入 draft 保留，与原行为一致）
   useEffect(() => {
@@ -266,7 +272,7 @@ export default function WorkflowBar({
       const restored = takeStash(stashRef.current, FIELD_DRAFT);
       setDraft(restored ?? "");
       touchStash();
-      taRef.current?.focus();
+      focusInput();
     };
     const pasteImageProbe = () => {
       if (!cwd) return;
@@ -293,7 +299,7 @@ export default function WorkflowBar({
         const ref = injectText(item, agentKind ?? "shell");
         if (!ref) return;
         setDraft((d) => (!d ? ref : /\s$/.test(d) ? d + ref : d + " " + ref));
-        taRef.current?.focus();
+        focusInput();
       } catch {
         /* ignore */
       }
@@ -324,10 +330,11 @@ export default function WorkflowBar({
           onCaret={(v, el) => syncCaret(v, el, null)}
           onKeyDown={(e) => {
             e.stopPropagation();
+            if (!canInteract()) { e.preventDefault(); return; }
             if (onStashKey(e, FIELD_DRAFT, draft, setDraft)) return;
             const r = slash.handleKey(e, draft);
             if (r.handled) {
-              if (r.next) applyCaret(setDraft, taRef.current, r.next);
+              if (r.next) applyCaret(setDraft, taRef.current, r.next, canInteract);
               return;
             }
             if (e.key === "Enter" && !e.shiftKey) {
@@ -347,7 +354,7 @@ export default function WorkflowBar({
             deleteEntry(p).catch(() => {});
           }}
           onDropItem={onInputDrop}
-          menu={slashMenu(draft, (next) => applyCaret(setDraft, taRef.current, next))}
+          menu={slashMenu(draft, (next) => applyCaret(setDraft, taRef.current, next, canInteract))}
         />
         <div className="flex h-[28px] items-center justify-end gap-2 bg-[#24211e] px-3">
           <button
@@ -410,7 +417,7 @@ export default function WorkflowBar({
     const restored = takeStash(stashRef.current, FIELD_DRAFT);
     setDraft(restored ?? "");
     touchStash();
-    taRef.current?.focus();
+    focusInput();
   };
   const onInputDrop = (e: React.DragEvent) => {
     setDragOver(false);
@@ -423,7 +430,7 @@ export default function WorkflowBar({
       const ref = injectText(item, agentKind ?? "shell");
       if (!ref) return;
       setDraft((d) => (!d ? ref : /\s$/.test(d) ? d + ref : d + " " + ref));
-      taRef.current?.focus();
+      focusInput();
     } catch {
       /* ignore */
     }
@@ -558,10 +565,11 @@ export default function WorkflowBar({
                 onCaret={(v, el) => syncCaret(v, el, plainSegId)}
                 onKeyDown={(e) => {
                   e.stopPropagation();
+                  if (!canInteract()) { e.preventDefault(); return; }
                   if (onStashKey(e, plainSegId, plainText, (t) => setSegText(plainSegId, t))) return;
                   const r = slash.handleKey(e, plainText);
                   if (r.handled) {
-                    if (r.next) applyCaret((t) => setSegText(plainSegId, t), taRef.current, r.next);
+                    if (r.next) applyCaret((t) => setSegText(plainSegId, t), taRef.current, r.next, canInteract);
                     return;
                   }
                   if (e.key === "Enter" && !e.shiftKey) {
@@ -579,7 +587,7 @@ export default function WorkflowBar({
                 onRemoveAttachment={(p) => removeSegAtt(plainSegId, p)}
                 onDropItem={(e) => onSegDrop(plainSegId, e)}
                 menu={slashMenu(plainText, (next) =>
-                  applyCaret((t) => setSegText(plainSegId, t), taRef.current, next),
+                  applyCaret((t) => setSegText(plainSegId, t), taRef.current, next, canInteract),
                 )}
               />
             ) : (
@@ -628,14 +636,16 @@ export default function WorkflowBar({
                           onKeyUp={(e) => syncCaret(segVal(seg.id).text, e.currentTarget, seg.id)}
                           onKeyDown={(e) => {
                             e.stopPropagation();
+                            if (!canInteract()) { e.preventDefault(); return; }
                             const text = segVal(seg.id).text;
                             if (onStashKey(e, seg.id, text, (t) => setSegText(seg.id, t))) return;
                             const r = slash.handleKey(e, text);
                             if (r.handled) {
                               if (r.next) {
                                 setSegText(seg.id, r.next.text);
+                                const el = e.currentTarget;
                                 requestAnimationFrame(() => {
-                                  const el = e.currentTarget;
+                                  if (!el.isConnected || !canInteract()) return;
                                   el.setSelectionRange(r.next!.cursor, r.next!.cursor);
                                   setCaret(r.next!.cursor);
                                 });
@@ -700,10 +710,11 @@ export default function WorkflowBar({
               onCaret={(v, el) => syncCaret(v, el, null)}
               onKeyDown={(e) => {
                 e.stopPropagation();
+                if (!canInteract()) { e.preventDefault(); return; }
                 if (onStashKey(e, FIELD_DRAFT, draft, setDraft)) return;
                 const r = slash.handleKey(e, draft);
                 if (r.handled) {
-                  if (r.next) applyCaret(setDraft, taRef.current, r.next);
+                  if (r.next) applyCaret(setDraft, taRef.current, r.next, canInteract);
                   return;
                 }
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -720,7 +731,7 @@ export default function WorkflowBar({
               attachments={attachments}
               onRemoveAttachment={removeAttachment}
               onDropItem={onInputDrop}
-              menu={slashMenu(draft, (next) => applyCaret(setDraft, taRef.current, next))}
+              menu={slashMenu(draft, (next) => applyCaret(setDraft, taRef.current, next, canInteract))}
             />
           )}
         </>
