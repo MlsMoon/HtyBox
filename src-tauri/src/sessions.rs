@@ -1046,6 +1046,20 @@ fn codex_label(native_title: Option<&String>, fallback: String) -> String {
     })
 }
 
+/// codex 0.15x 起子代理(thread_spawn)线程也写独立 rollout(同 cwd):首行 session_meta
+/// `thread_source=="subagent"` 或 `source.subagent` 为对象。它们是 CLI 内部线程(非用户会话,
+/// 复原无意义),列表与认领候选一律排除;旧版 CLI 无这两个字段 → 视为用户会话(向后兼容)。
+fn is_codex_subagent_thread(payload: &serde_json::Value) -> bool {
+    if payload.get("thread_source").and_then(|v| v.as_str()) == Some("subagent") {
+        return true;
+    }
+    payload
+        .get("source")
+        .and_then(|s| s.get("subagent"))
+        .map(|v| v.is_object())
+        .unwrap_or(false)
+}
+
 pub(crate) fn validate_codex_relative_path(relative: &Path, id: &str) -> Result<(), String> {
     let parts: Vec<_> = relative
         .components()
@@ -1279,6 +1293,9 @@ fn scan_codex_sessions(home_dir: &Path, batch: &mut SessionBatch) {
             continue;
         }
         let payload = meta.get("payload");
+        if payload.map(is_codex_subagent_thread).unwrap_or(false) {
+            continue;
+        }
         let targets = payload
             .and_then(|p| p.get("cwd"))
             .and_then(|c| c.as_str())
@@ -2441,7 +2458,7 @@ pub fn map_claude_sessions_by_pty(
         if used_sessions.contains(&hit.id) {
             continue;
         }
-        let Some(pty) = find_ancestor_in(hit.pid, &want, &snap.parents) else {
+        let Some(pty) = find_ancestor_in(hit.pid, &want, &snap) else {
             continue;
         };
         if !used_pty.insert(pty) {
@@ -2484,11 +2501,35 @@ fn scan_opencode_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
     hits
 }
 
+/// codex rollout 文件名时间戳（`rollout-YYYY-MM-DDTHH-MM-SS-<id>.jsonl`，本地时间、秒精度）。
+/// 0.153.x 起 rollout 文件拖到首轮（首条消息提交）才落盘：session_meta 的 timestamp = 首轮时刻，
+/// 文件名时间戳才是"会话开始"（≈ agent 进程启动 + TUI 开机秒数）。认领匹配必须用后者——
+/// 否则用户慢发首条消息，meta created 与进程启动的差值会撑爆 Pass 2 的 120s 窗口。
+fn codex_rollout_filename_ms(name: &str) -> Option<i64> {
+    let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let fmt = time::format_description::parse_borrowed::<2>(
+        "[year]-[month]-[day]T[hour]-[minute]-[second]",
+    )
+    .ok()?;
+    let naive = time::PrimitiveDateTime::parse(stem.get(..19)?, &fmt).ok()?;
+    let offset = time::UtcOffset::current_local_offset().ok()?;
+    Some(naive.assume_offset(offset).unix_timestamp() * 1000)
+}
+
 fn scan_codex_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
     let Some(h) = home() else {
         return Vec::new();
     };
-    let root = h.join(".codex").join("sessions");
+    scan_codex_session_times_in(&h, cwd, since_ms)
+}
+
+/// 测试 / 认领同源：在给定 home 下扫 codex rollout 的 (id, created)，升序；子代理线程除外。
+pub(crate) fn scan_codex_session_times_in(
+    home_dir: &Path,
+    cwd: &str,
+    since_ms: i64,
+) -> Vec<(String, i64)> {
+    let root = home_dir.join(".codex").join("sessions");
     if !root.is_dir() {
         return Vec::new();
     }
@@ -2523,6 +2564,9 @@ fn scan_codex_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
             continue;
         }
         let payload = meta.get("payload");
+        if payload.map(is_codex_subagent_thread).unwrap_or(false) {
+            continue;
+        }
         if payload
             .and_then(|pl| pl.get("cwd"))
             .and_then(|c| c.as_str())
@@ -2534,16 +2578,22 @@ fn scan_codex_session_times(cwd: &str, since_ms: i64) -> Vec<(String, i64)> {
         let Some(id) = payload.and_then(|pl| pl.get("id")).and_then(|i| i.as_str()) else {
             continue;
         };
-        let created = payload
+        // 匹配基准时间：文件名时间戳（会话开始）优先，meta created（0.153.x 起=首轮时刻）兜底。
+        let meta_created = payload
             .and_then(|pl| pl.get("timestamp"))
             .and_then(|t| t.as_str())
             .map(rfc3339_ms)
             .filter(|&t| t > 0)
             .unwrap_or(mt);
-        if created < since_ms {
+        let started = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(codex_rollout_filename_ms)
+            .unwrap_or(meta_created);
+        if started < since_ms {
             continue;
         }
-        hits.push((id.to_string(), created));
+        hits.push((id.to_string(), started));
     }
     hits.sort_by_key(|(_, t)| *t);
     hits
@@ -2805,7 +2855,7 @@ fn session_id_from_pty_cmdline(
     snap: &ProcSnap,
     valid: &HashSet<String>,
 ) -> Option<String> {
-    for pid in descendant_pids(pty_pid, &snap.parents) {
+    for pid in descendant_pids(pty_pid, snap) {
         let Some(cmd) = process_command_line_from_snapshot(pid, snap) else {
             continue;
         };
@@ -3012,24 +3062,40 @@ fn unix_process_snapshot() -> ProcSnap {
     snap
 }
 
-/// 从 pid 沿父链向上，若命中 `want` 中任一祖先则返回该祖先 pid。
-fn find_ancestor_in(pid: u32, want: &HashSet<u32>, parents: &HashMap<u32, u32>) -> Option<u32> {
+/// 父子边真实性校验（pid 复用防护）：合法父子恒有 child.created >= parent.created
+/// （父必先于子存在）；child.created < parent.created 只可能是父 pid 死后被 Windows 回收复用、
+/// 子的 ParentProcessId 还指着旧 pid —— 假边，返回 true。任一侧创建时间不可得 → false（宽松留边，不误伤）。
+fn stale_parent_edge(child: u32, parent: u32, snap: &ProcSnap) -> bool {
+    match (
+        process_creation_ms_from_snapshot(child, snap),
+        process_creation_ms_from_snapshot(parent, snap),
+    ) {
+        (Some(tc), Some(tp)) => tc < tp,
+        _ => false,
+    }
+}
+
+/// 从 pid 沿父链向上，若命中 `want` 中任一祖先则返回该祖先 pid；遇 pid 复用假边即中断。
+fn find_ancestor_in(pid: u32, want: &HashSet<u32>, snap: &ProcSnap) -> Option<u32> {
     let mut cur = pid;
     for _ in 0..64 {
         if want.contains(&cur) {
             return Some(cur);
         }
-        cur = *parents.get(&cur)?;
-        if cur == 0 {
-            break;
+        let parent = *snap.parents.get(&cur)?;
+        if parent == 0 || stale_parent_edge(cur, parent, snap) {
+            return None;
         }
+        cur = parent;
     }
     None
 }
 
-fn descendant_pids(root: u32, parents: &HashMap<u32, u32>) -> Vec<u32> {
+/// PTY 子树遍历（BFS）。遇 pid 复用假边（子比"父"早出生）断边不递归——
+/// 否则已关闭终端残留的孤儿 agent 会被误挂到复用了旧 pid 的新终端子树下。
+fn descendant_pids(root: u32, snap: &ProcSnap) -> Vec<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (&pid, &ppid) in parents {
+    for (&pid, &ppid) in &snap.parents {
         children.entry(ppid).or_default().push(pid);
     }
     let mut out = Vec::new();
@@ -3037,6 +3103,9 @@ fn descendant_pids(root: u32, parents: &HashMap<u32, u32>) -> Vec<u32> {
     while let Some(p) = stack.pop() {
         if let Some(chs) = children.get(&p) {
             for &c in chs {
+                if stale_parent_edge(c, p, snap) {
+                    continue;
+                }
                 out.push(c);
                 stack.push(c);
             }
@@ -3047,7 +3116,7 @@ fn descendant_pids(root: u32, parents: &HashMap<u32, u32>) -> Vec<u32> {
 
 /// 选 PTY 子树中的**主** agent 进程（排除 cursor/codex 的 worker node）。
 fn pick_agent_main_pid(agent: &str, pty_pid: u32, snap: &ProcSnap) -> Option<u32> {
-    let desc = descendant_pids(pty_pid, &snap.parents);
+    let desc = descendant_pids(pty_pid, snap);
     if desc.is_empty() {
         return None;
     }
@@ -3415,7 +3484,7 @@ mod tests {
         grok_bucket_matches_cwd, list_codex_sessions_in, list_grok_sessions_in,
         list_kimi_sessions_in, locate_claude_session_in, locate_codex_session_in,
         locate_cursor_session_in, parse_codex_session_titles, query_opencode_sessions_in,
-        scan_grok_session_times_in, scan_kimi_session_times_in, validate_codex_relative_path,
+        scan_codex_session_times_in, scan_grok_session_times_in, scan_kimi_session_times_in, validate_codex_relative_path,
         validate_opencode_session_id, validate_session_id, ExistingPathKind,
         MAX_OPENCODE_SESSIONS,
     };
@@ -4337,6 +4406,114 @@ mod tests {
     }
 
     #[test]
+    fn codex_subagent_threads_are_excluded_from_list_and_capture_scan() {
+        const USER_A: &str = "11111111-1111-4111-8111-111111111111";
+        const USER_B: &str = "22222222-2222-4222-8222-222222222222";
+        const SUB_A: &str = "33333333-3333-4333-8333-333333333333";
+        const SUB_B: &str = "44444444-4444-4444-8444-444444444444";
+        let ctx = test_home();
+        let cwd = path_text(&ctx.workspace);
+        let dir = ctx
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("08");
+        let write = |id: &str, time: &str, payload: Value| {
+            write_json_lines(
+                &dir.join(format!("rollout-2026-09-08T{}-{}.jsonl", time.replace(':', "-"), id)),
+                &[json!({"type": "session_meta", "payload": payload})],
+            );
+        };
+        // 用户会话:新版带 thread_source=user;旧版无 thread_source/source 字段(向后兼容)
+        write(USER_A, "12:00:00", json!({"id": USER_A, "cwd": cwd, "cli_version": "0.153.4", "timestamp": "2026-09-08T12:00:00.000Z", "thread_source": "user"}));
+        write(USER_B, "12:01:00", json!({"id": USER_B, "cwd": cwd, "cli_version": "0.101.0", "timestamp": "2026-09-08T12:01:00.000Z"}));
+        // 子代理线程:thread_source=subagent;仅 source.subagent 标记
+        write(SUB_A, "12:02:00", json!({"id": SUB_A, "cwd": cwd, "cli_version": "0.153.4", "timestamp": "2026-09-08T12:02:00.000Z", "thread_source": "subagent", "source": {"subagent": {"thread_spawn": {"parent_thread_id": USER_A, "depth": 1}}}}));
+        write(SUB_B, "12:03:00", json!({"id": SUB_B, "cwd": cwd, "cli_version": "0.153.4", "timestamp": "2026-09-08T12:03:00.000Z", "source": {"subagent": {"thread_spawn": {"parent_thread_id": USER_A, "depth": 1}}}}));
+
+        let listed_sessions = list_codex_sessions_in(&ctx.home, &cwd);
+        let mut listed: Vec<&str> = listed_sessions.iter().map(|s| s.id.as_str()).collect();
+        listed.sort_unstable();
+        assert_eq!(listed, [USER_A, USER_B], "列表只应剩用户会话,子代理线程不得出现");
+
+        let times = scan_codex_session_times_in(&ctx.home, &cwd, 0);
+        let ids: Vec<&str> = times.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, [USER_A, USER_B], "认领候选只应剩用户会话且按 created 升序");
+    }
+
+    #[test]
+    fn codex_rollout_filename_ms_parses_local_timestamp() {
+        let a = super::codex_rollout_filename_ms("rollout-2026-09-08T10-00-00-x.jsonl")
+            .expect("合法文件名应可解析");
+        let b = super::codex_rollout_filename_ms("rollout-2026-09-08T10-01-30-x.jsonl")
+            .expect("合法文件名应可解析");
+        assert_eq!(b - a, 90_000, "90 秒差与时区无关,必须精确");
+        assert_eq!(super::codex_rollout_filename_ms("rollout-bad.jsonl"), None);
+        assert_eq!(super::codex_rollout_filename_ms("other.jsonl"), None);
+    }
+
+    #[test]
+    fn codex_capture_scan_matches_on_filename_start_time_not_first_turn_meta() {
+        // 0.153.x 语义:文件名时间戳=会话开始(≈进程启动),meta timestamp=首轮落盘时刻;
+        // 用户慢发首条消息时两者可差数小时,认领匹配必须用前者,否则撑爆 Pass 2 时间窗。
+        let ctx = test_home();
+        let cwd = path_text(&ctx.workspace);
+        let dir = ctx
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("08");
+        let file_name = format!("rollout-2026-09-08T10-00-00-{TEST_ID}.jsonl");
+        write_json_lines(
+            &dir.join(&file_name),
+            &[json!({"type": "session_meta", "payload": {
+                "id": TEST_ID,
+                "cwd": cwd,
+                "cli_version": "0.153.4",
+                "timestamp": "2026-09-08T18:30:00.000Z",
+                "thread_source": "user"
+            }})],
+        );
+        let filename_ms =
+            super::codex_rollout_filename_ms(&file_name).expect("文件名时间戳应可解析");
+        let times = scan_codex_session_times_in(&ctx.home, &cwd, 0);
+        assert_eq!(
+            times,
+            vec![(TEST_ID.to_string(), filename_ms)],
+            "匹配基准须取文件名时间戳而非 meta 首轮时刻"
+        );
+
+        // 文件名解析失败 → 回退 meta created(旧版语义)
+        let legacy_name = format!("rollout-badname-{OTHER_ID}.jsonl");
+        write_json_lines(
+            &dir.join(&legacy_name),
+            &[json!({"type": "session_meta", "payload": {
+                "id": OTHER_ID,
+                "cwd": cwd,
+                "cli_version": "0.101.0",
+                "timestamp": "2026-09-08T02:30:00.000Z"
+            }})],
+        );
+        let meta_ms = super::rfc3339_ms("2026-09-08T02:30:00.000Z");
+        let times = scan_codex_session_times_in(&ctx.home, &cwd, 0);
+        assert!(
+            times.contains(&(OTHER_ID.to_string(), meta_ms)),
+            "文件名不可解析时应回退 meta created: {times:?}"
+        );
+
+        // since 过滤也按文件名时间戳:旧会话(文件名早于 since)不得被新终端误领
+        let times = scan_codex_session_times_in(&ctx.home, &cwd, filename_ms + 1);
+        assert!(
+            !times.iter().any(|(id, _)| id == TEST_ID),
+            "文件名时间戳早于 since 的会话须被过滤: {times:?}"
+        );
+    }
+
+    #[test]
     fn cursor_native_title_wins_and_fallback_remains_available() {
         assert_eq!(
             cursor_label(Some("原生标题"), Some("首条prompt".into())),
@@ -4640,5 +4817,67 @@ mod tests {
             super::session_id_from_pty_cmdline("kimi", pty, &snap, &valid).as_deref(),
             Some(sid.as_str())
         );
+    }
+
+    #[test]
+    fn descendant_pids_prunes_pid_reuse_stale_edges() {
+        // 新终端 shell(10,创建于 1000) → node(11) → codex(12);
+        // 孤儿 node(13,创建于 500) ParentProcessId 指着 10 —— 但 10 的现任占用者(1000)晚于 13(500)
+        // → 10→13 是 pid 复用假边,孤儿子树(13,14)不得混入新终端子树。
+        let parents: HashMap<u32, u32> = [(11, 10), (12, 11), (13, 10), (14, 13)]
+            .into_iter()
+            .collect();
+        let started_at: HashMap<u32, i64> = [
+            (10, 1_000),
+            (11, 2_000),
+            (12, 2_100),
+            (13, 500),
+            (14, 600),
+        ]
+        .into_iter()
+        .collect();
+        let snap = super::ProcSnap {
+            parents,
+            names: HashMap::new(),
+            commands: HashMap::new(),
+            started_at,
+        };
+        let mut desc = super::descendant_pids(10, &snap);
+        desc.sort_unstable();
+        assert_eq!(desc, [11, 12], "pid 复用假边须被断掉,孤儿子树不得混入");
+
+        // 创建时间不可得(权限/查询失败)时保持宽松:不断边
+        let snap_no_times = super::ProcSnap {
+            parents: [(15, 10)].into_iter().collect(),
+            names: HashMap::new(),
+            commands: HashMap::new(),
+            started_at: HashMap::new(),
+        };
+        assert_eq!(
+            super::descendant_pids(10, &snap_no_times),
+            [15],
+            "取不到创建时间时保留边"
+        );
+    }
+
+    #[test]
+    fn find_ancestor_stops_at_pid_reuse_stale_edge() {
+        let want: HashSet<u32> = [20].into_iter().collect();
+        // 假边:父(20)比子(21)晚出生 → 上爬中断,不得命中
+        let stale = super::ProcSnap {
+            parents: [(21, 20)].into_iter().collect(),
+            names: HashMap::new(),
+            commands: HashMap::new(),
+            started_at: [(20, 2_000), (21, 1_000)].into_iter().collect(),
+        };
+        assert_eq!(super::find_ancestor_in(21, &want, &stale), None);
+        // 真边:父先于子 → 正常命中
+        let legit = super::ProcSnap {
+            parents: [(21, 20)].into_iter().collect(),
+            names: HashMap::new(),
+            commands: HashMap::new(),
+            started_at: [(20, 1_000), (21, 2_000)].into_iter().collect(),
+        };
+        assert_eq!(super::find_ancestor_in(21, &want, &legit), Some(20));
     }
 }

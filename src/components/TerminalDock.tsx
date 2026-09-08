@@ -303,10 +303,11 @@ async function captureSessionId(
   cwd: string,
   signal: AbortSignal,
 ): Promise<void> {
-  // 非 kimi：约 45s（Codex 冷启动 + 首条消息落盘可能慢于旧的 12s 窗口）。
   // kimi：活到 sid 绑定或面板关闭 abort——0.39 子进程命令行 / state.json 时序不保证落在 45s 内。
+  // codex：同款——0.153.x 起 rollout 文件拖到首轮(首条消息提交)才落盘(session_meta 才出现)，
+  // 用户慢发首条消息时 45s 窗口必然错过 → 永久卡"会话初始化中"；活到绑定/关闭为止。
   let i = 0;
-  const untilBound = agentKind === "kimi";
+  const untilBound = agentKind === "kimi" || agentKind === "codex";
   while (untilBound || i < 30) {
     i += 1;
     if (signal.aborted) return;
@@ -746,8 +747,10 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
     const sessionsUnlisten = isAgentTerminal(agentKind) && cwd
       ? subscribeSessionList(agentKind, cwd, wsOfTerm(termId), {
           onInvalidate: () => {
-            if (agentKind === "kimi" && !SESSION_IDS[termId]) {
-              void assignCapturedSessions("kimi", cwd);
+            // kimi/codex 的会话文件可能晚到(kimi state.json / codex 首轮才落盘 rollout)：
+            // 文件事件到达且未绑定时即时重认，不等下一轮轮询。
+            if ((agentKind === "kimi" || agentKind === "codex") && !SESSION_IDS[termId]) {
+              void assignCapturedSessions(agentKind, cwd);
             }
           },
         })
