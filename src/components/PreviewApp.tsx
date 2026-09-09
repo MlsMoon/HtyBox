@@ -13,6 +13,7 @@ import { emitTo, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import DockEditor, { adoptEditorBuf, collectEditorBuf, disposeEditorBuf, isEditorDirty } from "./DockEditor";
 import FileTypeIcon from "./ui/FileTypeIcon";
+import OverflowTabsMenu from "./OverflowTabsMenu";
 import WindowControls from "./WindowControls";
 import { EV_ADOPT, EV_CLOSED, EV_OPEN_FILE, EV_READY, type AdoptItem } from "../previewProtocol";
 import { SETTINGS_CHANGED, reloadSettings } from "../settings";
@@ -346,7 +347,13 @@ export default function PreviewApp({
               className="dockview-theme-light relative h-full w-full"
               onKeyDownCapture={onTabKeyDownCapture}
             >
-              <DockviewReact components={components} defaultTabComponent={PreviewTab} onReady={onReady} />
+              <DockviewReact
+                components={components}
+                defaultTabComponent={PreviewTab}
+                rightHeaderActionsComponent={OverflowTabsMenu}
+                disableTabsOverflowList
+                onReady={onReady}
+              />
               {empty && (
                 <div className="pointer-events-none absolute inset-0">
                   <Watermark name={workspaceName} />

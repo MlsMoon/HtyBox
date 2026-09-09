@@ -10,6 +10,7 @@ import {
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import FileTypeIcon from "./ui/FileTypeIcon";
+import OverflowTabsMenu from "./OverflowTabsMenu";
 import {
   ensureEngine,
   attachEngine,
@@ -1395,6 +1396,8 @@ export default function TerminalDock({
             components={components}
             defaultTabComponent={DockTab}
             watermarkComponent={DockWatermark}
+            rightHeaderActionsComponent={OverflowTabsMenu}
+            disableTabsOverflowList
             onReady={onReady}
           />
         </WorkspaceInteractive.Provider>
