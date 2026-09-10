@@ -429,3 +429,7 @@ export const htyenvLibrarySkills = (libraryDir?: string) =>
 /** 从库删除 skill(确认交互在调用侧)。 */
 export const htyenvLibraryDeleteSkill = (skillId: string, libraryDir?: string) =>
   invoke<void>("htyenv_library_delete_skill", { skillId, libraryDir: libraryDir || null });
+
+/** 从工作区删除 skill(canonical+薄壳+登记;确认交互在调用侧)。不改写全局库。 */
+export const htyenvDeleteWorkspaceSkill = (workspace: string, skillId: string) =>
+  invoke<void>("htyenv_delete_workspace_skill", { workspace, skillId });

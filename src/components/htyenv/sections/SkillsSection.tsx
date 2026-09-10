@@ -3,8 +3,10 @@
 // 页头「同步检查」切换检查态(再点退出)=薄壳对账 + UNREGISTERED/GHOST + 与全局库五态及批量操作。
 import { useMemo, useState } from "react";
 import ConfirmModal from "../../ui/ConfirmModal";
+import ContextMenu from "../../ui/ContextMenu";
 import {
   htyenvConflictBrief,
+  htyenvDeleteWorkspaceSkill,
   htyenvUpdateFromLibrary,
   htyenvBackflowToLibrary,
   type AdapterState,
@@ -78,6 +80,8 @@ export default function SkillsSection({
   const [results, setResults] = useState<Record<string, SyncOpResult>>({});
   const [inject, setInject] = useState<{ title: string; text: string } | null>(null);
   const [confirmForce, setConfirmForce] = useState<{ id: string; direction: "update" | "backflow" } | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<{ id: string; ghost: boolean } | null>(null);
 
   const adapterById = useMemo(() => {
     const m = new Map<string, Record<string, AdapterState>>();
@@ -113,6 +117,17 @@ export default function SkillsSection({
       const failed = list.filter((r) => r.error);
       if (failed.length > 0) setOpError(`${failed.length} 项未执行:${failed.map((f) => f.id).join("、")}(逐行看原因)`);
     })
+      .catch((e) => setOpError(String(e)))
+      .finally(() => {
+        setBusy(false);
+        reloadAll();
+      });
+  };
+
+  const runDelete = (id: string) => {
+    setBusy(true);
+    setOpError(null);
+    htyenvDeleteWorkspaceSkill(ws.path, id)
       .catch((e) => setOpError(String(e)))
       .finally(() => {
         setBusy(false);
@@ -225,10 +240,17 @@ export default function SkillsSection({
               </div>
             ))}
             {check.ghosts.map((id) => (
-              <div key={"g" + id} className="flex gap-2">
+              <div key={"g" + id} className="flex items-center gap-2">
                 <span className="rounded bg-[var(--danger)]/15 px-1.5 py-px text-[9px] font-semibold text-[var(--danger)]">GHOST</span>
                 <span className="font-mono text-[var(--text-2)]">{id}</span>
-                <span className="text-[var(--text-3)]">登记有而 canonical 无 → 人工决议后清账</span>
+                <span className="text-[var(--text-3)]">登记有而 canonical 无 → 清账删除登记与残留薄壳</span>
+                <button
+                  onClick={() => setConfirmDelete({ id, ghost: true })}
+                  disabled={busy}
+                  className="ml-auto rounded-md border border-[var(--danger)]/60 px-2.5 py-0.5 text-[10px] text-[var(--danger)] hover:bg-[var(--danger)]/10 disabled:opacity-40"
+                >
+                  清账
+                </button>
               </div>
             ))}
           </div>
@@ -249,7 +271,14 @@ export default function SkillsSection({
             const lin = lineageById.get(s.id);
             const r = results[s.id];
             return (
-              <div key={s.id} className="flex items-center gap-3 border-b border-[var(--border-soft)] py-2 last:border-b-0">
+              <div
+                key={s.id}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  if (!busy) setMenu({ x: e.clientX, y: e.clientY, id: s.id });
+                }}
+                className="flex items-center gap-3 border-b border-[var(--border-soft)] py-2 last:border-b-0"
+              >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <span className="truncate font-mono text-[12.5px] text-[var(--text)]">{s.id}</span>
@@ -366,6 +395,9 @@ export default function SkillsSection({
         )}
         <Pager page={page} pageCount={Math.max(1, Math.ceil(rows.length / PAGE_SIZE))} onPage={setPage} />
       </div>
+      <div className="text-[10px] text-[var(--text-faint)]">
+        删除工作区 skill:右键条目 →「删除」(危险操作不放悬停按钮)
+      </div>
 
       {inject && (
         <InjectModal wsId={slugify(ws.path)} text={inject.text} title={inject.title} onClose={() => setInject(null)} />
@@ -387,6 +419,30 @@ export default function SkillsSection({
             )
           }
           onClose={() => setConfirmForce(null)}
+        />
+      )}
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          items={[{ id: "delete", label: "从工作区删除", danger: true }]}
+          onAction={(id) => {
+            if (id === "delete") setConfirmDelete({ id: menu.id, ghost: false });
+          }}
+          onClose={() => setMenu(null)}
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmModal
+          title={confirmDelete.ghost ? `清账「${confirmDelete.id}」?` : `从工作区删除「${confirmDelete.id}」?`}
+          message={
+            confirmDelete.ghost
+              ? "将删除本工作区的登记与残留薄壳。全局库中的同名 skill（若有）不受影响。此操作不是下架。"
+              : "将删除本工作区的 canonical 真版、各 Agent 薄壳和登记。全局库中的同名 skill（若有）不受影响，之后可再取件。此操作不是下架。"
+          }
+          confirmText="删除"
+          onConfirm={() => runDelete(confirmDelete.id)}
+          onClose={() => setConfirmDelete(null)}
         />
       )}
     </div>

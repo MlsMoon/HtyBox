@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -349,6 +350,53 @@ pub fn apply_enabled_set(
     Ok((outcome, warnings))
 }
 
+/// 从工作区删除 skill(canonical + 各端薄壳 + manifest 登记;确认交互在前端)。
+/// 不改写全局库。库内仍有该 id 时,谱系对比归入 library_only,可再取件。
+/// 顺序=清薄壳 → 真版改名入回收 → 销账 → 清回收:任一步失败可重跑本函数自愈。
+/// 存在判定=canonical 目录 或 manifest 登记 或 任一端薄壳目录——覆盖 UNREGISTERED / GHOST / 残壳。
+pub fn delete_workspace_skill(workspace: &Path, skill_id: &str) -> Result<(), String> {
+    manifest::validate_skill_id(skill_id)?;
+    let mut m = manifest::load(workspace)?;
+    let roots = adapter_roots(workspace, &m)?;
+    let canonical = manifest::skill_dir(workspace, skill_id)?;
+    let adapter_dirs: Vec<PathBuf> = roots.iter().map(|(_, root)| root.join(skill_id)).collect();
+    let present = canonical.is_dir()
+        || m.skills.iter().any(|s| s.id == skill_id)
+        || adapter_dirs.iter().any(|d| d.is_dir());
+    if !present {
+        return Err(format!("工作区无 {skill_id}"));
+    }
+    for dir in &adapter_dirs {
+        if dir.is_dir() {
+            fs::remove_dir_all(dir).map_err(|e| format!("清除 {} 失败: {e}", dir.display()))?;
+        }
+    }
+    let mut trash = None;
+    if canonical.is_dir() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let parent = canonical
+            .parent()
+            .ok_or_else(|| format!("{} 无父目录", canonical.display()))?;
+        let dst = parent.join(format!(".htybox-trash-{nanos}"));
+        fs::rename(&canonical, &dst)
+            .map_err(|e| format!("移除 {} 失败: {e}", canonical.display()))?;
+        trash = Some(dst);
+    }
+    let before = m.skills.len();
+    m.skills.retain(|s| s.id != skill_id);
+    if m.skills.len() != before {
+        m.generated_utc = Some(manifest::now_utc_rfc3339()?);
+        manifest::save(workspace, &m)?;
+    }
+    if let Some(dst) = trash {
+        let _ = fs::remove_dir_all(&dst);
+    }
+    Ok(())
+}
+
 fn sync_one(
     workspace: &Path,
     manifest_data: &WorkflowManifest,
@@ -635,5 +683,104 @@ mod tests {
         assert!(check_adapters(tmp.path(), &m).is_err());
         m.providers.get_mut("claude").unwrap().adapter_dir = "C:/abs".into();
         assert!(check_adapters(tmp.path(), &m).is_err());
+    }
+
+    fn register_alpha(ws: &std::path::Path) {
+        let mut m = manifest::load(ws).unwrap();
+        let entry = ws.join(manifest::ENV_DIR).join("skills/alpha/SKILL.md");
+        let sha = manifest::sha256_file_upper(&entry).unwrap();
+        m.skills.push(manifest::SkillEntry {
+            id: "alpha".into(),
+            source_id: None,
+            entry_sha256: sha,
+            file_count: 2,
+            status: None,
+            enabled: None,
+            library_sha: None,
+            extra: serde_json::Map::new(),
+        });
+        manifest::save(ws, &m).unwrap();
+    }
+
+    #[test]
+    fn delete_workspace_skill_full_cycle() {
+        let (tmp, _m) = setup_env();
+        let ws = tmp.path();
+        register_alpha(ws);
+        let registered = manifest::load(ws).unwrap();
+        sync_adapters(ws, &registered).unwrap();
+        assert!(ws.join(".claude/skills/alpha/SKILL.md").is_file());
+        assert!(ws.join(".agents/skills/alpha/SKILL.md").is_file());
+
+        delete_workspace_skill(ws, "alpha").unwrap();
+        assert!(
+            !ws.join(manifest::ENV_DIR).join("skills/alpha").exists(),
+            "canonical 应移除"
+        );
+        assert!(!ws.join(".claude/skills/alpha").exists());
+        assert!(!ws.join(".agents/skills/alpha").exists());
+        let after = manifest::load(ws).unwrap();
+        assert!(after.skills.iter().all(|s| s.id != "alpha"));
+        let ids = super::super::list_skill_dirs(ws).unwrap();
+        assert!(!ids.iter().any(|id| id == "alpha"));
+        let report = check_adapters(ws, &after).unwrap();
+        assert!(report.skills.iter().all(|s| s.id != "alpha"));
+        assert!(report.orphan_shells.iter().all(|o| o.id != "alpha"));
+        let err = delete_workspace_skill(ws, "alpha").unwrap_err();
+        assert!(err.contains("工作区无"), "{err}");
+    }
+
+    #[test]
+    fn delete_workspace_skill_unregistered() {
+        let (tmp, _m) = setup_env();
+        let ws = tmp.path();
+        let before_len = manifest::load(ws).unwrap().skills.len();
+        assert!(ws.join(manifest::ENV_DIR).join("skills/alpha").is_dir());
+        delete_workspace_skill(ws, "alpha").unwrap();
+        assert!(!ws.join(manifest::ENV_DIR).join("skills/alpha").exists());
+        assert_eq!(manifest::load(ws).unwrap().skills.len(), before_len);
+    }
+
+    #[test]
+    fn delete_workspace_skill_ghost_and_stale_shell() {
+        let (tmp, _m) = setup_env();
+        let ws = tmp.path();
+        register_alpha(ws);
+        fs::create_dir_all(ws.join(".claude/skills/alpha")).unwrap();
+        fs::write(ws.join(".claude/skills/alpha/SKILL.md"), b"leftover").unwrap();
+        fs::remove_dir_all(ws.join(manifest::ENV_DIR).join("skills/alpha")).unwrap();
+        delete_workspace_skill(ws, "alpha").unwrap();
+        assert!(manifest::load(ws).unwrap().skills.iter().all(|s| s.id != "alpha"));
+        assert!(!ws.join(".claude/skills/alpha").exists());
+    }
+
+    #[test]
+    fn delete_workspace_skill_leaves_library_intact() {
+        let (tmp, _m) = setup_env();
+        let ws = tmp.path();
+        register_alpha(ws);
+        let libtmp = tempfile::tempdir().unwrap();
+        let lib = libtmp.path().join("global-env");
+        let collected = super::super::library::collect_skill(ws, &lib, "alpha").unwrap();
+        assert_eq!(collected.status, "collected");
+        delete_workspace_skill(ws, "alpha").unwrap();
+        let list = super::super::library::list_library_skills(&lib).unwrap();
+        assert!(list.iter().any(|s| s.id == "alpha"), "库内 alpha 应仍在");
+        let cmp = super::super::lineage::compare(ws, &lib).unwrap();
+        assert!(
+            cmp.library_only.iter().any(|id| id == "alpha"),
+            "工作区删后应归入 library_only: {:?}",
+            cmp.library_only
+        );
+    }
+
+    #[test]
+    fn delete_workspace_skill_rejects_path_id() {
+        let (tmp, _m) = setup_env();
+        let ws = tmp.path();
+        let canonical = ws.join(manifest::ENV_DIR).join("skills/alpha");
+        assert!(canonical.is_dir());
+        assert!(delete_workspace_skill(ws, "../x").unwrap_err().contains("路径"));
+        assert!(canonical.is_dir(), "非法 id 不得动盘");
     }
 }

@@ -791,6 +791,22 @@ async fn htyenv_library_delete_skill(
     .map_err(|error| format!("hty环境库删除任务失败：{error}"))?
 }
 
+/// hty环境:从工作区删除 skill(canonical+各端薄壳+登记;确认交互在前端)。不改写全局库。
+#[tauri::command]
+async fn htyenv_delete_workspace_skill(
+    app: tauri::AppHandle,
+    workspace: String,
+    skill_id: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        htyenv::adapters::delete_workspace_skill(std::path::Path::new(&workspace), &skill_id)
+    })
+    .await
+    .map_err(|error| format!("hty环境工作区删除任务失败：{error}"))??;
+    let _ = app.emit("skills-changed", ());
+    Ok(())
+}
+
 #[tauri::command]
 async fn export_session_archive(
     agent: String,
@@ -1724,6 +1740,7 @@ pub fn run() {
             htyenv_apply_enabled_set,
             htyenv_library_skills,
             htyenv_library_delete_skill,
+            htyenv_delete_workspace_skill,
             export_session_archive,
             import_session_archive,
             export_memory_archive,
