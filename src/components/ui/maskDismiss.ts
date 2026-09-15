@@ -8,6 +8,9 @@ import { useRef } from "react";
 export function useMaskDismiss(onDismiss: () => void) {
   const downOnMask = useRef(false);
   return {
+    // 弹层遮罩统一标记:终端焦点归位(focusReclaim)凭它识别「目标已卸载且属弹层」。
+    // 静态容器(非浮层)上使用本 hook 时不得继承本属性——显式解构两个 handler 使用。
+    "data-hty-overlay": "",
     onMouseDown: (e: React.MouseEvent) => {
       if (e.button !== 0) return;
       downOnMask.current = e.target === e.currentTarget;

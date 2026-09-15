@@ -1,5 +1,5 @@
 // SVG 预览清洗管线：把损坏 SVG 的常见 XML 语法瑕疵规范化，让严格 XML 解析器（DOMParser）能通过、
-// 从而经 <img> 完整渲染。仅作用于【喂给渲染器的临时副本】，不改编辑缓冲与保存内容
+// 从而经 sandbox iframe 完整渲染。仅作用于【喂给渲染器的临时副本】，不改编辑缓冲与保存内容
 // （层级纪律见 memory feedback-preview-render-tolerance）。新增一类坏法 = 往 SANITIZERS 加一项，
 // 不动调用点——终结「每来一种坏法就补一个 if」的模式。
 

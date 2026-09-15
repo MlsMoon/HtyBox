@@ -66,6 +66,7 @@ import * as previewWin from "../previewWindow";
 import { EV_READY } from "../previewProtocol";
 import { hasPrimaryShortcutModifier } from "../platformServices";
 import { getSettings } from "../settings";
+import { shouldReclaimFocus, HARD_CONTROL_SELECTOR } from "../focusReclaim";
 import { refreshSessionList, subscribeSessionList } from "../sessionRefreshThrottle";
 import { createSessionCaptureScheduler, waitForSessionCapturePoll } from "../sessionCaptureScheduling";
 import {
@@ -1323,8 +1324,57 @@ export default function TerminalDock({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId, cwd]);
 
+  const rootRef = useRef<HTMLDivElement>(null);
+  // 焦点归位兜底:点已激活标签/标签栏死区/面板 chrome/弹层关闭后,焦点静默落 body 且
+  // 面板活动状态未变——grabFocus(只挂活动变化)管不到,这里把焦点还给活动终端。
+  // 豁免(控件/弹层/tabSelectable/dock 外)全部收敛在纯函数 shouldReclaimFocus。
+  useEffect(() => {
+    if (!interactive) return;
+    const onDown = (e: PointerEvent) => {
+      const scope = rootRef.current;
+      const target = e.target instanceof Element ? e.target : null;
+      if (!scope || !target) return;
+      const wasInScope = scope.contains(target);
+      // 焦点落定是异步的(浏览器默认行为 / xterm mousedown 聚焦 / React 卸载弹层)——
+      // 轮询复查:焦点有着落即收手;仍流落且命中归位规则则把焦点还给活动终端。约 240ms 上限。
+      let tries = 0;
+      const check = () => {
+        tries += 1;
+        const ae = document.activeElement;
+        // 「焦点未落在有意义目标上」= body/html,或焦点停在 dockview chrome 容器上
+        // (标签 div/分组/标签栏等带 tabindex 但不是输入目标;标签内的重命名输入框是硬控件,不算流落)
+        const adrift =
+          !ae ||
+          ae === document.body ||
+          ae === document.documentElement ||
+          (ae instanceof HTMLElement &&
+            !ae.matches(HARD_CONTROL_SELECTOR) &&
+            ae.closest(".dv-shell") !== null);
+        if (!adrift) return;
+        const ok = shouldReclaimFocus({
+          target,
+          targetWasInScope: wasInScope,
+          focusIsBody: true,
+          tabSelectable: getSettings().tabSelectable,
+        });
+        if (ok) {
+          const termId = (apiRef.current?.activePanel?.params as TermParams | undefined)?.termId;
+          if (termId) {
+            focusEngine(termId);
+            return;
+          }
+        }
+        if (tries < 6) window.setTimeout(check, 40);
+      };
+      window.setTimeout(check, 40);
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    return () => document.removeEventListener("pointerdown", onDown, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [interactive]);
+
   return (
-    <div className="flex h-full w-full flex-col bg-[#1f1e1d]">
+    <div ref={rootRef} className="flex h-full w-full flex-col bg-[#1f1e1d]">
       <div className="flex shrink-0 items-center gap-0.5 border-b border-[var(--border)] bg-[var(--surface)] px-2 py-1.5">
         {PROFILES.map((p) => {
           // 非 shell 且 CLI 未安装/安装中 → 置灰禁点（tooltip 引导去设置页安装）

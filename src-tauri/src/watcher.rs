@@ -1,7 +1,7 @@
 //! 监听 skill / memory / 各 Agent 会话落盘，防抖后向前端发刷新事件（M3b）。
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -9,12 +9,7 @@ use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use tauri::{AppHandle, Emitter};
 
-fn watch_path_key(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .trim_start_matches("//?/")
-        .to_lowercase()
-}
+use crate::watch_path::watch_path_key;
 
 fn is_codex_session_index(path: &Path, codex_root: &Path) -> bool {
     watch_path_key(path) == watch_path_key(&codex_root.join("session_index.jsonl"))
@@ -313,24 +308,56 @@ pub fn start(app: AppHandle) {
 }
 
 // ---------------- M9：编辑器打开文件的按需监听 ----------------
-// 外部修改「打开中的文件」时 emit "file-changed"(payload=路径)，编辑器收到后重读。
-// 单文件监听底层是监听其父目录，故回调里按已注册路径过滤后再发事件，避免误报同目录其它文件。
+// 外部修改「打开中的文件」时 emit "file-changed"(payload=该文件注册时的路径)，编辑器收到后重读。
+// 底层听父目录（notify 听单文件会用精确字符串过滤，Windows 回报大小写 / `\\?\` 对不上就丢事件）；
+// 回调按 watch_path_key 认文件，只把命中的注册路径发出去，同目录其它文件不误报。
 
-static WATCHED: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+#[derive(Clone)]
+struct WatchedFile {
+    registered: String,
+    count: usize,
+}
+
+struct DirWatch {
+    watch_path: PathBuf,
+    file_count: usize,
+}
+
+struct FileWatchState {
+    files: HashMap<String, WatchedFile>,
+    dirs: HashMap<String, DirWatch>,
+}
+
+static FILE_WATCH_STATE: OnceLock<Mutex<FileWatchState>> = OnceLock::new();
 static FILE_DEBOUNCER: OnceLock<Mutex<Option<Debouncer<RecommendedWatcher>>>> = OnceLock::new();
 static FILE_APP: OnceLock<AppHandle> = OnceLock::new();
 
-fn norm(p: &str) -> String {
-    p.replace('\\', "/")
-}
-fn watched() -> &'static Mutex<HashMap<String, usize>> {
-    WATCHED.get_or_init(|| Mutex::new(HashMap::new()))
+fn file_watch_state() -> &'static Mutex<FileWatchState> {
+    FILE_WATCH_STATE.get_or_init(|| {
+        Mutex::new(FileWatchState {
+            files: HashMap::new(),
+            dirs: HashMap::new(),
+        })
+    })
 }
 fn file_debouncer() -> &'static Mutex<Option<Debouncer<RecommendedWatcher>>> {
     FILE_DEBOUNCER.get_or_init(|| Mutex::new(None))
 }
 
-// 懒建唯一的文件防抖器（首个被监听文件时创建）。锁序固定为 WATCHED → FILE_DEBOUNCER，回调只取 WATCHED，无死锁。
+fn file_parent(path: &str) -> Result<&Path, String> {
+    Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| format!("无法监听无父目录的路径: {path}"))
+}
+
+fn resolve_registered_path(event_path: &Path, files: &HashMap<String, WatchedFile>) -> Option<String> {
+    files
+        .get(&watch_path_key(event_path))
+        .map(|f| f.registered.clone())
+}
+
+// 懒建唯一的文件防抖器（首个被监听文件时创建）。锁序固定为 FILE_WATCH_STATE → FILE_DEBOUNCER，回调只取 STATE，无死锁。
 fn ensure_debouncer() -> Result<(), String> {
     let mut g = file_debouncer().lock().map_err(|e| e.to_string())?;
     if g.is_some() {
@@ -343,15 +370,17 @@ fn ensure_debouncer() -> Result<(), String> {
         let Some(app) = FILE_APP.get() else {
             return;
         };
-        let keys: Vec<String> = match watched().lock() {
-            Ok(w) => w.keys().cloned().collect(),
+        let files = match file_watch_state().lock() {
+            Ok(state) => state.files.clone(),
             Err(_) => return,
         };
         let mut sent = HashSet::new();
         for e in &events {
-            let p = norm(&e.path.to_string_lossy());
-            if keys.contains(&p) && sent.insert(p.clone()) {
-                let _ = app.emit("file-changed", p);
+            let Some(registered) = resolve_registered_path(&e.path, &files) else {
+                continue;
+            };
+            if sent.insert(registered.clone()) {
+                let _ = app.emit("file-changed", registered);
             }
         }
     })
@@ -360,35 +389,87 @@ fn ensure_debouncer() -> Result<(), String> {
     Ok(())
 }
 
-/// 开始监听某文件（编辑器打开时调用）。同一文件多面板按引用计数，仅首个真正 watch。
+/// 开始监听某文件（编辑器打开时调用）。同一文件多面板按引用计数；父目录按「其下被听文件数」计数，归零才 unwatch。
 pub fn watch_file(path: &str) -> Result<(), String> {
     ensure_debouncer()?;
-    let key = norm(path);
-    let mut w = watched().lock().map_err(|e| e.to_string())?;
-    let c = w.entry(key).or_insert(0);
-    *c += 1;
-    if *c == 1 {
-        if let Some(d) = file_debouncer().lock().map_err(|e| e.to_string())?.as_mut() {
+    let parent = file_parent(path)?;
+    let file_key = watch_path_key(Path::new(path));
+    let dir_key = watch_path_key(parent);
+
+    let mut state = file_watch_state().lock().map_err(|e| e.to_string())?;
+    if let Some(f) = state.files.get_mut(&file_key) {
+        f.count += 1;
+        return Ok(());
+    }
+
+    state.files.insert(
+        file_key.clone(),
+        WatchedFile {
+            registered: path.to_string(),
+            count: 1,
+        },
+    );
+    let dir = state.dirs.entry(dir_key.clone()).or_insert_with(|| DirWatch {
+        watch_path: parent.to_path_buf(),
+        file_count: 0,
+    });
+    dir.file_count += 1;
+    let should_watch_dir = dir.file_count == 1;
+    let dir_watch_path = dir.watch_path.clone();
+
+    if !should_watch_dir {
+        return Ok(());
+    }
+    let watch_res = file_debouncer()
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_mut()
+        .ok_or_else(|| "file watcher 未初始化".to_string())
+        .and_then(|d| {
             d.watcher()
-                .watch(Path::new(path), RecursiveMode::NonRecursive)
-                .map_err(|e| e.to_string())?;
+                .watch(&dir_watch_path, RecursiveMode::NonRecursive)
+                .map_err(|e| e.to_string())
+        });
+    if let Err(err) = watch_res {
+        state.files.remove(&file_key);
+        if let Some(d) = state.dirs.get_mut(&dir_key) {
+            d.file_count -= 1;
+            if d.file_count == 0 {
+                state.dirs.remove(&dir_key);
+            }
         }
+        return Err(err);
     }
     Ok(())
 }
 
-/// 停止监听某文件（编辑器关闭时调用）。引用计数归零才真正 unwatch。
+/// 停止监听某文件（编辑器关闭时调用）。文件引用归零后，若该父目录下已无被听文件，才 unwatch 目录。
 pub fn unwatch_file(path: &str) -> Result<(), String> {
-    let key = norm(path);
-    let mut w = watched().lock().map_err(|e| e.to_string())?;
-    if let Some(c) = w.get_mut(&key) {
-        *c -= 1;
-        if *c == 0 {
-            w.remove(&key);
-            if let Some(d) = file_debouncer().lock().map_err(|e| e.to_string())?.as_mut() {
-                let _ = d.watcher().unwatch(Path::new(path));
-            }
-        }
+    let file_key = watch_path_key(Path::new(path));
+    let dir_key = Path::new(path).parent().map(watch_path_key);
+    let mut state = file_watch_state().lock().map_err(|e| e.to_string())?;
+    let Some(f) = state.files.get_mut(&file_key) else {
+        return Ok(());
+    };
+    f.count -= 1;
+    if f.count > 0 {
+        return Ok(());
+    }
+    state.files.remove(&file_key);
+    let Some(dir_key) = dir_key else {
+        return Ok(());
+    };
+    let Some(dir) = state.dirs.get_mut(&dir_key) else {
+        return Ok(());
+    };
+    dir.file_count -= 1;
+    if dir.file_count > 0 {
+        return Ok(());
+    }
+    let watch_path = dir.watch_path.clone();
+    state.dirs.remove(&dir_key);
+    if let Some(d) = file_debouncer().lock().map_err(|e| e.to_string())?.as_mut() {
+        let _ = d.watcher().unwatch(&watch_path);
     }
     Ok(())
 }
@@ -398,9 +479,36 @@ mod tests {
     use super::{
         claude_memory_watch_root, is_claude_memory_path, is_claude_session_watch_path,
         is_codex_session_index, is_codex_session_watch_path, is_cursor_session_watch_path,
-        is_grok_session_watch_path, is_opencode_session_watch_path,
+        is_grok_session_watch_path, is_opencode_session_watch_path, resolve_registered_path,
+        WatchedFile,
     };
+    use crate::watch_path::watch_path_key;
+    use std::collections::HashMap;
     use std::path::Path;
+
+    #[test]
+    fn file_watch_resolves_registered_path_and_ignores_sibling() {
+        let mut files = HashMap::new();
+        files.insert(
+            watch_path_key(Path::new(r"G:\a\b.svg")),
+            WatchedFile {
+                registered: r"G:\a\b.svg".into(),
+                count: 1,
+            },
+        );
+        assert_eq!(
+            resolve_registered_path(Path::new(r"g:/a/b.SVG"), &files).as_deref(),
+            Some(r"G:\a\b.svg")
+        );
+        assert_eq!(
+            resolve_registered_path(Path::new(r"\\?\G:\a\b.svg"), &files).as_deref(),
+            Some(r"G:\a\b.svg")
+        );
+        assert_eq!(
+            resolve_registered_path(Path::new(r"G:\a\c.svg"), &files),
+            None
+        );
+    }
 
     #[test]
     fn only_codex_session_index_triggers_session_refresh() {

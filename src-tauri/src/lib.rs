@@ -16,6 +16,7 @@ mod session_transfer;
 mod screenshot;
 mod sessions;
 mod terminal_core;
+mod watch_path;
 mod watcher;
 mod ws_host;
 

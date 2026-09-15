@@ -96,6 +96,7 @@ export default function OverflowTabsMenu({ panels, activePanel }: IDockviewHeade
             <div className="fixed inset-0 z-[60]" {...mask} />
             <div
               ref={popRef}
+              data-hty-overlay
               style={{ position: "fixed", left: pos.left, top: pos.top, zIndex: 61 }}
               className="flex w-[360px] max-w-[92vw] flex-col rounded-xl border border-[var(--border)] bg-[var(--elevated)] py-2 shadow-2xl"
             >

@@ -53,6 +53,7 @@ export default function ContextMenu({
   return createPortal(
     <div
       ref={ref}
+      data-hty-overlay
       style={{ position: "fixed", left: pos.left, top: pos.top, zIndex: 120 }}
       className="min-w-[170px] overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--elevated)] py-1 shadow-xl"
     >

@@ -392,7 +392,7 @@ export const importDroppedEntry = (baseDir: string, relPath: string, isDir: bool
   invoke<void>("import_dropped_entry", { baseDir, relPath, isDir, bytes });
 export const revealInExplorer = (path: string) =>
   invoke<void>("reveal_in_explorer", { path });
-// 编辑器打开/关闭文件时按需监听其外部变化（变化后后端 emit "file-changed"）
+// 编辑器打开/关闭文件时按需监听其外部变化（变化后后端 emit "file-changed"，payload=注册路径；比对走 filePathKey）
 export const watchFile = (path: string) => invoke<void>("watch_file", { path });
 export const unwatchFile = (path: string) => invoke<void>("unwatch_file", { path });
 

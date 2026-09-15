@@ -11,6 +11,7 @@ import { readTextFile, writeTextFile, readImageDataUrl, watchFile, unwatchFile, 
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { openFileInScope, revealFileInScope } from "../fileOpenBus";
 import { sanitizeForRender } from "../svgSanitize";
+import { filePathKey } from "../filePathKey";
 import { getSettings } from "../settings";
 
 // 透明图棋盘格背景（SVG / 图片预览共用）。
@@ -106,7 +107,7 @@ export default function DockEditor(
   );
   const [err, setErr] = useState<string | null>(null);
   const [externalChanged, setExternalChanged] = useState(false); // 文件被外部修改且本地有未保存改动 → 冲突提示
-  const lastSaveRef = useRef(0); // 最近一次本地保存时刻：忽略本应用自身写盘触发的 file-changed 回声
+  const lastSavedContentRef = useRef<string | null>(null); // 最近一次落盘/载入的正文：相同内容的 file-changed 当回声，不按时间窗盲丢
   const isImage = IMAGE_RE.test(path);
   const [img, setImg] = useState<ImgState | null>(() => imageStore.get(panelId) ?? null);
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
@@ -135,7 +136,7 @@ export default function DockEditor(
   );
   // plan-5 决策 1 = A：超编辑上限的显式编辑入口（提示条按钮 → 自定义确认弹窗）
   const [editAnywayAsk, setEditAnywayAsk] = useState(false);
-  const [imgFailed, setImgFailed] = useState(false); // SVG <img> 渲染失败(onError)安全网标志
+  const [imgFailed, setImgFailed] = useState(false); // SVG iframe 加载失败(onError)安全网标志
   // md 内代码块语法按需加载：某语法就绪后 tick+1 触发重渲染，把无高亮代码块换成着色版。
   // （代码文件预览与 md 分段路径的语法就绪通知各自内部管理，本 tick 只服务全量 md）
   const [hlTick, setHlTick] = useState(0);
@@ -148,12 +149,10 @@ export default function DockEditor(
     () => (mdMode === "full" && view === "preview" ? renderMarkdown(buf.content) : ""),
     [mdMode, view, buf.content, hlTick],
   );
-  // SVG 预览：良构性校验（DOMParser 失败时 Chromium 插入 <parsererror>，取明细作诊断）+ 容错重试。
-  // 解析失败时把「孤立 &」（后面不是合法实体）转义为 &amp; 再试一次——损坏/AI 生成的 mockup 常见
-  // 此类语法伤；容错只影响预览渲染，不改编辑缓冲与保存内容，重试仍失败才如实报原始错误。
-  const svgView = useMemo<{ url: string; error: string | null; cleaned: boolean; degraded: boolean }>(() => {
+  // SVG 预览：良构性校验 + 清洗管线（只碰渲染副本）。载体是 sandbox iframe + blob（SVG-as-document，对齐浏览器打开 .svg）。
+  const svgView = useMemo<{ text: string; error: string | null; cleaned: boolean; degraded: boolean }>(() => {
     if (!isSvg || view !== "preview" || !buf.loaded || !buf.content.trim())
-      return { url: "", error: null, cleaned: false, degraded: false };
+      return { text: "", error: null, cleaned: false, degraded: false };
     const parseErr = (txt: string): string | null => {
       const doc = new DOMParser().parseFromString(txt, "image/svg+xml");
       const errNode = doc.querySelector("parsererror");
@@ -161,16 +160,22 @@ export default function DockEditor(
       const detail = errNode.querySelector("div")?.textContent; // Chromium 把"error on line…"明细放在内层 div
       return (detail || errNode.textContent || "SVG 解析失败").replace(/\s+/g, " ").trim();
     };
-    const toUrl = (txt: string) => `data:image/svg+xml;charset=utf-8,${encodeURIComponent(txt)}`;
     const err0 = parseErr(buf.content);
-    if (!err0) return { url: toUrl(buf.content), error: null, cleaned: false, degraded: false };
-    // 非良构：清洗管线累加修正（仅作用于渲染副本、不改编辑缓冲与保存），让严格 DOMParser 通过。
+    if (!err0) return { text: buf.content, error: null, cleaned: false, degraded: false };
     const { text, cleaned, wellFormed } = sanitizeForRender(buf.content, (s) => !parseErr(s));
-    if (wellFormed) return { url: toUrl(text), error: null, cleaned, degraded: false };
-    // 决策 1-A：清洗仍非良构 → 乐观兜底，仍交 <img> 试渲染（onError=imgFailed 才判失败）；err0 留作诊断。
-    return { url: toUrl(text), error: err0, cleaned, degraded: true };
+    if (wellFormed) return { text, error: null, cleaned, degraded: false };
+    return { text, error: err0, cleaned, degraded: true };
   }, [isSvg, view, buf.loaded, buf.content]);
-  // 内容变化时复位 <img> 渲染失败标志,让修正后的 SVG 重新尝试渲染。
+  const [svgBlobUrl, setSvgBlobUrl] = useState("");
+  useEffect(() => {
+    if (!svgView.text) {
+      setSvgBlobUrl("");
+      return;
+    }
+    const url = URL.createObjectURL(new Blob([svgView.text], { type: "image/svg+xml" }));
+    setSvgBlobUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [svgView.text]);
   useEffect(() => {
     setImgFailed(false);
   }, [buf.content]);
@@ -254,6 +259,7 @@ export default function DockEditor(
     const cached = editorStore.get(panelId);
     if (cached?.loaded) {
       setBuf(cached);
+      if (!cached.dirty) lastSavedContentRef.current = cached.content;
       return;
     }
     let alive = true;
@@ -261,6 +267,7 @@ export default function DockEditor(
       .then((r) => {
         const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, viewable: r.viewable, sizeBytes: r.sizeBytes };
         editorStore.set(panelId, b);
+        lastSavedContentRef.current = r.content;
         if (alive) setBuf(b);
       })
       .catch((e) => {
@@ -285,7 +292,8 @@ export default function DockEditor(
   }, [props.api, path, props.params.workspaceId]);
 
   // 从磁盘重新载入（放弃本地未保存内容）。供外部变化同步 / 冲突时手动重载。
-  const reloadFromDisk = () => {
+  // skipIfUnchanged：自己保存的 file-changed 回声（正文相同）直接丢掉，避免预览闪一下，也不挡紧随其后的外部第二写。
+  const reloadFromDisk = (mode?: { skipIfUnchanged?: boolean }) => {
     const prev = editorStore.get(panelId);
     const forced = prev?.forcedLossy ?? false;
     const anyway = prev?.editAnyway ?? false;
@@ -294,8 +302,10 @@ export default function DockEditor(
     if (anyway) opts.maxBytes = Math.max(opts.maxBytes, EDIT_ANYWAY_MAX_BYTES);
     readTextFile(path, { forceLossy: forced, ...opts })
       .then((r) => {
+        if (mode?.skipIfUnchanged && r.content === lastSavedContentRef.current) return;
         const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, forcedLossy: forced, viewable: r.viewable, sizeBytes: r.sizeBytes, editAnyway: anyway && r.editable };
         editorStore.set(panelId, b);
+        lastSavedContentRef.current = r.content;
         setBuf(b);
         setExternalChanged(false);
         setErr(null);
@@ -309,6 +319,7 @@ export default function DockEditor(
       .then((r) => {
         const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, forcedLossy: true, viewable: r.viewable, sizeBytes: r.sizeBytes };
         editorStore.set(panelId, b);
+        lastSavedContentRef.current = r.content;
         setBuf(b);
       })
       .catch((e) => setErr(String(e)));
@@ -323,6 +334,7 @@ export default function DockEditor(
       .then((r) => {
         const b: Buf = { content: r.content, dirty: false, loaded: true, editable: r.editable, reason: r.reason, canForce: r.canForce, lossy: r.lossy, warning: r.warning, forcedLossy: forced, viewable: r.viewable, sizeBytes: r.sizeBytes, editAnyway: r.editable };
         editorStore.set(panelId, b);
+        lastSavedContentRef.current = r.content;
         setBuf(b);
         if (r.editable) setView("edit");
       })
@@ -337,14 +349,14 @@ export default function DockEditor(
     };
   }, [path]);
 
-  // 后端报告文件被外部修改 → 同步：图片刷新预览；文本无未保存改动则静默重载，否则提示冲突
+  // 后端报告文件被外部修改 → 同步：图片刷新预览；文本无未保存改动则静默重载，否则提示冲突。
+  // 自己保存的回声：重读正文与 lastSavedContentRef 相同则忽略，不按 1 秒时间窗盲丢（否则紧随其后的外部第二写会被误杀）。
   useEffect(() => {
-    const mine = path.replace(/\\/g, "/");
+    const mine = filePathKey(path);
     let un: UnlistenFn | undefined;
     let disposed = false;
     listen<string>("file-changed", (e) => {
-      if (e.payload.replace(/\\/g, "/") !== mine) return;
-      if (Date.now() - lastSaveRef.current < 1000) return; // 忽略本应用自身保存触发的回声
+      if (filePathKey(e.payload) !== mine) return;
       if (isImage) {
         readImageDataUrl(path)
           .then((r) => {
@@ -356,7 +368,7 @@ export default function DockEditor(
         return;
       }
       if (editorStore.get(panelId)?.dirty) setExternalChanged(true);
-      else reloadFromDisk();
+      else reloadFromDisk({ skipIfUnchanged: true });
     }).then((u) => {
       if (disposed) u();
       else un = u;
@@ -381,7 +393,7 @@ export default function DockEditor(
         setBuf(b);
         setErr(null);
         setExternalChanged(false);
-        lastSaveRef.current = Date.now();
+        lastSavedContentRef.current = b.content;
       })
       .catch((e) => setErr(String(e)));
   };
@@ -591,7 +603,7 @@ export default function DockEditor(
         <div className="flex shrink-0 items-center gap-2 border-b border-[var(--accent-border-soft)] bg-[var(--accent-soft)] px-3 py-1.5">
           <span className="min-w-0 flex-1 text-[10.5px] text-[var(--accent-text)]">文件已被外部修改，本地有未保存的改动。</span>
           <button
-            onClick={reloadFromDisk}
+            onClick={() => reloadFromDisk()}
             className="shrink-0 rounded-md bg-[var(--accent)] px-2 py-0.5 text-[10.5px] font-semibold text-white hover:bg-[var(--accent-text)]"
           >
             重载（放弃本地修改）
@@ -607,7 +619,7 @@ export default function DockEditor(
       {(previewable && view === "preview") || canVirtualPreview ? (
         /* canVirtualPreview 无可编辑内容，无视 view 恒走只读虚拟预览 */
         isSvg ? (
-          !svgView.url ? (
+          !svgView.text ? (
             <div
               className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4 text-[12px] text-[var(--text-3)]"
               style={CHECKER_BG}
@@ -623,16 +635,16 @@ export default function DockEditor(
               <div className="text-[10.5px] text-[var(--text-3)]">已尽力容错渲染仍无法显示，可切到「编辑」查看并修正原始内容。</div>
             </div>
           ) : (
-            <div
-              className="relative flex min-h-0 flex-1 items-center justify-center overflow-auto p-4"
-              style={CHECKER_BG}
-            >
-              <img
-                src={svgView.url}
-                alt={basename(path)}
-                onError={() => setImgFailed(true)}
-                className="max-h-full max-w-full object-contain"
-              />
+            <div className="relative min-h-0 flex-1 overflow-hidden" style={CHECKER_BG}>
+              {svgBlobUrl ? (
+                <iframe
+                  src={svgBlobUrl}
+                  sandbox=""
+                  title={basename(path)}
+                  onError={() => setImgFailed(true)}
+                  className="absolute inset-0 h-full w-full border-0 bg-transparent"
+                />
+              ) : null}
               {svgView.cleaned ? (
                 <div className="absolute bottom-1.5 right-2 rounded bg-[var(--bg)]/80 px-1.5 py-0.5 text-[10px] text-[var(--text-3)]">
                   已容错渲染

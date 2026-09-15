@@ -674,7 +674,8 @@ export default function FilePanel({
           ref={scrollRef}
           tabIndex={0}
           onScroll={(e) => setShowTop(e.currentTarget.scrollTop > 200)}
-          {...blankClear}
+          onMouseDown={blankClear.onMouseDown}
+          onMouseUp={blankClear.onMouseUp}
           onKeyDown={(e) => {
             // 有弹窗/输入聚焦时不接管，避免吞掉重命名框/确认框的按键
             if (prompt || confirm || menu || showIgnore) return;

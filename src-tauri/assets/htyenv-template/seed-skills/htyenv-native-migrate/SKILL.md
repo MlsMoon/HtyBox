@@ -28,7 +28,7 @@ description: 把工程从原生 Agent 目录（.claude / .agents / .codex 承载
 1. **复制优先、删除最后** —— 先 SHA 盘点 + 只读快照，再复制进 canonical，切换引用与薄壳，**用户二次确认后**才删旧业务目录。
 2. **语义改路径，禁盲替换** —— 只改活跃 Skill/规则中的写入与发现路径；历史 plan 正文里的旧路径是**历史事实**，不全局字符串替换。
 3. **原生与业务分离** —— 业务进 `.htyworkflows`；原生入口默认不动（决策默认 A：提炼规则到 `rules/common.md`，`CLAUDE.md` 原样保留并刷新保护哈希）。
-4. **工程工具链实事求是** —— 迁 Skill 时把源工程专用工具写进正文（如本仓 Grep/Glob/Read；Unity 仓 Jet MCP），禁止把别的工程的工具链原样带过来却不改。
+4. **工程工具链实事求是** —— 迁 Skill 时把源工程专用工具写进正文（如本仓 Grep/Glob/Read；Unity 仓同为 Grep/Glob/Read + hty-unity-mcp-kit 编译验证），禁止把别的工程的工具链原样带过来却不改。
 5. **记忆单向** —— 产品 memory → `memory/imports/…` 快照 → 策展进 canonical；topic 文件哈希对齐；`MEMORY.md` 按 sync 契约双写收敛（缓存索引 ⊆ canonical）。
 
 ---
