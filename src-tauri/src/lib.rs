@@ -2,6 +2,7 @@ mod agent_accounts;
 mod agent_env;
 mod broker;
 mod catalog;
+mod diag;
 mod fs_tree;
 mod host_identity;
 pub mod htyenv; // hty环境引擎:pub 供独立测试 harness/后续命令层消费(阶段构建期亦免 dead_code 噪声)
@@ -348,7 +349,28 @@ fn create_terminal(
 
 #[tauri::command]
 fn write_terminal(state: State<'_, AppState>, id: String, data: String) -> Result<(), String> {
-    state.terminal.write(&id, data.as_bytes())
+    if !diag::enabled() {
+        return state.terminal.write(&id, data.as_bytes());
+    }
+    // 拖放诊断开启时采样写入耗时（同步命令跑在宿主事件线程，阻塞即整窗卡死的候选根因）
+    let t0 = std::time::Instant::now();
+    let result = state.terminal.write(&id, data.as_bytes());
+    diag::sample_write(&id, data.len(), t0.elapsed(), result.is_err());
+    result
+}
+
+/// 拖放诊断：前端批量追加诊断行（落盘在阻塞线程池，不占宿主事件线程）。
+#[tauri::command]
+async fn append_diag_log(lines: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || diag::append(&lines))
+        .await
+        .map_err(|error| format!("诊断日志任务失败：{error}"))?
+}
+
+/// 拖放诊断：随设置开关宿主 UI 线程看门狗（同时决定 write_terminal 是否采样）。
+#[tauri::command]
+fn set_diag_watchdog(app: tauri::AppHandle, on: bool) {
+    diag::set_watchdog(app, on);
 }
 
 #[tauri::command]
@@ -1776,6 +1798,8 @@ pub fn run() {
             read_clipboard_text,
             save_clipboard_image,
             set_screenshot_hotkey_enabled,
+            append_diag_log,
+            set_diag_watchdog,
             watch_file,
             unwatch_file,
             list_all_files,

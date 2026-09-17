@@ -19,6 +19,7 @@ import {
 } from "../clipboardPasteBusy";
 import { getSettings } from "../settings";
 import { perfIpcMsg, perfWrite } from "../perf/perfHud";
+import { createSyncOutputHold, type SyncOutputHold } from "../outputFrameHold";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -32,6 +33,8 @@ import "@xterm/xterm/css/xterm.css";
  * 4. 粘贴：只走标准 paste 事件一条路径（capture 阶段拦截，避免 xterm 再粘一遍 → 双重粘贴）。
  * 5. 引擎与 React/dockview 挂载解耦：dockview 重排会卸载重挂面板，xterm 挂在游离 host 元素上，
  *    attach=塞进容器、detach=移出保留、dispose=面板真正关闭时才结束 PTY。
+ * 6. 输出：IPC 块入队 + rAF 合帧写 xterm；同步输出帧（`ESC[?2026h…l`）整帧到齐再写
+ *    （outputFrameHold），让全量重绘落在同一解析任务内、滚动条不出现中间态。
  */
 interface Engine {
   term: Terminal;
@@ -55,12 +58,19 @@ interface Engine {
   lastPingAt?: number; // 最近一次向 agentStatus 上报活动的时刻（节流 PTY 高频输出，避免每帧都 ping）
   pendingChunks: Uint8Array[]; // plan-2：待写 xterm 的输出块队列（rAF 合帧消费）
   writeRaf?: number; // plan-2：已调度的合帧 rAF 句柄（在飞不重复调度）
+  syncHold: SyncOutputHold; // 同步输出帧暂存：BSU 到 ESU 之间的块攒齐再入队
+  holdTimer?: number; // 暂存超时兜底句柄（ESU 迟迟不到 → 强制放行）
   midScroll: () => void; // 解绑中键自动滚动（dispose 时调用；见 middleScroll.ts）
   textInputCleanup?: () => void; // 解绑 macOS WebKit 文本提交修正
   canInteract?: () => boolean;
 }
 
 const engines = new Map<string, Engine>();
+
+// 同步输出帧暂存的安全边界：ESU 超过此时长未到 / 暂存超过此字节数 → 强制放行，退化为逐块写
+//（与 xterm 自身 1000ms 同步超时同类；常态 pi-tui 一帧 ≤ 数十 KB、毫秒级到齐）。
+const SYNC_HOLD_TIMEOUT_MS = 100;
+const SYNC_HOLD_MAX_BYTES = 1024 * 1024;
 
 function isEngineInteractive(engine: Engine | undefined): engine is Engine {
   return !!engine?.el.isConnected && engine.canInteract?.() === true;
@@ -206,6 +216,7 @@ export function ensureEngine(
     launchArmed: false,
     launched: false,
     pendingChunks: [],
+    syncHold: createSyncOutputHold(SYNC_HOLD_MAX_BYTES),
     // 中键自动滚动挂宿主 el（与 paste 拦截同位置）：跟随引擎生命周期，dockview 重排不丢
     midScroll: attachMiddleScroll(term, el, () => focusEngine(termId)),
   });
@@ -228,6 +239,23 @@ function installTerminalTextInputHandler(engine: Engine): () => void {
   };
   textarea.addEventListener("beforeinput", onBeforeInput, true);
   return () => textarea.removeEventListener("beforeinput", onBeforeInput, true);
+}
+
+/** plan-2 合帧：入队 + rAF 一次消费（在飞不重复调度）；单帧内多条 IPC 消息只触发一轮 write。 */
+function enqueueChunks(e: Engine, termId: string, chunks: Uint8Array[]): void {
+  if (!chunks.length) return;
+  e.pendingChunks.push(...chunks);
+  if (e.writeRaf === undefined) {
+    e.writeRaf = requestAnimationFrame(() => flushChunks(termId));
+  }
+}
+
+/** 同步帧暂存超时兜底：ESU 未在时限内到达 → 强制放行已暂存字节，后续块直写直到下一个 BSU。 */
+function releaseHold(termId: string): void {
+  const e = engines.get(termId);
+  if (!e) return;
+  e.holdTimer = undefined;
+  enqueueChunks(e, termId, e.syncHold.flush());
 }
 
 /** plan-2 合帧消费：rAF 内逐块 write（不 concat 避免拷贝；xterm WriteBuffer 内部串行）。 */
@@ -278,10 +306,15 @@ function createPty(termId: string): void {
     }
     const bytes = new Uint8Array(buf); // ArrayBuffer → 零拷贝视图
     if (getSettings().perfHud) perfIpcMsg(bytes.length); // 性能探针(plan-1)，bool 短路
-    // plan-2 合帧：入队 + rAF 一次消费（在飞不重复调度）；单帧内多条 IPC 消息只触发一轮 write
-    e.pendingChunks.push(bytes);
-    if (e.writeRaf === undefined) {
-      e.writeRaf = requestAnimationFrame(() => flushChunks(termId));
+    // 同步输出帧（?2026h…l）攒齐再入队；帧外块与已闭合帧即时放行
+    enqueueChunks(e, termId, e.syncHold.push(bytes));
+    if (e.syncHold.holding) {
+      if (e.holdTimer === undefined) {
+        e.holdTimer = window.setTimeout(() => releaseHold(termId), SYNC_HOLD_TIMEOUT_MS);
+      }
+    } else if (e.holdTimer !== undefined) {
+      clearTimeout(e.holdTimer);
+      e.holdTimer = undefined;
     }
   };
 
@@ -399,6 +432,7 @@ export function disposeEngine(termId: string): void {
   e.ro?.disconnect();
   if (e.fitTimer) clearTimeout(e.fitTimer);
   if (e.writeRaf !== undefined) cancelAnimationFrame(e.writeRaf); // plan-2：清未消费的合帧
+  if (e.holdTimer !== undefined) clearTimeout(e.holdTimer); // 暂存字节随引擎一起丢弃
   e.textInputCleanup?.();
   e.midScroll(); // 解绑中键滚动；若滚动会话正属于本终端则一并清场
   if (e.created) invoke("close_terminal", { id: termId }).catch(() => {});

@@ -615,6 +615,12 @@ export default function SettingsModal({
                   on={s.perfHud}
                   onChange={(v) => setSetting("perfHud", v)}
                 />
+                <ToggleRow
+                  title="拖放诊断日志"
+                  desc={"记录左栏拖到终端的拖放事件、终端写入耗时、界面与后台主线程停顿，写入 %APPDATA%\\HtyBox\\logs\\dragdrop-日期.log；仅在排查「拖拽到终端卡死」时开启，命中后把日志交给 AI，日常关闭"}
+                  on={s.dragDropDiag}
+                  onChange={(v) => setSetting("dragDropDiag", v)}
+                />
               </div>
             )}
             {section === "files" && (

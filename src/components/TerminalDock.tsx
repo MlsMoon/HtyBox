@@ -66,6 +66,7 @@ import * as previewWin from "../previewWindow";
 import { EV_READY } from "../previewProtocol";
 import { hasPrimaryShortcutModifier } from "../platformServices";
 import { getSettings } from "../settings";
+import { diag, activeElementTag } from "../dragDropDiag";
 import { shouldReclaimFocus, HARD_CONTROL_SELECTOR } from "../focusReclaim";
 import { refreshSessionList, subscribeSessionList } from "../sessionRefreshThrottle";
 import { createSessionCaptureScheduler, waitForSessionCapturePoll } from "../sessionCaptureScheduling";
@@ -763,12 +764,17 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
       if (e.dataTransfer?.types.includes(DRAG_MIME)) {
         e.preventDefault();
         e.dataTransfer.dropEffect = "copy";
-        c.classList.add("htybox-drop");
+        if (!c.classList.contains("htybox-drop")) {
+          c.classList.add("htybox-drop");
+          diag("dragover-enter", { termId, agentKind });
+        }
       }
     };
     const onDragLeave = (e: DragEvent) => {
-      if (!c.contains(e.relatedTarget as Node | null))
+      if (!c.contains(e.relatedTarget as Node | null) && c.classList.contains("htybox-drop")) {
         c.classList.remove("htybox-drop");
+        diag("dragleave", { termId });
+      }
     };
     const onDrop = (e: DragEvent) => {
       if (!interactiveRef.current || !apiRef.current.isVisible) return;
@@ -788,8 +794,15 @@ function DockTerminal(props: IDockviewPanelProps<TermParams>) {
           return;
         }
         const text = injectText(item, agentKind) + (e.shiftKey ? "\r" : "");
-        invoke("write_terminal", { id: termId, data: text }).catch(() => {});
+        const t0 = performance.now();
+        diag("drop", { termId, agentKind, kind: item.kind, bytes: text.length, ae: activeElementTag() });
+        invoke("write_terminal", { id: termId, data: text })
+          .then(() => diag("drop-write", { termId, ms: Math.round(performance.now() - t0) }))
+          .catch((err) => diag("drop-write-err", { termId, ms: Math.round(performance.now() - t0), err: String(err) }));
         focusEngine(termId);
+        if (getSettings().dragDropDiag) {
+          requestAnimationFrame(() => diag("drop-after", { termId, ae: activeElementTag() }));
+        }
       } catch {
         /* ignore */
       }

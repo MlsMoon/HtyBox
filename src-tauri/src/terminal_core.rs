@@ -24,8 +24,12 @@ const BROADCAST_CAP: usize = 2048; // 广播缓冲消息数（慢订阅者超限
 // ---- plan-2 帧聚合参数(全局决策 2 默认值;plan-1 实测可微调) ----
 /// 读缓冲(原 8KB→64KB):read 按需返回不等满,不影响回显延迟,大输出 syscall 频率降 8 倍。
 const READ_BUF: usize = 64 * 1024;
-/// 聚合窗口:静默后首包立即 flush(回显零延迟);距上次 flush 不足此时长的后继包攒一帧。
+/// 聚合窗口:自首包起最多攒此时长即成帧(持续输出按此节拍出帧)。
 const FLUSH_WINDOW: Duration = Duration::from_millis(8);
+/// 首包静默等待:最后一包到达后再静默此时长才成帧,让 TUI 紧邻的多次 write(如 pi-tui 的
+/// 「同步帧 + 帧外光标定位」,间隔微秒级)并入同一帧,避免 xterm 每帧渲染两次、IME 锚点往返;
+/// 总等待仍受 FLUSH_WINDOW 封顶,首包延迟 ≤ 窗口(需求档红线 ≤10ms)。
+const FLUSH_SETTLE: Duration = Duration::from_millis(3);
 /// pending 达到此字节数不等窗口直接成帧(大输出直发)。
 const FLUSH_NOW_BYTES: usize = 32 * 1024;
 /// 单帧字节上限,超出拆帧(保护前端单次 write 的帧预算)。
@@ -72,12 +76,17 @@ impl Scrollback {
     }
 }
 
-/// 帧聚合共享状态：读线程 append + 按需 notify；flusher 线程取帧发送。
-type FlushQueue = (Mutex<Vec<u8>>, Condvar);
+/// 帧聚合共享状态：读线程 append（并记最后到达时刻）+ 按需 notify；flusher 线程取帧发送。
+struct Pending {
+    bytes: Vec<u8>,
+    last_append: Instant,
+}
+type FlushQueue = (Mutex<Pending>, Condvar);
 
 /// 本地通道 flusher（plan-2）：独占 Channel。
-/// 策略 = 首包即发（距上次 flush ≥ 窗口）+ 窗口内聚合（攒满阈值提前直发）+ 单帧拆帧上限。
-/// 低吞吐（回显/spinner）每包即时走、延迟与改造前一致；高吞吐自然合并成 32KB~256KB 帧。
+/// 策略 = 首包静默等待（最后一包后静默 FLUSH_SETTLE 即发）+ 自首包起 FLUSH_WINDOW 封顶
+/// + 攒满阈值提前直发 + 单帧拆帧上限。低吞吐（回显/spinner）每帧 ≈3ms 内走；
+/// 高吞吐按窗口节拍自然合并成 32KB~256KB 帧。
 /// 退出：读线程结束置 closed → flush 余量后退出；Channel send 失败（前端关闭）立即退。
 /// 退出路径必须 `local_alive.store(false)`——恢复「本地通道死 → 停止本地复制」止损语义
 ///（旧实现 local=None 的等效）；否则读线程持续 append 无人消费的 pending，内存无界增长。
@@ -88,25 +97,25 @@ fn run_flusher(
     ch: Channel<Response>,
 ) {
     let (lock, cond) = &*queue;
-    // 初始视为"窗口已过"：启动后第一包即发。
-    let mut last_flush = Instant::now() - FLUSH_WINDOW;
     loop {
         let mut p = lock.lock().unwrap();
         // 1) 等首包（无限等；关闭且无余量才退）
-        while p.is_empty() {
+        while p.bytes.is_empty() {
             if closed.load(Ordering::Relaxed) {
                 local_alive.store(false, Ordering::Relaxed);
                 return;
             }
             p = cond.wait(p).unwrap();
         }
-        // 2) 聚合窗口：距上次 flush 不足窗口且未攒满阈值 → 等到窗口期满/攒满/关闭
-        let deadline = last_flush + FLUSH_WINDOW;
+        // 2) 静默等待：最后一包后静默 FLUSH_SETTLE 即成帧，距首包 FLUSH_WINDOW 封顶；攒满/关闭直发。
+        //    读线程只在「空→非空 / 攒满」notify，后继包靠 wait_timeout 到期后重读 last_append 感知。
+        let window_deadline = Instant::now() + FLUSH_WINDOW;
         loop {
-            if p.len() >= FLUSH_NOW_BYTES || closed.load(Ordering::Relaxed) {
+            if p.bytes.len() >= FLUSH_NOW_BYTES || closed.load(Ordering::Relaxed) {
                 break;
             }
             let now = Instant::now();
+            let deadline = (p.last_append + FLUSH_SETTLE).min(window_deadline);
             if now >= deadline {
                 break;
             }
@@ -114,7 +123,7 @@ fn run_flusher(
             p = g;
         }
         // 3) 取帧发送（拆帧保护前端单次 write 帧预算）
-        let frame = std::mem::take(&mut *p);
+        let frame = std::mem::take(&mut p.bytes);
         drop(p);
         for chunk in frame.chunks(MAX_FRAME_BYTES) {
             if ch.send(Response::new(chunk.to_vec())).is_err() {
@@ -122,7 +131,6 @@ fn run_flusher(
                 return; // 前端通道关了（面板关闭/刷新）→ 止损 + flusher 退
             }
         }
-        last_flush = Instant::now();
     }
 }
 
@@ -191,7 +199,10 @@ impl TerminalCore {
         let txc = tx.clone();
         let exit_app = self.app.lock().unwrap().clone();
         let exit_id = id.clone();
-        let queue: Arc<FlushQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let queue: Arc<FlushQueue> = Arc::new((
+            Mutex::new(Pending { bytes: Vec::new(), last_append: Instant::now() }),
+            Condvar::new(),
+        ));
         let closed = Arc::new(AtomicBool::new(false));
         // 本地通道存活标志(读线程与 flusher 共享):flusher 退出(前端关闭/读线程结束)即置 false,
         // 读线程据此停止 append——止损语义,防 pending 无界增长。
@@ -222,9 +233,10 @@ impl TerminalCore {
                         if local_alive.load(Ordering::Relaxed) {
                             let (lock, cond) = &*queue;
                             let mut p = lock.lock().unwrap();
-                            let was_empty = p.is_empty();
-                            p.extend_from_slice(&bytes);
-                            if was_empty || p.len() >= FLUSH_NOW_BYTES {
+                            let was_empty = p.bytes.is_empty();
+                            p.bytes.extend_from_slice(&bytes);
+                            p.last_append = Instant::now();
+                            if was_empty || p.bytes.len() >= FLUSH_NOW_BYTES {
                                 cond.notify_one();
                             }
                         }

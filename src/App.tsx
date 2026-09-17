@@ -29,6 +29,7 @@ import { SidebarToggleIcon, useSidebarToggle } from "./components/ui/SidebarTogg
 import DashboardShell from "./components/htyenv/DashboardShell";
 import { getSettings, setSetting, useSettings } from "./settings";
 import { startPerfHud, stopPerfHud } from "./perf/perfHud";
+import { setDragDropDiagEnabled } from "./dragDropDiag";
 import * as previewWin from "./previewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -241,6 +242,12 @@ export default function App() {
     else stopPerfHud();
     return () => stopPerfHud();
   }, [perfHudOn]);
+
+  // 拖放诊断日志(排查「拖到终端卡死」)：随设置启停渲染停顿监测 + Rust 侧主线程看门狗，默认关
+  const dragDropDiagOn = useSettings().dragDropDiag;
+  useEffect(() => {
+    setDragDropDiagEnabled(dragDropDiagOn);
+  }, [dragDropDiagOn]);
 
   // 持久化已打开的工作区 + 活动工作区（退出重进复原标签栏）
   useEffect(() => {

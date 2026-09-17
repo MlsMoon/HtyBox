@@ -41,6 +41,9 @@ export interface Settings {
   tabSelectable: boolean;
   /** 性能诊断角标(终端性能主题群 plan-1):开=左下角常驻一行 msg/s·write耗时·FPS·长任务·重扫计数；默认关 */
   perfHud: boolean;
+  /** 拖放诊断日志:开=记录左栏→终端拖放生命周期、终端写入耗时、渲染/宿主主线程停顿到
+   *  `%APPDATA%\HtyBox\logs\dragdrop-日期.log`(排查「拖到终端卡死」用)；默认关,关时零开销 */
+  dragDropDiag: boolean;
   /** 左栏 File/Skill/Memory/Session/Flow 分段切换条：开=仅图标(更紧凑) / 关=图标+文字(现状,默认) */
   sidebarTabIconOnly: boolean;
   /**
@@ -83,6 +86,7 @@ const DEFAULTS: Settings = {
   screenshotHotkey: true,
   tabSelectable: false,
   perfHud: false,
+  dragDropDiag: false,
   sidebarTabIconOnly: false,
   skillRootEntries: DEFAULT_ENTRIES.map((e) => ({ ...e })),
   skillRoots: DEFAULT_ENTRIES.filter((e) => e.enabled).map((e) => e.path),

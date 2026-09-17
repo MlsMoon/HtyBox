@@ -24,6 +24,7 @@ import { loadFavFolders, toggleFavFolder as toggleFavStored, remapFavPaths, onFa
 import { getWsState, setWsState } from "../wsState";
 import { useSettings } from "../settings";
 import { writeClipboardText } from "../platformServices";
+import { diag } from "../dragDropDiag";
 
 const DRAG_MIME = "application/x-htybox-item";
 const MAX_IMPORT = 20 * 1024 * 1024; // 单文件导入上限 20MB
@@ -124,6 +125,26 @@ export default function FilePanel({
     if (!dragActive) stopScroll();
   }, [dragActive]);
   useEffect(() => () => stopScroll(), []);
+  // 拖拽态复位兜底：源行在拖拽中被卸载（watcher 刷新树）时，Chromium 不再向它派发 dragend，
+  // dragActive 会一直为 true（投放区/滚动条带常驻、自动滚动不停）。拖拽进行中浏览器不派发指针事件，
+  // 故「落到本窗口任意目标的 drop」或「拖拽结束后的首个 pointerup / pointerdown」都可作为复位信号。
+  useEffect(() => {
+    if (!dragActive) return;
+    const reset = (ev: Event) => {
+      diag("drag-reset", { via: ev.type });
+      setDragActive(false);
+      setDropDir(null);
+      setRootHot(false);
+    };
+    document.addEventListener("drop", reset, true);
+    document.addEventListener("pointerup", reset, true);
+    document.addEventListener("pointerdown", reset, true);
+    return () => {
+      document.removeEventListener("drop", reset, true);
+      document.removeEventListener("pointerup", reset, true);
+      document.removeEventListener("pointerdown", reset, true);
+    };
+  }, [dragActive]);
 
   const load = useCallback((path: string) => {
     setLoading((s) => new Set(s).add(path));
@@ -515,10 +536,12 @@ export default function FilePanel({
             }
             e.dataTransfer.setData(DRAG_MIME, JSON.stringify({ kind: "file", path: entry.path, paths }));
             e.dataTransfer.effectAllowed = "copyMove";
+            diag("dragstart", { src: entry.path, paths: paths.length });
             // 延后到下一帧再改 DOM：dragstart 期间同步增删 DOM 会被 WebView 取消本次拖拽
             requestAnimationFrame(() => setDragActive(true));
           }}
-          onDragEnd={() => {
+          onDragEnd={(e) => {
+            diag("dragend", { src: entry.path, dropEffect: e.dataTransfer.dropEffect });
             setDragActive(false);
             setDropDir(null);
           }}
@@ -712,9 +735,11 @@ export default function FilePanel({
                     onDragStart={(e) => {
                       e.dataTransfer.setData(DRAG_MIME, JSON.stringify({ kind: "file", path: p, paths: [p] }));
                       e.dataTransfer.effectAllowed = "copyMove";
+                      diag("dragstart", { src: p, paths: 1 });
                       requestAnimationFrame(() => setDragActive(true));
                     }}
-                    onDragEnd={() => {
+                    onDragEnd={(e) => {
+                      diag("dragend", { src: p, dropEffect: e.dataTransfer.dropEffect });
                       setDragActive(false);
                       setDropDir(null);
                     }}
