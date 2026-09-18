@@ -1,6 +1,6 @@
 [package]
 name = "htybox-app"
-version = "1.14.9"
+version = "1.14.10"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -60,6 +60,11 @@ tauri-plugin-global-shortcut = "2.3.2"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
+
+[target.'cfg(windows)'.dependencies]
+# 拖拽卡死守卫：查鼠标主键物理状态(GetAsyncKeyState) + 注入 Esc 取消卡住的系统拖拽(SendInput)。
+# 版本对齐依赖树中已有的 windows 0.61.3(wry/tao)，避免同 crate 多版本共存。
+windows = { version = "0.61.3", features = ["Win32_UI_Input_KeyboardAndMouse"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
