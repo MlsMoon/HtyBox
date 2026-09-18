@@ -30,6 +30,7 @@ import DashboardShell from "./components/htyenv/DashboardShell";
 import { getSettings, setSetting, useSettings } from "./settings";
 import { startPerfHud, stopPerfHud } from "./perf/perfHud";
 import { setDragDropDiagEnabled } from "./dragDropDiag";
+import { installDragStuckRecovery } from "./dragStuckRecovery";
 import * as previewWin from "./previewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -248,6 +249,11 @@ export default function App() {
   useEffect(() => {
     setDragDropDiagEnabled(dragDropDiagOn);
   }, [dragDropDiagOn]);
+
+  // 拖拽卡死守卫：系统拖拽会话结束不了时(点击全无效)注入 Esc 解除，注入无效则提示手按 Esc
+  useEffect(() => {
+    installDragStuckRecovery();
+  }, []);
 
   // 持久化已打开的工作区 + 活动工作区（退出重进复原标签栏）
   useEffect(() => {

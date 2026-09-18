@@ -31,6 +31,7 @@ import { Allotment } from "allotment";
 import FilePanel from "./FilePanel";
 import { initFont } from "../fonts";
 import { initTheme } from "../theme";
+import { installDragStuckRecovery } from "../dragStuckRecovery";
 
 const basename = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
@@ -139,6 +140,11 @@ export default function PreviewApp({
   // 前进 / 后退：openPath 本身就是幂等的「打开或激活」——后退到已被关掉的 tab 时它会重新建面板，
   // 正是所需语义，故直接把它交给历史 hook 当导航实现，不再另造一个 navigateTo。
   const { canBack, canForward, record, back, forward, suppress, reset } = useNavHistory(openPath);
+
+  // 拖拽卡死守卫：本窗也有文件树，同类卡死会发生在光标所在的窗口，故各窗独立装一次
+  useEffect(() => {
+    installDragStuckRecovery();
+  }, []);
 
   // md 预览里的链接点开另一个文件 → 在本窗新开 Tab（主窗那侧由 TerminalDock 注册同名通道）
   useEffect(() => registerFileOpener(workspaceId, (p) => openPath(p)), [workspaceId, openPath]);

@@ -62,4 +62,10 @@ impl PlatformServices for MacosPlatformServices {
     fn launch_screen_snip(&self) -> bool {
         system::launch_screen_snip()
     }
+    fn primary_mouse_button_down(&self) -> Option<bool> {
+        None // 无法查询 → 前端停用拖拽卡死守卫
+    }
+    fn send_escape_key(&self) -> bool {
+        false
+    }
 }

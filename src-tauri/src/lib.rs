@@ -373,6 +373,18 @@ fn set_diag_watchdog(app: tauri::AppHandle, on: bool) {
     diag::set_watchdog(app, on);
 }
 
+/// 鼠标主键当前是否物理按下；`None` = 本平台无法查询（前端据此停用拖拽卡死守卫）。
+#[tauri::command]
+fn primary_mouse_button_down() -> Option<bool> {
+    platform_services::platform_services().primary_mouse_button_down()
+}
+
+/// 注入一次 Esc 取消已卡住的系统拖拽会话（见前端 dragStuckRecovery.ts 的判定）。
+#[tauri::command]
+fn send_escape_key() -> bool {
+    platform_services::platform_services().send_escape_key()
+}
+
 #[tauri::command]
 fn resize_terminal(
     state: State<'_, AppState>,
@@ -1800,6 +1812,8 @@ pub fn run() {
             set_screenshot_hotkey_enabled,
             append_diag_log,
             set_diag_watchdog,
+            primary_mouse_button_down,
+            send_escape_key,
             watch_file,
             unwatch_file,
             list_all_files,

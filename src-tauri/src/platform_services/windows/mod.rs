@@ -1,5 +1,6 @@
 mod clipboard;
 mod command;
+mod input;
 mod path;
 mod system;
 
@@ -63,5 +64,11 @@ impl PlatformServices for WindowsPlatformServices {
     }
     fn launch_screen_snip(&self) -> bool {
         system::launch_screen_snip()
+    }
+    fn primary_mouse_button_down(&self) -> Option<bool> {
+        Some(input::primary_mouse_button_down())
+    }
+    fn send_escape_key(&self) -> bool {
+        input::send_escape_key()
     }
 }

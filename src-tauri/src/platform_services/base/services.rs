@@ -24,4 +24,8 @@ pub trait PlatformServices: Sync {
     fn clipboard_marker(&self) -> Option<String>;
     fn clipboard_has_image(&self) -> bool;
     fn launch_screen_snip(&self) -> bool;
+    /// 鼠标主键当前是否物理按下；`None` = 本平台无法查询（调用侧据此停用依赖它的能力）。
+    fn primary_mouse_button_down(&self) -> Option<bool>;
+    /// 向系统输入队列注入一次 Esc（按下 + 抬起）；返回是否注入成功。
+    fn send_escape_key(&self) -> bool;
 }
