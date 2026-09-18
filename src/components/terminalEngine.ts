@@ -20,6 +20,7 @@ import {
 import { getSettings } from "../settings";
 import { perfIpcMsg, perfWrite } from "../perf/perfHud";
 import { createSyncOutputHold, type SyncOutputHold } from "../outputFrameHold";
+import { shouldPullScrollbackOnGrow } from "../terminalResizePolicy";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -358,6 +359,26 @@ function scheduleFit(termId: string): void {
 }
 
 /**
+ * 按容器尺寸 fit；「列数不变、行数变多」时改按非 ConPTY 语义 resize，让 xterm 把回滚区历史拉回
+ * 视口填充，而不是在缓冲区底部追加空行（判据与理由见 terminalResizePolicy.ts）。
+ * 切换与 resize 在同一同步块内完成，期间不会有新输出被解析，故不影响 ConPTY 换行启发式。
+ */
+function fitPreservingBottom(e: Engine): void {
+  const proposed = e.fit.proposeDimensions();
+  if (!shouldPullScrollbackOnGrow(e.term, proposed) || !proposed) {
+    e.fit.fit();
+    return;
+  }
+  const saved = e.term.options.windowsPty;
+  e.term.options.windowsPty = {};
+  try {
+    e.term.resize(proposed.cols, proposed.rows);
+  } finally {
+    e.term.options.windowsPty = saved;
+  }
+}
+
+/**
  * 尺寸稳定后：首次 open + fit + 按真实列宽建 PTY；之后仅在列宽/行高真的变了才 resize。
  * 不做任何强制重绘 —— 重绘交给 xterm 渲染循环与内置 IntersectionObserver（恢复显示自会全量重画）。
  */
@@ -380,7 +401,7 @@ function doFit(termId: string): void {
     focusEngine(termId);
   }
   try {
-    e.fit.fit();
+    fitPreservingBottom(e);
   } catch {
     return; // 容器尺寸暂不可用
   }
